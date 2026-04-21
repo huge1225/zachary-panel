@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  # Panel 主控端
+  panel:
+    image: your-registry.com/zachary-panel:latest
+    container_name: zachary-panel
+    ports:
+      - "8080:8080"   # HTTP API
+      - "9090:9090"   # gRPC (mTLS)
+    volumes:
+      - panel-data:/data
+      - ./logs:/var/log/zachary-panel
+      - ./nginx/ssl:/etc/nginx/ssl
+    environment:
+      - DATA_DIR=/data
+      - LISTEN=:8080
+      - GRPC_ADDR=:9090
+      - LOG_LEVEL=info
+      - ENV=prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/v1/dashboard"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx 反向代理（可选）
+  nginx:
+    image: nginx:alpine
+    container_name: zachary-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - panel
+    restart: unless-stopped
+    profiles:
+      - nginx
+
+  # 数据库管理工具（可选）
+  adminer:
+    image: adminer
+    container_name: zachary-adminer
+    ports:
+      - "8081:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=sqlite
+    restart: unless-stopped
+    profiles:
+      - admin
+
+volumes:
+  panel-data:

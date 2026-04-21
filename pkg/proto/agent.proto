@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package agent;
+
+option go_package = "github.com/huge1225/zachary-panel/pkg/proto";
+
+service AgentService {
+  // Panel → Agent: 下发配置
+  rpc SyncConfig(SyncConfigRequest) returns (SyncConfigResponse);
+  // Agent → Panel: 心跳上报
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Agent → Panel: 注册
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+}
+
+message ForwardRule {
+  string id = 1;
+  string listen_addr = 2;
+  string target_addr = 3;
+  string protocol = 4; // tcp, udp, tls
+  bool enabled = 5;
+  map<string, string> extra = 6; // gost 额外参数
+}
+
+message SyncConfigRequest {
+  repeated ForwardRule rules = 1;
+  string config_version = 2;
+}
+
+message SyncConfigResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message HeartbeatRequest {
+  string agent_id = 1;
+  string hostname = 2;
+  string ip = 3;
+  repeated string active_rules = 4;
+  int64 uptime = 5;
+  double cpu_usage = 6;
+  double mem_usage = 7;
+}
+
+message HeartbeatResponse {
+  bool acknowledged = 1;
+  string config_version = 2;
+}
+
+message RegisterRequest {
+  string hostname = 1;
+  string ip = 2;
+  string os = 3;
+  string arch = 4;
+}
+
+message RegisterResponse {
+  bool success = 1;
+  string agent_id = 2;
+  string server_version = 3;
+}

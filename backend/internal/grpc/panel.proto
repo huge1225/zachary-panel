@@ -1,0 +1,99 @@
+syntax = "proto3";
+
+package zachary_panel;
+
+option go_package = "github.com/huge1225/zachary-panel/backend/internal/grpc";
+
+// Agent 注册请求
+message RegisterRequest {
+  string id = 1;
+  string hostname = 2;
+  string ip = 3;
+  string os = 4;
+  string arch = 5;
+  string token = 6;
+}
+
+// Agent 注册响应
+message RegisterResponse {
+  bool success = 1;
+  string message = 2;
+  repeated ForwardRule rules = 3;
+}
+
+// 获取转发规则请求
+message GetRulesRequest {
+  string agent_id = 1;
+}
+
+// 转发规则
+message ForwardRule {
+  string id = 1;
+  string agent_id = 2;
+  string listen_addr = 3;
+  string target_addr = 4;
+  string protocol = 5;
+  bool enabled = 6;
+  string extra = 7;
+  string config_ver = 8;
+}
+
+// 获取转发规则响应
+message GetRulesResponse {
+  repeated ForwardRule rules = 1;
+}
+
+// 更新规则状态请求
+message UpdateRuleStatusRequest {
+  string rule_id = 1;
+  bool enabled = 2;
+}
+
+// 更新规则状态响应
+message UpdateRuleStatusResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 心跳请求
+message HeartbeatRequest {
+  string agent_id = 1;
+}
+
+// 心跳响应
+message HeartbeatResponse {
+  bool success = 1;
+}
+
+// Panel 服务定义
+service PanelService {
+  // Agent 注册
+  rpc RegisterAgent(RegisterRequest) returns (RegisterResponse);
+
+  // 获取转发规则
+  rpc GetForwardRules(GetRulesRequest) returns (GetRulesResponse);
+
+  // 更新规则状态
+  rpc UpdateRuleStatus(UpdateRuleStatusRequest) returns (UpdateRuleStatusResponse);
+
+  // 心跳检测
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Agent 服务定义
+service AgentService {
+  // Panel 推送配置变更（Agent发起流式连接接收配置）
+  rpc PushConfig(stream ConfigUpdate) returns (ConfigResponse);
+}
+
+// 配置更新
+message ConfigUpdate {
+  string agent_id = 1;
+  repeated ForwardRule rules = 2;
+}
+
+// 配置响应
+message ConfigResponse {
+  bool success = 1;
+  string message = 2;
+}
