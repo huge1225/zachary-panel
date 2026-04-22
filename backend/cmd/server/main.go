@@ -46,14 +46,19 @@ func main() {
 	grpcStore := &dbGrpcStore{db: database}
 
 	// 启动 gRPC 服务
+	grpcServer, err := startGRPC(grpcAddr, serverDir, caDir, grpcStore)
+	if err != nil {
+		log.Fatalf("gRPC server failed: %v", err)
+	}
 	go func() {
-		if err := startGRPC(grpcAddr, serverDir, caDir, grpcStore); err != nil {
-			log.Fatalf("gRPC server failed: %v", err)
+		if err := grpcServer.Start(grpcAddr); err != nil {
+			log.Fatalf("gRPC server start failed: %v", err)
 		}
 	}()
 
 	// 启动 HTTP API
 	srv := api.NewServer(database)
+	srv.SetGRPCServer(grpcServer)
 	log.Printf("⚡ Panel HTTP server on %s", listen)
 	log.Printf("🔒 gRPC agent server on %s (mTLS)", grpcAddr)
 	if err := srv.Run(listen); err != nil {
@@ -98,10 +103,10 @@ func (s *dbGrpcStore) UpdateAgentStatus(id, status string) error {
 	return s.db.UpdateAgentStatus(id, status)
 }
 
-func startGRPC(addr, certDir, caDir string, store grpc.AgentStore) error {
+func startGRPC(addr, certDir, caDir string, store grpc.AgentStore) (*grpc.GRPCServer, error) {
 	grpcServer, err := grpc.NewGRPCServer(addr, certDir, caDir, store)
 	if err != nil {
-		return fmt.Errorf("failed to create gRPC server: %v", err)
+		return nil, fmt.Errorf("failed to create gRPC server: %v", err)
 	}
 
 	go func() {
@@ -112,7 +117,7 @@ func startGRPC(addr, certDir, caDir string, store grpc.AgentStore) error {
 		}
 	}()
 
-	return grpcServer.Start(addr)
+	return grpcServer, nil
 }
 
 func envOrDefault(key, def string) string {

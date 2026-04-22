@@ -1,17 +1,25 @@
 package api
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/huge1225/zachary-panel/backend/internal/cert"
 	"github.com/huge1225/zachary-panel/backend/internal/db"
+	grpcPkg "github.com/huge1225/zachary-panel/backend/internal/grpc"
 )
 
 type Server struct {
-	db *db.DB
-	r  *gin.Engine
+	db      *db.DB
+	r       *gin.Engine
+	grpcSrv interface{}
 }
 
 func NewServer(d *db.DB) *Server {
@@ -22,6 +30,11 @@ func NewServer(d *db.DB) *Server {
 	return s
 }
 
+// SetGRPCServer 设置 gRPC 服务引用（用于推送配置）
+func (s *Server) SetGRPCServer(grpcSrv interface{}) {
+	s.grpcSrv = grpcSrv
+}
+
 func (s *Server) routes() {
 	api := s.r.Group("/api/v1")
 	{
@@ -30,6 +43,7 @@ func (s *Server) routes() {
 		api.GET("/agents/:id", s.getAgent)
 		api.POST("/agents", s.createAgent)
 		api.DELETE("/agents/:id", s.deleteAgent)
+		api.GET("/agents/:id/certs.zip", s.getAgentCerts) // 新增
 
 		// 转发规则
 		api.GET("/agents/:id/rules", s.listRules)
@@ -109,7 +123,35 @@ func (s *Server) createRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	s.pushRulesToAgent(agentID)
 	c.JSON(http.StatusCreated, rule)
+}
+
+// pushRulesToAgent 推送规则给 Agent
+func (s *Server) pushRulesToAgent(agentID string) {
+	rules, _ := s.db.GetRulesByAgent(agentID)
+	pbRules := make([]*grpcPkg.ForwardRule, len(rules))
+	for i, r := range rules {
+		pbRules[i] = &grpcPkg.ForwardRule{
+			Id:         r.ID,
+			AgentId:    r.AgentID,
+			ListenAddr: r.ListenAddr,
+			TargetAddr: r.TargetAddr,
+			Protocol:   r.Protocol,
+			Enabled:    r.Enabled,
+			Extra:      r.Extra,
+			ConfigVer:  r.ConfigVer,
+		}
+	}
+	if grpcSrv, ok := s.grpcSrv.(interface {
+		PushConfigToAgent(context.Context, *grpcPkg.PushConfigRequest) (*grpcPkg.PushConfigResponse, error)
+	}); ok {
+		grpcSrv.PushConfigToAgent(context.Background(), &grpcPkg.PushConfigRequest{
+			AgentId:   agentID,
+			Rules:     pbRules,
+			ConfigVer: "1",
+		})
+	}
 }
 
 func (s *Server) updateRule(c *gin.Context) {
@@ -154,6 +196,7 @@ func (s *Server) updateRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	s.pushRulesToAgent(existing.AgentID)
 	c.JSON(http.StatusOK, existing)
 }
 
@@ -193,6 +236,71 @@ func (s *Server) createAgent(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, agent)
+}
+
+// getAgentCerts 获取 Agent 证书 ZIP
+func (s *Server) getAgentCerts(c *gin.Context) {
+	agentID := c.Param("id")
+	if _, err := s.db.GetAgent(agentID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "agent not found"})
+		return
+	}
+
+	// 获取 CA 和 Server 证书目录路径
+	dataDir := envOrDefault("DATA_DIR", "/data")
+	certDir := filepath.Join(dataDir, "certs")
+	caDir := filepath.Join(certDir, "ca")
+	agentCertDir := filepath.Join(certDir, "agents", agentID)
+
+	// 确保 CA 存在
+	if _, err := os.Stat(filepath.Join(caDir, "ca.crt")); os.IsNotExist(err) {
+		if err := cert.GenerateCA(caDir); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	// 为 Agent 生成证书
+	if err := cert.GenerateCert(caDir, agentCertDir, fmt.Sprintf("agent-%s", agentID)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 创建 ZIP
+	var buf bytes.Buffer
+	w := zip.NewWriter(&buf)
+
+	// 添加文件
+	files := []struct {
+		local string
+		zip   string
+	}{
+		{filepath.Join(agentCertDir, "ca.crt"), "ca.crt"},
+		{filepath.Join(agentCertDir, "tls.crt"), "tls.crt"},
+		{filepath.Join(agentCertDir, "tls.key"), "tls.key"},
+	}
+
+	for _, f := range files {
+		content, err := os.ReadFile(f.local)
+		if err != nil {
+			continue // 不中断
+		}
+		fw, _ := w.Create(f.zip)
+		fw.Write(content)
+	}
+
+	w.Close()
+
+	// 响应
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=agent-%s-certs.zip", agentID))
+	c.Data(http.StatusOK, "application/zip", buf.Bytes())
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func (s *Server) dashboard(c *gin.Context) {

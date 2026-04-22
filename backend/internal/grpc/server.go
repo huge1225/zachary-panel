@@ -33,6 +33,7 @@ type GRPCServer struct {
 // AgentConnection Agent连接
 type AgentConnection struct {
 	lastSeen time.Time
+	stream   AgentService_PushConfigServer // 预留，后续扩展
 }
 
 // NewGRPCServer 创建gRPC服务器
@@ -151,6 +152,17 @@ func (s *GRPCServer) UpdateRuleStatus(ctx context.Context, req *UpdateRuleStatus
 	return &UpdateRuleStatusResponse{
 		Success: true,
 		Message: "Rule status updated",
+	}, nil
+}
+
+// PushConfigToAgent Panel 主动推送配置给 Agent
+func (s *GRPCServer) PushConfigToAgent(ctx context.Context, req *PushConfigRequest) (*PushConfigResponse, error) {
+	log.Printf("[gRPC] Push config to agent %s (config_ver: %s)", req.AgentId, req.ConfigVer)
+	
+	// TODO: 后续实现主动推送（通过 Agent 保持的流式连接）
+	return &PushConfigResponse{
+		Success: true,
+		Message: "Config pushed (placeholder)",
 	}, nil
 }
 

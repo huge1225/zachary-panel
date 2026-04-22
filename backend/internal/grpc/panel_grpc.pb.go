@@ -19,10 +19,11 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	PanelService_RegisterAgent_FullMethodName    = "/zachary_panel.PanelService/RegisterAgent"
-	PanelService_GetForwardRules_FullMethodName  = "/zachary_panel.PanelService/GetForwardRules"
-	PanelService_UpdateRuleStatus_FullMethodName = "/zachary_panel.PanelService/UpdateRuleStatus"
-	PanelService_Heartbeat_FullMethodName        = "/zachary_panel.PanelService/Heartbeat"
+	PanelService_RegisterAgent_FullMethodName     = "/zachary_panel.PanelService/RegisterAgent"
+	PanelService_GetForwardRules_FullMethodName   = "/zachary_panel.PanelService/GetForwardRules"
+	PanelService_UpdateRuleStatus_FullMethodName  = "/zachary_panel.PanelService/UpdateRuleStatus"
+	PanelService_Heartbeat_FullMethodName         = "/zachary_panel.PanelService/Heartbeat"
+	PanelService_PushConfigToAgent_FullMethodName = "/zachary_panel.PanelService/PushConfigToAgent"
 )
 
 // PanelServiceClient is the client API for PanelService service.
@@ -37,6 +38,8 @@ type PanelServiceClient interface {
 	UpdateRuleStatus(ctx context.Context, in *UpdateRuleStatusRequest, opts ...grpc.CallOption) (*UpdateRuleStatusResponse, error)
 	// 心跳检测
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	// 推送配置变更给 Agent（Panel 发起，单向流）
+	PushConfigToAgent(ctx context.Context, in *PushConfigRequest, opts ...grpc.CallOption) (*PushConfigResponse, error)
 }
 
 type panelServiceClient struct {
@@ -83,6 +86,15 @@ func (c *panelServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest
 	return out, nil
 }
 
+func (c *panelServiceClient) PushConfigToAgent(ctx context.Context, in *PushConfigRequest, opts ...grpc.CallOption) (*PushConfigResponse, error) {
+	out := new(PushConfigResponse)
+	err := c.cc.Invoke(ctx, PanelService_PushConfigToAgent_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PanelServiceServer is the server API for PanelService service.
 // All implementations must embed UnimplementedPanelServiceServer
 // for forward compatibility
@@ -95,6 +107,8 @@ type PanelServiceServer interface {
 	UpdateRuleStatus(context.Context, *UpdateRuleStatusRequest) (*UpdateRuleStatusResponse, error)
 	// 心跳检测
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// 推送配置变更给 Agent（Panel 发起，单向流）
+	PushConfigToAgent(context.Context, *PushConfigRequest) (*PushConfigResponse, error)
 	mustEmbedUnimplementedPanelServiceServer()
 }
 
@@ -113,6 +127,9 @@ func (UnimplementedPanelServiceServer) UpdateRuleStatus(context.Context, *Update
 }
 func (UnimplementedPanelServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedPanelServiceServer) PushConfigToAgent(context.Context, *PushConfigRequest) (*PushConfigResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PushConfigToAgent not implemented")
 }
 func (UnimplementedPanelServiceServer) mustEmbedUnimplementedPanelServiceServer() {}
 
@@ -199,6 +216,24 @@ func _PanelService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PanelService_PushConfigToAgent_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PushConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PanelServiceServer).PushConfigToAgent(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PanelService_PushConfigToAgent_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PanelServiceServer).PushConfigToAgent(ctx, req.(*PushConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PanelService_ServiceDesc is the grpc.ServiceDesc for PanelService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -221,6 +256,10 @@ var PanelService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Heartbeat",
 			Handler:    _PanelService_Heartbeat_Handler,
+		},
+		{
+			MethodName: "PushConfigToAgent",
+			Handler:    _PanelService_PushConfigToAgent_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

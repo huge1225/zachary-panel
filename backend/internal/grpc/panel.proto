@@ -78,6 +78,22 @@ service PanelService {
 
   // 心跳检测
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // 推送配置变更给 Agent（Panel 发起，单向流）
+  rpc PushConfigToAgent(PushConfigRequest) returns (PushConfigResponse);
+}
+
+// 推送配置请求
+message PushConfigRequest {
+  string agent_id = 1;
+  repeated ForwardRule rules = 2;
+  string config_ver = 3;
+}
+
+// 推送配置响应
+message PushConfigResponse {
+  bool success = 1;
+  string message = 2;
 }
 
 // Agent 服务定义
