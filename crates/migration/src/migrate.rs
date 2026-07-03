@@ -12,6 +12,7 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     create_operation_logs_table(pool).await?;
     create_security_events_table(pool).await?;
     create_agent_nonces_table(pool).await?;
+    migrate_v2(pool).await?;
     create_indexes(pool).await?;
     Ok(())
 }
@@ -278,7 +279,40 @@ async fn create_agent_nonces_table(pool: &SqlitePool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// v2 增量迁移
+async fn migrate_v2(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // "ALTER TABLE ADD COLUMN" 在 SQLite 中不支持 IF NOT EXISTS
+    // 忽略错误即可（列已存在时返回 Err 但不影响）
+    let migrations = [
+        "ALTER TABLE forward_rules ADD COLUMN bytes_in INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE forward_rules ADD COLUMN bytes_out INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE forward_rules ADD COLUMN last_traffic_at TEXT",
+        "ALTER TABLE forward_rules ADD COLUMN gost_service_name TEXT",
+        "ALTER TABLE forward_rules ADD COLUMN traffic_ratio REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE nodes ADD COLUMN cpu_cores INTEGER",
+        "ALTER TABLE nodes ADD COLUMN memory_total_mb INTEGER",
+        "ALTER TABLE nodes ADD COLUMN load_avg TEXT",
+    ];
+    for sql in &migrations {
+        let _ = sqlx::query(sql).execute(pool).await;
+    }
+    // 使用 println 因为 migration crate 可能没有 tracing 依赖
+    println!("v2 migrations applied");
+    Ok(())
+}
+
 async fn create_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // v2 migration: add traffic columns to forward_rules
+    let _ = sqlx::query("ALTER TABLE forward_rules ADD COLUMN bytes_in INTEGER NOT NULL DEFAULT 0").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE forward_rules ADD COLUMN bytes_out INTEGER NOT NULL DEFAULT 0").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE forward_rules ADD COLUMN last_traffic_at TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE forward_rules ADD COLUMN gost_service_name TEXT").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE forward_rules ADD COLUMN traffic_ratio REAL NOT NULL DEFAULT 1.0").execute(pool).await;
+    // v2 migration: add last_ip columns to nodes
+    let _ = sqlx::query("ALTER TABLE nodes ADD COLUMN cpu_cores INTEGER").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE nodes ADD COLUMN memory_total_mb INTEGER").execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE nodes ADD COLUMN load_avg TEXT").execute(pool).await;
+
     let indexes = [
         "CREATE INDEX IF NOT EXISTS idx_nodes_node_id ON nodes(node_id)",
         "CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)",

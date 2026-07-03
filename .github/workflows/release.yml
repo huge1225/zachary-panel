@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+        include:
+          - target: x86_64-unknown-linux-gnu
+            binary_suffix: linux-amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compilation dependencies
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build server
+        run: cargo build --release --target ${{ matrix.target }} --bin zachary-panel-server
+
+      - name: Build agent
+        run: cargo build --release --target ${{ matrix.target }} --bin zachary-panel-agent
+
+      - name: Prepare release artifacts
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/zachary-panel-server release/server-${{ matrix.binary_suffix }}
+          cp target/${{ matrix.target }}/release/zachary-panel-agent release/agent-${{ matrix.binary_suffix }}
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.binary_suffix }}
+          path: release/
+
+  create-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+
+      - name: Organize release files
+        run: |
+          mkdir -p publish
+          find release -type f ! -name '*.zip' -exec cp {} publish/ \;
+          ls -la publish/
+
+      - name: Generate release notes
+        run: |
+          echo "## Zachary Panel ${{ github.ref_name }}" > release-notes.md
+          echo "" >> release-notes.md
+          echo "### Downloads" >> release-notes.md
+          echo "" >> release-notes.md
+          for f in publish/*; do
+            echo "- \`$(basename $f)\`" >> release-notes.md
+          done
+          echo "" >> release-notes.md
+          echo "### SHA256" >> release-notes.md
+          echo '```' >> release-notes.md
+          cat publish/SHA256SUMS >> release-notes.md
+          echo '```' >> release-notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: publish/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}

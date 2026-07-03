@@ -10,6 +10,7 @@
 
 mod config;
 mod executor;
+mod gost_manager;
 mod register;
 mod system;
 mod ws;
