@@ -30,7 +30,10 @@ curl -fSL "${RELEASE_URL}/zachary-panel-server-linux-${ARCH_SUFFIX}.tar.gz" \
 
 # Install systemd service
 echo "📋 安装 systemd 服务..."
-cp "$INSTALL_DIR/deploy/zachary-panel.service" /etc/systemd/system/
+# Try local copy first, fall back to GitHub
+cp "$INSTALL_DIR/zachary-panel.service" /etc/systemd/system/ 2>/dev/null || \
+    curl -sSL "https://raw.githubusercontent.com/huge1225/zachary-panel/main/deploy/zachary-panel.service" \
+    > /etc/systemd/system/zachary-panel.service
 systemctl daemon-reload
 
 # Config

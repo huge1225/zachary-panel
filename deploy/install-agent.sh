@@ -50,7 +50,7 @@ INSTALL_TOKEN=${INSTALL_TOKEN}
 EOF
 
 # Install systemd service
-cp "$INSTALL_DIR/deploy/zachary-panel-agent.service" /etc/systemd/system/ 2>/dev/null || \
+cp "$INSTALL_DIR/zachary-panel-agent.service" /etc/systemd/system/ 2>/dev/null || \
     curl -sSL "https://raw.githubusercontent.com/huge1225/zachary-panel/main/deploy/zachary-panel-agent.service" \
     > /etc/systemd/system/zachary-panel-agent.service
 systemctl daemon-reload

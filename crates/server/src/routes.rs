@@ -2,7 +2,6 @@ use axum::{Router, routing::get};
 use tokio::net::TcpListener;
 use tower_http::{cors::{CorsLayer, Any}, services::{ServeDir, ServeFile}};
 use tracing::info;
-use std::path::PathBuf;
 
 use crate::app::AppState;
 use crate::handlers;
@@ -27,7 +26,7 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         // 受保护路由
         .nest("/api", protected_routes(state.clone()))
         // 静态文件（前端 SPA）
-        .fallback_service(serve_frontend())
+        .fallback_service(serve_frontend_service())
         .layer(cors)
         .with_state(state);
 
@@ -117,16 +116,8 @@ fn security_event_routes() -> Router<AppState> {
 }
 
 /// Serve frontend SPA static files
-/// Serves from frontend/dist/ if it exists, otherwise returns 404
-fn serve_frontend() -> axum::Router {
-    let dist = PathBuf::from("frontend/dist");
-    if dist.join("index.html").exists() {
-        let index = ServeFile::new(dist.join("index.html"));
-        Router::new().nest_service("/", ServeDir::new(dist).fallback(index))
-    } else {
-        // No frontend built yet — 404 for non-API routes
-        Router::new().fallback(|| async {
-            (axum::http::StatusCode::NOT_FOUND, "Frontend not built. Run: cd frontend && npm run build")
-        })
-    }
+/// Returns a ServeDir that can be used as fallback_service
+fn serve_frontend_service() -> ServeDir<ServeFile> {
+    ServeDir::new("frontend/dist")
+        .fallback(ServeFile::new("frontend/dist/index.html"))
 }

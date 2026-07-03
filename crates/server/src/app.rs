@@ -3,6 +3,7 @@ use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use std::collections::HashMap;
 use crate::config::ServerConfig;
+use crate::middleware::rate_limit::LoginLimiter;
 
 /// 全局应用状态
 #[derive(Clone)]
@@ -11,6 +12,8 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     /// Agent WebSocket 连接池：node_id → WebSocket sender
     pub agent_connections: Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// 登录限流器
+    pub login_limiter: Arc<LoginLimiter>,
 }
 
 impl AppState {
@@ -22,6 +25,7 @@ impl AppState {
             pool,
             config: Arc::new(config),
             agent_connections: Arc::new(RwLock::new(HashMap::new())),
+            login_limiter: Arc::new(LoginLimiter::new(300, 10)), // 5分钟内最多10次
         })
     }
 

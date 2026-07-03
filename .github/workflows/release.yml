@@ -19,9 +19,14 @@ jobs:
       matrix:
         target:
           - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
         include:
           - target: x86_64-unknown-linux-gnu
-            binary_suffix: linux-amd64
+            arch_name: x86_64
+            deb_arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch_name: aarch64
+            deb_arch: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -38,26 +43,58 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        run: |
+          cd frontend
+          npm ci --silent
+          npm run build
+
       - name: Build server
         run: cargo build --release --target ${{ matrix.target }} --bin zachary-panel-server
 
       - name: Build agent
         run: cargo build --release --target ${{ matrix.target }} --bin zachary-panel-agent
 
-      - name: Prepare release artifacts
+      - name: Package server tarball
         run: |
-          mkdir -p release
-          cp target/${{ matrix.target }}/release/zachary-panel-server release/server-${{ matrix.binary_suffix }}
-          cp target/${{ matrix.target }}/release/zachary-panel-agent release/agent-${{ matrix.binary_suffix }}
-          cd release
-          sha256sum * > SHA256SUMS
-          cat SHA256SUMS
+          PKG_NAME="zachary-panel-server-linux-${{ matrix.arch_name }}"
+          mkdir -p "$PKG_NAME"
+          cp target/${{ matrix.target }}/release/zachary-panel-server "$PKG_NAME/"
+          cp -r frontend/dist "$PKG_NAME/frontend/dist"
+          cp deploy/zachary-panel.service "$PKG_NAME/"
+          cp deploy/install-server.sh "$PKG_NAME/"
+          cp .env.example "$PKG_NAME/" 2>/dev/null || true
+          cp README.md "$PKG_NAME/" 2>/dev/null || true
+          tar czf "$PKG_NAME.tar.gz" "$PKG_NAME"
 
-      - name: Upload release artifacts
+      - name: Package agent tarball
+        run: |
+          PKG_NAME="zachary-panel-agent-linux-${{ matrix.arch_name }}"
+          mkdir -p "$PKG_NAME"
+          cp target/${{ matrix.target }}/release/zachary-panel-agent "$PKG_NAME/"
+          cp deploy/zachary-panel-agent.service "$PKG_NAME/"
+          cp deploy/install-agent.sh "$PKG_NAME/"
+          tar czf "$PKG_NAME.tar.gz" "$PKG_NAME"
+
+      - name: Generate checksums
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS-${{ matrix.arch_name }}
+          cat SHA256SUMS-${{ matrix.arch_name }}
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.binary_suffix }}
-          path: release/
+          name: release-${{ matrix.arch_name }}
+          path: |
+            *.tar.gz
+            SHA256SUMS-*
 
   create-release:
     name: Create GitHub Release
@@ -74,17 +111,32 @@ jobs:
       - name: Organize release files
         run: |
           mkdir -p publish
-          find release -type f ! -name '*.zip' -exec cp {} publish/ \;
+          find release -type f -name '*.tar.gz' -exec cp {} publish/ \;
+          find release -type f -name 'SHA256SUMS-*' -exec cat {} \; > publish/SHA256SUMS
           ls -la publish/
 
       - name: Generate release notes
         run: |
-          echo "## Zachary Panel ${{ github.ref_name }}" > release-notes.md
-          echo "" >> release-notes.md
-          echo "### Downloads" >> release-notes.md
-          echo "" >> release-notes.md
-          for f in publish/*; do
-            echo "- \`$(basename $f)\`" >> release-notes.md
+          TAG="${{ github.ref_name }}"
+          cat > release-notes.md <<EOF
+          ## Zachary Panel \${TAG}
+
+          ### 一键安装
+
+          **Server:**
+          \`\`\`bash
+          curl -sSL https://github.com/huge1225/zachary-panel/releases/download/\${TAG}/zachary-panel-server-linux-x86_64.tar.gz | tar xz && bash zachary-panel-server-linux-x86_64/install-server.sh
+          \`\`\`
+
+          **Agent (在节点上执行):**
+          \`\`\`bash
+          bash install-agent.sh <SERVER_URL> <NODE_ID> <INSTALL_TOKEN>
+          \`\`\`
+
+          ### 下载
+          EOF
+          for f in publish/*.tar.gz; do
+            echo "- [\`$(basename $f)\`](https://github.com/huge1225/zachary-panel/releases/download/\${TAG}/$(basename $f))" >> release-notes.md
           done
           echo "" >> release-notes.md
           echo "### SHA256" >> release-notes.md
@@ -97,6 +149,6 @@ jobs:
         with:
           name: ${{ github.ref_name }}
           body_path: release-notes.md
-          files: publish/*
+          files: publish/*.tar.gz
           draft: false
           prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}

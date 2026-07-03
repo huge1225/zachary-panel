@@ -16,6 +16,14 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    // 登录限流（基于用户名，IP 级别在中间件层处理）
+    let client_key = req.username.clone();
+    if !state.login_limiter.check(&client_key).await {
+        let remaining = state.login_limiter.remaining(&client_key).await;
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "code": 42900, "message": format!("Too many login attempts, retry in 5 minutes (remaining: {})", remaining), "data": null
+        })));
+    }
     // Use sqlx::query (not query!) to avoid offline DB requirement
     let user = sqlx::query("SELECT id, username, password_hash, role FROM users WHERE username = ?")
         .bind(&req.username)
@@ -43,6 +51,9 @@ pub async fn login(
             })));
         }
     };
+
+    // 登录成功，清除限流计数
+    state.login_limiter.clear(&client_key).await;
 
     let expires_at = chrono::Utc::now() + chrono::Duration::hours(state.config.jwt_expiry_hours as i64);
 
