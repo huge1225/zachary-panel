@@ -1,0 +1,30 @@
+# Build stage
+FROM rust:1-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN cargo build --release --bin zachary-panel-agent
+
+# ─── Agent image ───
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates nftables curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/zachary-panel-agent /app/zachary-panel-agent
+COPY agent.yaml.example /app/agent.yaml.example
+
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/app/zachary-panel-agent"]
+CMD ["--config", "/app/agent.yaml"]

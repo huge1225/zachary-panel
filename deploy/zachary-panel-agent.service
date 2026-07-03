@@ -1,0 +1,17 @@
+[Unit]
+Description=Zachary Panel Agent
+After=network.target
+
+[Service]
+Type=simple
+User=zachary
+Group=zachary
+WorkingDirectory=/opt/zachary-panel-agent
+EnvironmentFile=/opt/zachary-panel-agent/.env
+ExecStart=/opt/zachary-panel-agent/zachary-panel-agent --config /opt/zachary-panel-agent/agent.yaml
+Restart=always
+RestartSec=5
+RestartMaxDelaySec=60
+
+[Install]
+WantedBy=multi-user.target
