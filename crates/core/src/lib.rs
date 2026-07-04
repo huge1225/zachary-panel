@@ -7,5 +7,5 @@ pub mod gost;
 pub mod nftables;
 
 // Re-exports for convenience
-pub use nftables::NftCommand;
 pub use gost::GostCommand;
+pub use nftables::NftCommand;

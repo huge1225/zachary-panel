@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use sqlx::SqlitePool;
-use tokio::sync::RwLock;
-use std::collections::HashMap;
 use crate::config::ServerConfig;
 use crate::middleware::rate_limit::LoginLimiter;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// 全局应用状态
 #[derive(Clone)]
@@ -32,22 +32,19 @@ impl AppState {
     async fn ensure_admin(pool: &SqlitePool, config: &ServerConfig) -> anyhow::Result<()> {
         use zachary_panel_common::hash_password;
 
-        let existing = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM users WHERE username = ?"
-        )
-        .bind(&config.admin_username)
-        .fetch_one(pool)
-        .await?;
+        let existing =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE username = ?")
+                .bind(&config.admin_username)
+                .fetch_one(pool)
+                .await?;
 
         if existing == 0 {
             let hash = hash_password(&config.admin_password)?;
-            sqlx::query(
-                "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')"
-            )
-            .bind(&config.admin_username)
-            .bind(&hash)
-            .execute(pool)
-            .await?;
+            sqlx::query("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')")
+                .bind(&config.admin_username)
+                .bind(&hash)
+                .execute(pool)
+                .await?;
 
             tracing::info!("Default admin user created: {}", config.admin_username);
         }

@@ -20,7 +20,10 @@ impl Default for NftCommand {
 
 impl NftCommand {
     pub fn new(nft_path: &str) -> Self {
-        Self { nft_path: nft_path.to_string(), ..Default::default() }
+        Self {
+            nft_path: nft_path.to_string(),
+            ..Default::default()
+        }
     }
 
     pub fn init_table(&self) -> Vec<String> {
@@ -28,35 +31,110 @@ impl NftCommand {
     }
 
     pub fn init_chain(&self) -> Vec<String> {
-        args(&[&self.nft_path, "add", "chain", "ip", &self.table, &self.chain,
-            "{", "type", "nat", "hook", "prerouting", "priority", "dstnat", ";", "}"])
+        args(&[
+            &self.nft_path,
+            "add",
+            "chain",
+            "ip",
+            &self.table,
+            &self.chain,
+            "{",
+            "type",
+            "nat",
+            "hook",
+            "prerouting",
+            "priority",
+            "dstnat",
+            ";",
+            "}",
+        ])
     }
 
-    pub fn add_tcp_forward(&self, public_ip: &str, listen_port: i32, target_addr: &str, target_port: i32) -> Vec<String> {
+    pub fn add_tcp_forward(
+        &self,
+        public_ip: &str,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Vec<String> {
         let tgt = format!("{target_addr}:{target_port}");
         let port = listen_port.to_string();
-        args(&[&self.nft_path, "add", "rule", "ip", &self.table, &self.chain,
-            "ip", "daddr", public_ip, "tcp", "dport", &port,
-            "counter", "dnat", "to", &tgt])
+        args(&[
+            &self.nft_path,
+            "add",
+            "rule",
+            "ip",
+            &self.table,
+            &self.chain,
+            "ip",
+            "daddr",
+            public_ip,
+            "tcp",
+            "dport",
+            &port,
+            "counter",
+            "dnat",
+            "to",
+            &tgt,
+        ])
     }
 
-    pub fn add_udp_forward(&self, public_ip: &str, listen_port: i32, target_addr: &str, target_port: i32) -> Vec<String> {
+    pub fn add_udp_forward(
+        &self,
+        public_ip: &str,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Vec<String> {
         let tgt = format!("{target_addr}:{target_port}");
         let port = listen_port.to_string();
-        args(&[&self.nft_path, "add", "rule", "ip", &self.table, &self.chain,
-            "ip", "daddr", public_ip, "udp", "dport", &port,
-            "counter", "dnat", "to", &tgt])
+        args(&[
+            &self.nft_path,
+            "add",
+            "rule",
+            "ip",
+            &self.table,
+            &self.chain,
+            "ip",
+            "daddr",
+            public_ip,
+            "udp",
+            "dport",
+            &port,
+            "counter",
+            "dnat",
+            "to",
+            &tgt,
+        ])
     }
 
-    pub fn add_forward(&self, protocol: &ForwardProtocol, public_ip: &str, listen_port: i32, target_addr: &str, target_port: i32) -> Vec<Vec<String>> {
+    pub fn add_forward(
+        &self,
+        protocol: &ForwardProtocol,
+        public_ip: &str,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Vec<Vec<String>> {
         let mut cmds = Vec::new();
-        if protocol.contains_tcp() { cmds.push(self.add_tcp_forward(public_ip, listen_port, target_addr, target_port)); }
-        if protocol.contains_udp() { cmds.push(self.add_udp_forward(public_ip, listen_port, target_addr, target_port)); }
+        if protocol.contains_tcp() {
+            cmds.push(self.add_tcp_forward(public_ip, listen_port, target_addr, target_port));
+        }
+        if protocol.contains_udp() {
+            cmds.push(self.add_udp_forward(public_ip, listen_port, target_addr, target_port));
+        }
         cmds
     }
 
     pub fn flush_chain(&self) -> Vec<String> {
-        args(&[&self.nft_path, "flush", "chain", "ip", &self.table, &self.chain])
+        args(&[
+            &self.nft_path,
+            "flush",
+            "chain",
+            "ip",
+            &self.table,
+            &self.chain,
+        ])
     }
 
     pub fn delete_table(&self) -> Vec<String> {
@@ -68,7 +146,14 @@ impl NftCommand {
     }
 
     pub fn list_chain(&self) -> Vec<String> {
-        args(&[&self.nft_path, "list", "chain", "ip", &self.table, &self.chain])
+        args(&[
+            &self.nft_path,
+            "list",
+            "chain",
+            "ip",
+            &self.table,
+            &self.chain,
+        ])
     }
 
     pub fn check_available(&self) -> Vec<String> {

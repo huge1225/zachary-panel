@@ -1,13 +1,13 @@
 use axum::{
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{header, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json},
 };
 use zachary_panel_common::ApiResponse;
 
-use crate::AppState;
 use crate::services::jwt;
+use crate::AppState;
 
 /// JWT 认证中间件
 pub async fn jwt_auth(
@@ -27,12 +27,19 @@ pub async fn jwt_auth(
                 req.extensions_mut().insert(claims);
                 next.run(req).await
             }
-            Err(_) => {
-                (StatusCode::UNAUTHORIZED, Json(ApiResponse::<()>::error(40100, "Invalid or expired token"))).into_response()
-            }
+            Err(_) => (
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::<()>::error(40100, "Invalid or expired token")),
+            )
+                .into_response(),
         },
-        None => {
-            (StatusCode::UNAUTHORIZED, Json(ApiResponse::<()>::error(40100, "Missing authorization header"))).into_response()
-        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiResponse::<()>::error(
+                40100,
+                "Missing authorization header",
+            )),
+        )
+            .into_response(),
     }
 }

@@ -1,14 +1,13 @@
 /// Agent WebSocket 客户端模块
 /// 负责 WSS 连接、HMAC-SHA256 签名、心跳、任务接收、自动重连
-
 use crate::config::AgentConfig;
 use crate::executor::TaskExecutor;
 use crate::system;
-use zachary_panel_common::{AgentWsMessage, ServerWsMessage, hmac_sha256_hex, random_hex};
 use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::{Message};
-use tracing::{info, warn, error};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{error, info, warn};
+use zachary_panel_common::{hmac_sha256_hex, random_hex, AgentWsMessage, ServerWsMessage};
 
 /// 启动 Agent WebSocket 连接（含自动重连）
 pub async fn run(config: AgentConfig) {
@@ -44,7 +43,8 @@ async fn connect_and_run(config: &AgentConfig, executor: &TaskExecutor) -> anyho
 
     // Use connect_async_tls_with_config for WSS
     let connector = if config.tls_verify {
-        let tls = native_tls::TlsConnector::new().map_err(|e| anyhow::anyhow!("TLS error: {}", e))?;
+        let tls =
+            native_tls::TlsConnector::new().map_err(|e| anyhow::anyhow!("TLS error: {}", e))?;
         Some(tokio_tungstenite::Connector::NativeTls(tls))
     } else {
         let tls = native_tls::TlsConnector::builder()
@@ -53,7 +53,8 @@ async fn connect_and_run(config: &AgentConfig, executor: &TaskExecutor) -> anyho
             .map_err(|e| anyhow::anyhow!("TLS error: {}", e))?;
         Some(tokio_tungstenite::Connector::NativeTls(tls))
     };
-    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(&url, None, false, connector).await?;
+    let (ws_stream, _) =
+        tokio_tungstenite::connect_async_tls_with_config(&url, None, false, connector).await?;
 
     info!("✅ WebSocket connected to {}", url);
 
@@ -97,14 +98,7 @@ async fn connect_and_run(config: &AgentConfig, executor: &TaskExecutor) -> anyho
     while let Some(msg) = ws_read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                handle_server_message(
-                    &text,
-                    &config.node_id,
-                    node_token,
-                    executor,
-                    &out_tx,
-                )
-                .await;
+                handle_server_message(&text, &config.node_id, node_token, executor, &out_tx).await;
             }
             Ok(Message::Ping(data)) => {
                 // tungstenite auto-responds to pings, but just in case
@@ -160,7 +154,11 @@ async fn handle_server_message(
                 error!("Failed to send task result for {}", task_id);
             }
 
-            info!("📤 Task {} result: {}", task_id, if result.success { "OK" } else { "FAIL" });
+            info!(
+                "📤 Task {} result: {}",
+                task_id,
+                if result.success { "OK" } else { "FAIL" }
+            );
         }
 
         Ok(ServerWsMessage::HeartbeatAck { timestamp }) => {

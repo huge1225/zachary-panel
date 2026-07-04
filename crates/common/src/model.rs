@@ -561,13 +561,9 @@ pub enum ServerWsMessage {
         payload: serde_json::Value,
     },
     #[serde(rename = "heartbeat_ack")]
-    HeartbeatAck {
-        timestamp: String,
-    },
+    HeartbeatAck { timestamp: String },
     #[serde(rename = "shutdown")]
-    Shutdown {
-        reason: String,
-    },
+    Shutdown { reason: String },
 }
 
 // ═══════════════════════════════════════════════════════════════════

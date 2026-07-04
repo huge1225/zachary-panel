@@ -4,7 +4,10 @@ use tracing::info;
 use crate::config::ServerConfig;
 
 pub async fn init(config: &ServerConfig) -> anyhow::Result<SqlitePool> {
-    info!("Connecting to database: {}", mask_db_url(&config.database_url));
+    info!(
+        "Connecting to database: {}",
+        mask_db_url(&config.database_url)
+    );
 
     // 确保数据目录存在
     if config.database_url.starts_with("sqlite://") {
@@ -23,7 +26,9 @@ pub async fn init(config: &ServerConfig) -> anyhow::Result<SqlitePool> {
         .await?;
 
     // 启用 WAL 模式
-    sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await?;
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&pool)
+        .await?;
     sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
 
     // 运行迁移

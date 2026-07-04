@@ -1,9 +1,8 @@
 /// Agent 注册模块
 /// 使用 install_token 向 Server 注册，获取 node_token
-
 use crate::config::AgentConfig;
-use zachary_panel_common::{AgentRegisterRequest, sha256_hex};
-use tracing::{info, error};
+use tracing::{error, info};
+use zachary_panel_common::{sha256_hex, AgentRegisterRequest};
 
 /// 获取本机 Agent 版本
 fn agent_version() -> String {
@@ -44,10 +43,11 @@ async fn get_public_ip() -> Option<String> {
 
 /// 向 Server 注册 Agent，返回 node_token
 pub async fn register(config: &AgentConfig) -> anyhow::Result<String> {
-    let install_token = config.install_token.as_ref()
-        .ok_or_else(|| anyhow::anyhow!(
+    let install_token = config.install_token.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
             "No install_token provided. Set INSTALL_TOKEN env var or install_token in config.yaml"
-        ))?;
+        )
+    })?;
 
     let (os, arch) = get_os_info();
     let public_ip = get_public_ip().await;
@@ -83,14 +83,19 @@ pub async fn register(config: &AgentConfig) -> anyhow::Result<String> {
         anyhow::bail!("Registration failed: {}", msg);
     }
 
-    let data = body.get("data")
+    let data = body
+        .get("data")
         .ok_or_else(|| anyhow::anyhow!("No data in response"))?;
-    let node_token = data.get("node_token")
+    let node_token = data
+        .get("node_token")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No node_token in response"))?
         .to_string();
 
-    let hb = data.get("heartbeat_interval").and_then(|v| v.as_u64()).unwrap_or(30);
+    let hb = data
+        .get("heartbeat_interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30);
     info!("✅ Agent registered! Heartbeat interval: {}s", hb);
 
     Ok(node_token)

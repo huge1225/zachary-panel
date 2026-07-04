@@ -1,6 +1,5 @@
 /// Agent 配置模块
 /// 配置来源优先级：环境变量 > config.yaml > 默认值
-
 use serde::Deserialize;
 use std::path::Path;
 
@@ -54,20 +53,35 @@ impl AgentConfig {
         };
 
         // Environment overrides
-        if let Ok(v) = std::env::var("SERVER_URL") { cfg.server_url = v; }
-        if let Ok(v) = std::env::var("NODE_ID") { cfg.node_id = v; }
-        if let Ok(v) = std::env::var("INSTALL_TOKEN") { cfg.install_token = Some(v); }
-        if let Ok(v) = std::env::var("NODE_TOKEN") { cfg.node_token = Some(v); }
-        if let Ok(v) = std::env::var("HEARTBEAT_INTERVAL") { cfg.heartbeat_interval = v.parse()?; }
-        if let Ok(v) = std::env::var("TLS_VERIFY") { cfg.tls_verify = v.parse()?; }
-        if let Ok(v) = std::env::var("LOG_LEVEL") { cfg.log_level = v; }
+        if let Ok(v) = std::env::var("SERVER_URL") {
+            cfg.server_url = v;
+        }
+        if let Ok(v) = std::env::var("NODE_ID") {
+            cfg.node_id = v;
+        }
+        if let Ok(v) = std::env::var("INSTALL_TOKEN") {
+            cfg.install_token = Some(v);
+        }
+        if let Ok(v) = std::env::var("NODE_TOKEN") {
+            cfg.node_token = Some(v);
+        }
+        if let Ok(v) = std::env::var("HEARTBEAT_INTERVAL") {
+            cfg.heartbeat_interval = v.parse()?;
+        }
+        if let Ok(v) = std::env::var("TLS_VERIFY") {
+            cfg.tls_verify = v.parse()?;
+        }
+        if let Ok(v) = std::env::var("LOG_LEVEL") {
+            cfg.log_level = v;
+        }
 
         Ok(cfg)
     }
 
     /// Full WebSocket URL
     pub fn ws_url(&self) -> String {
-        let base = self.server_url
+        let base = self
+            .server_url
             .trim_end_matches('/')
             .replace("http://", "ws://")
             .replace("https://", "wss://");
@@ -100,11 +114,27 @@ impl Default for AgentConfig {
     }
 }
 
-fn default_ws_path() -> String { "/ws/agent".into() }
-fn default_heartbeat_interval() -> u64 { 30 }
-fn default_reconnect_base() -> u64 { 2 }
-fn default_reconnect_max() -> u64 { 60 }
-fn default_tls_verify() -> bool { true }
-fn default_nft_path() -> String { "/usr/sbin/nft".into() }
-fn default_gost_path() -> String { "/usr/local/bin/gost".into() }
-fn default_log_level() -> String { "info".into() }
+fn default_ws_path() -> String {
+    "/ws/agent".into()
+}
+fn default_heartbeat_interval() -> u64 {
+    30
+}
+fn default_reconnect_base() -> u64 {
+    2
+}
+fn default_reconnect_max() -> u64 {
+    60
+}
+fn default_tls_verify() -> bool {
+    true
+}
+fn default_nft_path() -> String {
+    "/usr/sbin/nft".into()
+}
+fn default_gost_path() -> String {
+    "/usr/local/bin/gost".into()
+}
+fn default_log_level() -> String {
+    "info".into()
+}

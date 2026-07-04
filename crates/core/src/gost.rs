@@ -8,26 +8,45 @@ pub struct GostCommand {
 
 impl Default for GostCommand {
     fn default() -> Self {
-        Self { gost_path: "/usr/local/bin/gost".into() }
+        Self {
+            gost_path: "/usr/local/bin/gost".into(),
+        }
     }
 }
 
 impl GostCommand {
     pub fn new(gost_path: &str) -> Self {
-        Self { gost_path: gost_path.to_string() }
+        Self {
+            gost_path: gost_path.to_string(),
+        }
     }
 
-    pub fn tcp_forward(&self, listen_port: i32, target_addr: &str, target_port: i32) -> Vec<String> {
+    pub fn tcp_forward(
+        &self,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Vec<String> {
         let url = format!("tcp://:{listen_port}/{target_addr}:{target_port}");
         vec![self.gost_path.clone(), "-L".into(), url]
     }
 
-    pub fn udp_forward(&self, listen_port: i32, target_addr: &str, target_port: i32) -> Vec<String> {
+    pub fn udp_forward(
+        &self,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Vec<String> {
         let url = format!("udp://:{listen_port}/{target_addr}:{target_port}");
         vec![self.gost_path.clone(), "-L".into(), url]
     }
 
-    pub fn tcp_udp_forward(&self, listen_port: i32, target_addr: &str, target_port: i32) -> Vec<String> {
+    pub fn tcp_udp_forward(
+        &self,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+    ) -> Vec<String> {
         let tcp = format!("tcp://:{listen_port}/{target_addr}:{target_port}");
         let udp = format!("udp://:{listen_port}/{target_addr}:{target_port}");
         vec![self.gost_path.clone(), "-L".into(), tcp, "-L".into(), udp]
@@ -38,25 +57,65 @@ impl GostCommand {
         vec![self.gost_path.clone(), "-L".into(), url]
     }
 
-    pub fn wss_server(&self, listen_port: i32, ws_path: &str, cert_path: &str, key_path: &str) -> Vec<String> {
-        let url = format!("tcp+wss://:{listen_port}?path={ws_path}&cert={cert_path}&key={key_path}");
+    pub fn wss_server(
+        &self,
+        listen_port: i32,
+        ws_path: &str,
+        cert_path: &str,
+        key_path: &str,
+    ) -> Vec<String> {
+        let url =
+            format!("tcp+wss://:{listen_port}?path={ws_path}&cert={cert_path}&key={key_path}");
         vec![self.gost_path.clone(), "-L".into(), url]
     }
 
-    pub fn ws_client(&self, listen_port: i32, target_addr: &str, target_port: i32, server_addr: &str, server_port: i32, ws_path: &str, tls: bool) -> Vec<String> {
+    pub fn ws_client(
+        &self,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+        server_addr: &str,
+        server_port: i32,
+        ws_path: &str,
+        tls: bool,
+    ) -> Vec<String> {
         let scheme = if tls { "tcp+wss" } else { "tcp+ws" };
         let local = format!("rtcp://:{listen_port}/{target_addr}:{target_port}");
         let remote = format!("{scheme}://{server_addr}:{server_port}?path={ws_path}");
-        vec![self.gost_path.clone(), "-L".into(), local, "-F".into(), remote]
+        vec![
+            self.gost_path.clone(),
+            "-L".into(),
+            local,
+            "-F".into(),
+            remote,
+        ]
     }
 
-    pub fn generate_forward(&self, mode: &str, protocol: &ForwardProtocol, listen_port: i32, target_addr: &str, target_port: i32, tunnel_type: &TunnelType, ws_path: Option<&str>, cert_path: Option<&str>, key_path: Option<&str>, tls_skip_verify: bool) -> Result<Vec<String>, String> {
+    pub fn generate_forward(
+        &self,
+        mode: &str,
+        protocol: &ForwardProtocol,
+        listen_port: i32,
+        target_addr: &str,
+        target_port: i32,
+        tunnel_type: &TunnelType,
+        ws_path: Option<&str>,
+        cert_path: Option<&str>,
+        key_path: Option<&str>,
+        tls_skip_verify: bool,
+    ) -> Result<Vec<String>, String> {
         match mode {
             "gost" => match tunnel_type {
                 TunnelType::Plain => match protocol {
-                    ForwardProtocol::Tcp => Ok(self.tcp_forward(listen_port, target_addr, target_port)),
-                    ForwardProtocol::Udp => Ok(self.udp_forward(listen_port, target_addr, target_port)),
-                    ForwardProtocol::TcpUdp => Ok(self.tcp_udp_forward(listen_port, target_addr, target_port)),
+                    ForwardProtocol::Tcp => {
+                        Ok(self.tcp_forward(listen_port, target_addr, target_port))
+                    }
+                    ForwardProtocol::Udp => {
+                        Ok(self.udp_forward(listen_port, target_addr, target_port))
+                    }
+                    ForwardProtocol::TcpUdp => {
+                        Ok(self.tcp_udp_forward(listen_port, target_addr, target_port))
+                    }
                 },
                 TunnelType::Ws => {
                     let path = ws_path.unwrap_or("/ws");

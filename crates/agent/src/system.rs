@@ -1,5 +1,4 @@
 /// 系统信息收集模块
-
 use zachary_panel_common::SystemInfoPayload;
 
 /// 收集系统信息
@@ -55,10 +54,7 @@ pub fn nft_available(nft_path: &str) -> String {
 
 /// 检测 gost 是否可用
 pub fn gost_available(gost_path: &str) -> String {
-    match std::process::Command::new(gost_path)
-        .arg("-V")
-        .output()
-    {
+    match std::process::Command::new(gost_path).arg("-V").output() {
         Ok(output) => {
             if output.status.success() {
                 String::from_utf8_lossy(&output.stdout).trim().to_string()

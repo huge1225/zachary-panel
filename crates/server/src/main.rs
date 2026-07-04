@@ -8,7 +8,10 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
 
-    info!("Starting Zachary Panel Server v{}", env!("CARGO_PKG_VERSION"));
+    info!(
+        "Starting Zachary Panel Server v{}",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let cfg = config::load()?;
     let pool = zachary_panel_server::db::init(&cfg).await?;

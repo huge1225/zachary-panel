@@ -1,10 +1,10 @@
 /// 密码哈希工具
-
 use bcrypt::{hash, verify, DEFAULT_COST};
 
 /// 使用 bcrypt 哈希密码
 pub fn hash_password(password: &str) -> Result<String, anyhow::Error> {
-    bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| anyhow::anyhow!("Password hash error: {e}"))
+    bcrypt::hash(password, bcrypt::DEFAULT_COST)
+        .map_err(|e| anyhow::anyhow!("Password hash error: {e}"))
 }
 
 /// 验证 bcrypt 密码
@@ -22,8 +22,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key)
-        .expect("HMAC can take key of any size");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(message);
     hex::encode(mac.finalize().into_bytes())
 }

@@ -1,10 +1,9 @@
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tracing::{error, info, warn};
 /// 任务执行模块
 /// 负责接收 Server 下发的任务，分发执行，返回结果
-
-use zachary_panel_common::{TaskType, TaskResult};
+use zachary_panel_common::{TaskResult, TaskType};
 use zachary_panel_core::NftCommand;
-use tracing::{info, warn, error};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
 pub struct TaskExecutor {
@@ -99,7 +98,12 @@ impl TaskExecutor {
         };
 
         let elapsed = started.elapsed();
-        info!("Task {} completed in {}ms: {}", task_id, elapsed.as_millis(), if result.success { "OK" } else { "FAIL" });
+        info!(
+            "Task {} completed in {}ms: {}",
+            task_id,
+            elapsed.as_millis(),
+            if result.success { "OK" } else { "FAIL" }
+        );
 
         result
     }
@@ -109,11 +113,26 @@ impl TaskExecutor {
     // ═══════════════════════════════════════════════════════════════
 
     async fn exec_forward_rule(&self, payload: &serde_json::Value, _dry_run: bool) -> TaskResult {
-        let protocol = payload.get("protocol").and_then(|v| v.as_str()).unwrap_or("tcp");
-        let public_ip = payload.get("public_ip").and_then(|v| v.as_str()).unwrap_or("0.0.0.0");
-        let listen_port = payload.get("listen_port").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let target_addr = payload.get("target_addr").and_then(|v| v.as_str()).unwrap_or("");
-        let target_port = payload.get("target_port").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let protocol = payload
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tcp");
+        let public_ip = payload
+            .get("public_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0.0.0.0");
+        let listen_port = payload
+            .get("listen_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let target_addr = payload
+            .get("target_addr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target_port = payload
+            .get("target_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
 
         let proto = zachary_panel_common::ForwardProtocol::parse(protocol);
         let start_ts = now_ts();
@@ -134,7 +153,10 @@ impl TaskExecutor {
                 let msg = if last.success {
                     "nft forward rule added".into()
                 } else {
-                    last.stderr.as_deref().unwrap_or("unknown error").to_string()
+                    last.stderr
+                        .as_deref()
+                        .unwrap_or("unknown error")
+                        .to_string()
                 };
                 TaskResult {
                     task_id: String::new(),
@@ -161,7 +183,10 @@ impl TaskExecutor {
     }
 
     async fn exec_delete_forward_rule(&self, payload: &serde_json::Value) -> TaskResult {
-        let listen_port = payload.get("listen_port").and_then(|v| v.as_i64()).unwrap_or(0);
+        let listen_port = payload
+            .get("listen_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let start_ts = now_ts();
 
         if listen_port == 0 {
@@ -182,7 +207,11 @@ impl TaskExecutor {
         let nft = NftCommand::new(&self.nft_path);
         let r = run_cmd(&nft.flush_chain());
 
-        let msg = if r.success { "nft chain flushed".into() } else { r.stderr.as_deref().unwrap_or("unknown error").to_string() };
+        let msg = if r.success {
+            "nft chain flushed".into()
+        } else {
+            r.stderr.as_deref().unwrap_or("unknown error").to_string()
+        };
         TaskResult {
             task_id: String::new(),
             success: r.success,
@@ -199,7 +228,11 @@ impl TaskExecutor {
         let nft = NftCommand::new(&self.nft_path);
         let start_ts = now_ts();
         let r = run_cmd(&nft.reload());
-        let msg = if r.success { "nftables reloaded".into() } else { r.stderr.as_deref().unwrap_or("unknown error").to_string() };
+        let msg = if r.success {
+            "nftables reloaded".into()
+        } else {
+            r.stderr.as_deref().unwrap_or("unknown error").to_string()
+        };
         TaskResult {
             task_id: String::new(),
             success: r.success,
@@ -216,7 +249,11 @@ impl TaskExecutor {
         let nft = NftCommand::new(&self.nft_path);
         let start_ts = now_ts();
         let r = run_cmd(&nft.list_rules());
-        let msg = if r.success { "nft rules listed".into() } else { r.stderr.as_deref().unwrap_or("unknown error").to_string() };
+        let msg = if r.success {
+            "nft rules listed".into()
+        } else {
+            r.stderr.as_deref().unwrap_or("unknown error").to_string()
+        };
         TaskResult {
             task_id: String::new(),
             success: r.success,
@@ -286,15 +323,17 @@ impl TaskExecutor {
 
     async fn exec_check_port(&self, payload: &serde_json::Value) -> TaskResult {
         let port = payload.get("port").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let host = payload.get("host").and_then(|v| v.as_str()).unwrap_or("127.0.0.1");
+        let host = payload
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("127.0.0.1");
         let start_ts = now_ts();
 
         use tokio::net::TcpStream;
         let addr = format!("{}:{}", host, port);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            TcpStream::connect(&addr),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
+                .await;
 
         let (success, msg) = match result {
             Ok(Ok(_)) => (true, format!("Port {} is open", port)),
@@ -315,21 +354,35 @@ impl TaskExecutor {
     }
 
     async fn exec_check_target(&self, payload: &serde_json::Value) -> TaskResult {
-        let target_addr = payload.get("target_addr").and_then(|v| v.as_str()).unwrap_or("");
-        let target_port = payload.get("target_port").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let target_addr = payload
+            .get("target_addr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target_port = payload
+            .get("target_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
         let start_ts = now_ts();
 
         use tokio::net::TcpStream;
         let addr = format!("{}:{}", target_addr, target_port);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            TcpStream::connect(&addr),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
+                .await;
 
         let (success, msg) = match result {
-            Ok(Ok(_)) => (true, format!("Target {}:{} reachable", target_addr, target_port)),
-            Ok(Err(e)) => (false, format!("Target {}:{} unreachable: {}", target_addr, target_port, e)),
-            Err(_) => (false, format!("Target {}:{} check timed out", target_addr, target_port)),
+            Ok(Ok(_)) => (
+                true,
+                format!("Target {}:{} reachable", target_addr, target_port),
+            ),
+            Ok(Err(e)) => (
+                false,
+                format!("Target {}:{} unreachable: {}", target_addr, target_port, e),
+            ),
+            Err(_) => (
+                false,
+                format!("Target {}:{} check timed out", target_addr, target_port),
+            ),
         };
 
         TaskResult {
@@ -365,8 +418,14 @@ impl TaskExecutor {
     // ═══════════════════════════════════════════════════════════════
 
     async fn exec_latency_test(&self, payload: &serde_json::Value) -> TaskResult {
-        let target_addr = payload.get("target_addr").and_then(|v| v.as_str()).unwrap_or("");
-        let target_port = payload.get("target_port").and_then(|v| v.as_i64()).unwrap_or(80) as i32;
+        let target_addr = payload
+            .get("target_addr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target_port = payload
+            .get("target_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(80) as i32;
         let count = payload.get("count").and_then(|v| v.as_i64()).unwrap_or(5) as i32;
         let start_ts = now_ts();
 
@@ -378,10 +437,9 @@ impl TaskExecutor {
             use tokio::net::TcpStream;
             let addr = format!("{}:{}", target_addr, target_port);
             let start = Instant::now();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                TcpStream::connect(&addr),
-            ).await;
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(&addr))
+                    .await;
             let elapsed = start.elapsed().as_millis() as f64;
 
             match result {
@@ -407,24 +465,32 @@ impl TaskExecutor {
 
         let msg = format!(
             "Latency test to {}:{} — sent: {}, success: {}, fail: {}, avg: {}ms",
-            target_addr, target_port, count, success_count, fail_count,
-            avg.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "N/A".into())
+            target_addr,
+            target_port,
+            count,
+            success_count,
+            fail_count,
+            avg.map(|v| format!("{:.1}", v))
+                .unwrap_or_else(|| "N/A".into())
         );
 
         TaskResult {
             task_id: String::new(),
             success: fail_count == 0,
             message: msg,
-            stdout: Some(serde_json::json!({
-                "target_addr": target_addr,
-                "target_port": target_port,
-                "count": count,
-                "success_count": success_count,
-                "fail_count": fail_count,
-                "avg_latency_ms": avg,
-                "min_latency_ms": min,
-                "max_latency_ms": max,
-            }).to_string()),
+            stdout: Some(
+                serde_json::json!({
+                    "target_addr": target_addr,
+                    "target_port": target_port,
+                    "count": count,
+                    "success_count": success_count,
+                    "fail_count": fail_count,
+                    "avg_latency_ms": avg,
+                    "min_latency_ms": min,
+                    "max_latency_ms": max,
+                })
+                .to_string(),
+            ),
             stderr: None,
             exit_code: if fail_count == 0 { Some(0) } else { Some(1) },
             started_at: start_ts,
@@ -442,11 +508,14 @@ impl TaskExecutor {
                 let mut results = Vec::new();
                 for t in ts {
                     let target_addr = t.get("target_addr").and_then(|v| v.as_str()).unwrap_or("");
-                    let target_port = t.get("target_port").and_then(|v| v.as_i64()).unwrap_or(80) as i32;
-                    let single = self.exec_latency_test(&serde_json::json!({
-                        "target_addr": target_addr,
-                        "target_port": target_port,
-                    })).await;
+                    let target_port =
+                        t.get("target_port").and_then(|v| v.as_i64()).unwrap_or(80) as i32;
+                    let single = self
+                        .exec_latency_test(&serde_json::json!({
+                            "target_addr": target_addr,
+                            "target_port": target_port,
+                        }))
+                        .await;
                     results.push(serde_json::json!({
                         "target": format!("{}:{}", target_addr, target_port),
                         "success": single.success,
@@ -509,21 +578,21 @@ impl TaskExecutor {
         let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let start_ts = now_ts();
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                let client = reqwest::Client::new();
-                let start = Instant::now();
-                let resp = client.head(url).send().await?;
-                let elapsed = start.elapsed().as_millis() as f64;
-                Ok::<_, reqwest::Error>((resp.status().as_u16(), elapsed))
-            },
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let client = reqwest::Client::new();
+            let start = Instant::now();
+            let resp = client.head(url).send().await?;
+            let elapsed = start.elapsed().as_millis() as f64;
+            Ok::<_, reqwest::Error>((resp.status().as_u16(), elapsed))
+        })
+        .await;
 
         let (success, msg, elapsed) = match result {
-            Ok(Ok((status, ms))) => {
-                (status < 400, format!("HTTP {} in {:.1}ms", status, ms), Some(ms))
-            }
+            Ok(Ok((status, ms))) => (
+                status < 400,
+                format!("HTTP {} in {:.1}ms", status, ms),
+                Some(ms),
+            ),
             Ok(Err(e)) => (false, format!("HTTP ping failed: {}", e), None),
             Err(_) => (false, "HTTP ping timed out".into(), None),
         };
@@ -542,16 +611,21 @@ impl TaskExecutor {
 
     async fn exec_tcp_ping(&self, payload: &serde_json::Value) -> TaskResult {
         // Same as latency test but single shot
-        let single = self.exec_latency_test(&serde_json::json!({
-            "target_addr": payload.get("target_addr").and_then(|v| v.as_str()),
-            "target_port": payload.get("target_port").and_then(|v| v.as_i64()),
-            "count": 1,
-        })).await;
+        let single = self
+            .exec_latency_test(&serde_json::json!({
+                "target_addr": payload.get("target_addr").and_then(|v| v.as_str()),
+                "target_port": payload.get("target_port").and_then(|v| v.as_i64()),
+                "count": 1,
+            }))
+            .await;
         single
     }
 
     async fn exec_icmp_ping(&self, payload: &serde_json::Value) -> TaskResult {
-        let target = payload.get("target_addr").and_then(|v| v.as_str()).unwrap_or("");
+        let target = payload
+            .get("target_addr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let count = payload.get("count").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
         let start_ts = now_ts();
 
@@ -566,7 +640,11 @@ impl TaskExecutor {
                 TaskResult {
                     task_id: String::new(),
                     success: output.status.success(),
-                    message: if output.status.success() { "ICMP ping OK".into() } else { format!("ICMP ping failed: {}", stderr.trim()) },
+                    message: if output.status.success() {
+                        "ICMP ping OK".into()
+                    } else {
+                        format!("ICMP ping failed: {}", stderr.trim())
+                    },
                     stdout: Some(stdout),
                     stderr: Some(stderr),
                     exit_code: output.status.code(),
@@ -602,7 +680,12 @@ struct CmdResult {
 /// Execute a command using Command::new().args() — NO sh -c
 fn run_cmd(args: &[String]) -> CmdResult {
     if args.is_empty() {
-        return CmdResult { success: false, stdout: None, stderr: Some("Empty command".into()), exit_code: None };
+        return CmdResult {
+            success: false,
+            stdout: None,
+            stderr: Some("Empty command".into()),
+            exit_code: None,
+        };
     }
     let result = std::process::Command::new(&args[0])
         .args(&args[1..])
@@ -636,6 +719,10 @@ trait IfStd {
 
 impl IfStd for f64 {
     fn if_std(&self) -> Option<f64> {
-        if self.is_finite() && *self > 0.0 { Some(*self) } else { None }
+        if self.is_finite() && *self > 0.0 {
+            Some(*self)
+        } else {
+            None
+        }
     }
 }

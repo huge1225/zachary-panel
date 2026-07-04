@@ -35,9 +35,9 @@ pub struct ChangePasswordRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtClaims {
-    pub sub: String,       // user id
+    pub sub: String, // user id
     pub username: String,
     pub role: String,
-    pub exp: usize,        // expiration
-    pub iat: usize,        // issued at
+    pub exp: usize, // expiration
+    pub iat: usize, // issued at
 }

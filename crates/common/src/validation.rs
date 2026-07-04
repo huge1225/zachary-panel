@@ -19,9 +19,10 @@ pub fn validate_hostname(host: &str) -> bool {
     if validate_ip(host) {
         return true;
     }
-    host.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '.' || c == '-'
-    }) && !host.starts_with('-') && !host.ends_with('-')
+    host.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && !host.starts_with('-')
+        && !host.ends_with('-')
 }
 
 /// 校验路径安全性（防止路径遍历）
@@ -36,16 +37,17 @@ pub fn validate_path(path: &str) -> bool {
         return false;
     }
     // 只允许可打印的 ASCII + /
-    path.chars().all(|c| {
-        c.is_ascii_graphic() || c == '/' || c == ' '
-    })
+    path.chars()
+        .all(|c| c.is_ascii_graphic() || c == '/' || c == ' ')
 }
 
 /// 校验节点名称
 pub fn validate_node_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= 128 && name.chars().all(|c| {
-        c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' || c as u32 > 127
-    })
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == ' ' || c as u32 > 127)
 }
 
 /// 校验字符串长度

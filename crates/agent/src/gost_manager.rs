@@ -1,6 +1,5 @@
 /// gost 进程管理模块
 /// 借鉴 flux-panel 的方式：用配置文件管理 gost 转发，支持热重载
-
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -32,11 +31,7 @@ impl GostManager {
     }
 
     /// 启动一条 gost 转发规则
-    pub async fn start_forward(
-        &self,
-        rule_name: &str,
-        args: &[String],
-    ) -> anyhow::Result<()> {
+    pub async fn start_forward(&self, rule_name: &str, args: &[String]) -> anyhow::Result<()> {
         let mut procs = self.processes.lock().await;
         if procs.contains_key(rule_name) {
             warn!("gost rule {} already running", rule_name);
@@ -116,7 +111,9 @@ impl GostManager {
 
     /// 列出运行中的规则
     pub async fn list_running(&self) -> Vec<(String, u32)> {
-        self.processes.lock().await
+        self.processes
+            .lock()
+            .await
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect()
@@ -133,6 +130,12 @@ impl GostManager {
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

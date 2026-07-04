@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSignatureHeaders {
     pub node_id: String,
-    pub timestamp: String,  // Unix 秒级 timestamp
-    pub nonce: String,      // 随机一次性值
-    pub signature: String,  // HMAC-SHA256 hex
+    pub timestamp: String, // Unix 秒级 timestamp
+    pub nonce: String,     // 随机一次性值
+    pub signature: String, // HMAC-SHA256 hex
 }
 
 /// 签名负载（用于计算签名）

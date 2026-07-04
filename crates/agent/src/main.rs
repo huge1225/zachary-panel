@@ -16,7 +16,7 @@ mod system;
 mod ws;
 
 use config::AgentConfig;
-use tracing::{info, error, warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
