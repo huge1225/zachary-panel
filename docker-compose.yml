@@ -1,4 +1,7 @@
 services:
+  # ═══════════════════════════════════════
+  # Server (主控面板)
+  # ═══════════════════════════════════════
   server:
     build:
       context: .
@@ -6,7 +9,7 @@ services:
     container_name: zachary-panel
     restart: unless-stopped
     ports:
-      - "38088:38088"
+      - "${PORT:-38088}:38088"
     environment:
       - JWT_SECRET=${JWT_SECRET:-change-me-to-a-random-secret}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change-me}
@@ -14,15 +17,40 @@ services:
       - DATABASE_URL=sqlite:///app/data/zachary-panel.db?mode=rwc
       - HOST=0.0.0.0
       - PORT=38088
-      - RUST_LOG=info
-      - WS_HEARTBEAT_INTERVAL=30
+      - RUST_LOG=${RUST_LOG:-info}
+      - WS_HEARTBEAT_INTERVAL=${WS_HEARTBEAT_INTERVAL:-30}
+      - JWT_EXPIRY_HOURS=${JWT_EXPIRY_HOURS:-24}
+      - INSTALL_TOKEN_TTL_MINUTES=${INSTALL_TOKEN_TTL_MINUTES:-30}
     volumes:
       - zachary-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:38088/api/auth/login"]
+      test: ["CMD", "curl", "-sf", "http://localhost:38088/api/auth/login"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s
+
+  # ═══════════════════════════════════════
+  # Agent (转发节点) — 可选，本机部署时使用
+  # 远程节点建议用 install-agent.sh 或单独部署
+  # ═══════════════════════════════════════
+  # agent:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.agent
+  #   container_name: zachary-agent
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   cap_add:
+  #     - NET_ADMIN
+  #   environment:
+  #     - SERVER_URL=https://panel.example.com
+  #     - NODE_ID=node_xxxxxxxxxxxx
+  #     - NODE_TOKEN=nt_xxxxxxxxxxxx
+  #     - TLS_VERIFY=true
+  #     - RUST_LOG=info
+  #   volumes:
+  #     - agent-config:/app
 
 volumes:
   zachary-data:

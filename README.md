@@ -1,84 +1,55 @@
 # Zachary Panel
 
-一个基于 Rust 开发的现代化流量转发管理面板，支持多节点管理、nftables/gost 转发、延迟测试和安全审计。
+[![CI](https://github.com/huge1225/zachary-panel/actions/workflows/ci.yml/badge.svg)](https://github.com/huge1225/zachary-panel/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+一个基于 Rust 的现代化流量转发管理面板，支持 nftables 内核转发和 gost 应用层转发（含 WS/WSS 隧道），自带多节点管理、延迟测试和安全审计。
 
 ## ⚠️ 安全声明
 
-本项目**仅用于合法的服务器流量转发、内网穿透、运维测试和个人网络管理**。
+本项目**仅用于合法的服务器流量转发、内网穿透、运维测试和个人网络管理**。禁止用于任何违法用途。
 
-**禁止用于：**
-- 任何形式的攻击、扫描
-- 绕过网络限制
-- 未授权代理
-- 恶意流量转发
-- 任何违法用途
+## ✨ 功能特性
 
-## 功能特性
-
-- 🔐 **安全架构**：Agent 全程 WSS 加密通信、HMAC-SHA256 签名、timestamp + nonce 防重放
-- 🖥️ **多节点管理**：批量管理转发节点，自助添加、一键安装 Agent
-- 🔄 **多种转发模式**：nftables 内核转发（TCP/UDP）、gost 应用层转发
-- 🌐 **隧道支持**：WebSocket / WSS 隧道转发
-- 📊 **延迟测试**：ICMP/TCP/HTTP/DNS 延迟测试，多节点批量测试
-- 📈 **流量统计**：nftables counter 流量统计
+- 🔐 **安全通信**：WSS 加密 + HMAC-SHA256 签名 + timestamp/nonce 防重放
+- 🖥️ **多节点管理**：一键安装 Agent、实时探针监控（CPU/MEM/DISK/SWAP/网络流量）
+- 🔄 **多种转发**：
+  - **nftables DNAT**（内核层）— TCP / UDP / TCP+UDP，高性能
+  - **gost**（应用层）— Plain / WebSocket / WSS+TLS 隧道
+- 📊 **延迟测试**：ICMP / TCP / HTTP / DNS，多节点批量测试
 - 📋 **完整审计**：操作日志、安全事件、任务记录
-- 🎨 **现代 UI**：Vue 3 + TypeScript，深色/浅色模式
+- 🎨 **现代 UI**：Vue 3 + TypeScript，响应式探针卡片
 
-## 技术栈
-
-| 组件 | 技术 |
-|------|------|
-| 后端 | Rust + Axum + Tokio + SQLx |
-| 前端 | Vue 3 + TypeScript + Naive UI + Vite |
-| 数据库 | SQLite（默认），预留 PostgreSQL |
-| Agent | Rust + tokio-tungstenite + sysinfo |
-| 部署 | Docker Compose + systemd |
-
-## 架构
-
-```
-浏览器 → Nginx (HTTPS) → Server (Axum) ← WSS → Agent (转发节点)
-                            ↓
-                        SQLite
-```
-
-详细架构见 [docs/architecture.md](docs/architecture.md)
-
-## 快速开始
+## 🚀 快速开始
 
 ### 前置条件
 
-- Docker & Docker Compose
-- 域名已解析到 VPS
-- 端口 80/443 可访问
+- Docker & Docker Compose（Server）
+- 任意 Linux（Agent 节点）
 
-### 部署主控
+### 1. 部署主控
 
 ```bash
-# 克隆项目
-git clone https://github.com/zachary-su/zachary-panel.git
+git clone https://github.com/huge1225/zachary-panel.git
 cd zachary-panel
 
-# 配置环境变量
+# 配置
 cp .env.example .env
-# 编辑 .env：设置 ADMIN_PASSWORD、JWT_SECRET、DOMAIN
+# 生成 JWT 密钥
+echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
+# 设置管理员密码
+vim .env
 
 # 启动
-docker compose up -d
+docker compose up -d --build
 
 # 访问
-# https://your-domain.com
-# 默认管理员: admin / 你的 ADMIN_PASSWORD
+# http://<服务器IP>:38088
 ```
 
-### 添加转发节点
+### 2. 添加转发节点
 
-1. 登录面板 → 节点管理 → 添加节点
-2. 复制生成的安装命令
-3. 在目标 VPS 上执行安装命令
-4. 节点自动注册并与主控建立 WSS 连接
-
-## Agent 安装
+面板 → 节点管理 → 添加节点 → 复制安装命令 → 在目标 VPS 执行：
 
 ```bash
 curl -fsSL https://panel.example.com/install-agent.sh | bash -s -- \
@@ -87,94 +58,86 @@ curl -fsSL https://panel.example.com/install-agent.sh | bash -s -- \
   --install-token it_yyyyy
 ```
 
-详细 Agent 文档见 [docs/agent.md](docs/agent.md)
+### 3. 创建转发规则
 
-## 转发规则创建
+面板 → 转发规则 → 新增 → 选择节点、模式（nft/gost）、协议、隧道类型 → 启动
 
-1. 面板 → 转发规则 → 新增规则
-2. 选择节点、转发方式（nft/gost）、协议、端口
-3. 配置源/目标地址和端口
-4. 启动规则
-5. 查看运行状态和日志
+📖 **完整部署文档**: [docs/deploy.md](docs/deploy.md)
 
-## 延迟测试
+## 转发能力一览
 
-1. 面板 → 延迟测试
-2. 选择测试类型（ICMP/TCP/HTTP/DNS）
-3. 输入目标地址和端口
-4. 选择节点（单个或多个）
-5. 开始测试
-6. 查看测试结果和历史记录
+| 模式 | 协议 | 隧道 | 说明 |
+|------|------|------|------|
+| nftables | TCP / UDP / TCP+UDP | — | 内核 DNAT，最高性能 |
+| gost Plain | TCP / UDP / TCP+UDP | 直连 | 应用层转发，兼容性好 |
+| gost WS | — | tcp+ws | WebSocket 隧道，穿 CDN |
+| gost WSS | — | tcp+wss+TLS | TLS 加密隧道 |
 
-## GitHub 开发流程
+## 技术栈
+
+| 组件 | 技术 |
+|------|------|
+| 后端 | Rust + Axum + Tokio + SQLx |
+| 前端 | Vue 3 + TypeScript + Vite |
+| 数据库 | SQLite (WAL 模式) |
+| Agent | Rust + tokio-tungstenite + sysinfo |
+| 部署 | Docker Compose / systemd |
+
+## 升级
 
 ```bash
-# 克隆
-git clone https://github.com/zachary-su/zachary-panel.git
 cd zachary-panel
-
-# 功能开发
-git checkout dev
-git checkout -b feature/your-feature
-git add .
-git commit -m "feat(scope): description"
-git push origin feature/your-feature
-# 创建 PR → dev
-
-# 版本发布
-git tag v0.1.0
-git push origin v0.1.0
+git pull origin main
+docker compose up -d --build
 ```
 
-详见 [docs/github-flow.md](docs/github-flow.md)
+数据库自动迁移，数据不丢失。详见 [部署文档](docs/deploy.md#四升级)。
 
-## 版本规划
+## .env 配置
 
-| 版本 | 内容 |
-|------|------|
-| v0.1.0 | 基础框架、登录认证、节点管理、运营基础 |
-| v0.2.0 | Agent 任务系统、HMAC 签名、nftables TCP/UDP |
-| v0.3.0 | gost 转发、进程管理 |
-| v0.4.0 | WebSocket/WSS 隧道 |
-| v0.5.0 | 延迟测试、连通性测试 |
-| v0.6.0 | 流量统计、UI 优化、安全事件 |
-| v1.0.0 | 稳定发布 |
+```env
+# 必须修改
+JWT_SECRET=<openssl rand -hex 32>
+ADMIN_PASSWORD=<你的密码>
 
-## 安全注意事项
+# 可选
+ADMIN_USERNAME=admin
+PORT=38088
+RUST_LOG=info
+```
 
-- ⚠️ 生产环境**必须**使用 HTTPS
-- ⚠️ 生产环境**必须**修改默认管理员密码
-- ⚠️ 建议定期轮换 node_token
-- ⚠️ 建议开启防火墙，仅暴露必要端口
-- ℹ️ Agent 已做加密通信和签名校验，但**任何客户端程序都不能保证绝对无法被逆向**
-- ℹ️ 安全核心依赖 Server 端鉴权、签名校验、token 轮换、节点禁用和审计日志
-
-详细安全文档见 [docs/security.md](docs/security.md)
-
-## 文档列表
-
-- [架构设计](docs/architecture.md)
-- [API 设计](docs/api.md)
-- [数据库设计](docs/database.md)
-- [部署指南](docs/deploy.md)
-- [Agent 文档](docs/agent.md)
-- [安全文档](docs/security.md)
-- [GitHub 流程](docs/github-flow.md)
+完整配置项见 [部署文档](docs/deploy.md#五完整-env-配置参考)。
 
 ## 常见问题
 
-### Agent 连接不上主控？
-检查：防火墙是否开放 443 出站、TLS 证书是否有效、node_token 是否正确。
+<details>
+<summary><b>Agent 连接不上？</b></summary>
 
-### nftables 转发不生效？
-确认 `net.ipv4.ip_forward=1` 已启用：`sysctl net.ipv4.ip_forward`
+检查：① Agent 出站 443 是否畅通 ② TLS 证书是否有效 ③ install_token 是否过期（30 分钟）
+</details>
 
-### 如何重新生成 node_token？
-面板 → 节点管理 → 节点详情 → 重新生成 Token → 更新 Agent 配置文件。
+<details>
+<summary><b>nftables 转发不生效？</b></summary>
 
-### 如何禁用节点？
-面板 → 节点管理 → 禁用节点。Agent 连接会立即被拒绝。
+```bash
+sysctl net.ipv4.ip_forward
+# 如果不是 1，执行：
+echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf && sysctl -p
+```
+</details>
+
+<details>
+<summary><b>gost 转发报错？</b></summary>
+
+确认目标节点已安装 gost：`which gost`。WSS 模式还需要有效的 TLS 证书和私钥。
+</details>
+
+<details>
+<summary><b>如何重置管理员密码？</b></summary>
+
+修改 `.env` 中的 `ADMIN_PASSWORD`，重启服务。首次启动时会初始化，之后需要通过面板修改。
+</details>
 
 ## License
 
-MIT License - 见 [LICENSE](LICENSE)
+MIT
