@@ -26,7 +26,7 @@ export const nodesApi = {
     return api.delete(`/nodes/${id}`)
   },
   installCommand(id: number, ttlMinutes?: number) {
-    return api.post(`/nodes/${id}/install-command`, { ttl_minutes: ttlMinutes || 30 })
+    return api.get(`/nodes/${id}/install-command`, { params: { ttl_minutes: ttlMinutes || 30 } })
   },
 }
 

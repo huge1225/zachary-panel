@@ -54,7 +54,10 @@
       <div class="bg-white rounded-lg p-6 w-full max-w-lg">
         <h3 class="text-lg font-semibold mb-2">安装命令</h3>
         <p class="text-sm text-slate-500 mb-3">在目标节点上执行此命令</p>
-        <pre class="bg-slate-900 text-green-400 rounded p-3 text-sm overflow-x-auto">{{ installCmd }}</pre>
+        <div class="relative">
+          <pre class="bg-slate-900 text-green-400 rounded p-3 text-sm overflow-x-auto pr-12">{{ installCmd }}</pre>
+          <button @click="copyInstallCmd" class="absolute top-2 right-2 bg-slate-700 hover:bg-slate-600 text-white text-xs px-2 py-1 rounded">{{ copyBtnText }}</button>
+        </div>
         <div class="flex justify-end mt-4">
           <button @click="installCmd = ''" class="px-4 py-2 text-sm rounded bg-blue-600 text-white">关闭</button>
         </div>
@@ -71,6 +74,7 @@ const nodes = ref<any[]>([])
 const showCreate = ref(false)
 const installCmd = ref('')
 const form = ref({ name: '', public_ip: '', remark: '' })
+const copyBtnText = ref('复制')
 
 onMounted(load)
 
@@ -89,6 +93,24 @@ async function createNode() {
 async function getInstallCmd(id: number) {
   const res = await nodesApi.installCommand(id)
   installCmd.value = res.data.data?.command || ''
+}
+
+async function copyInstallCmd() {
+  try {
+    await navigator.clipboard.writeText(installCmd.value)
+    copyBtnText.value = '已复制'
+    setTimeout(() => copyBtnText.value = '复制', 2000)
+  } catch {
+    // Fallback for non-secure contexts
+    const ta = document.createElement('textarea')
+    ta.value = installCmd.value
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+    copyBtnText.value = '已复制'
+    setTimeout(() => copyBtnText.value = '复制', 2000)
+  }
 }
 
 function statusClass(status: string) {
