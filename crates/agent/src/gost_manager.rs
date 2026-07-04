@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// gost 进程管理器
+#[derive(Debug)]
 pub struct GostManager {
     gost_path: String,
     config_dir: String,

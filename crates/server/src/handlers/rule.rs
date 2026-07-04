@@ -187,25 +187,16 @@ pub async fn test_chain(
 }
 
 async fn create_rule_task(state: &AppState, rule_id: i64, task_type: &str) -> impl IntoResponse {
-    let r = sqlx::query("SELECT id,node_id,mode,protocol,listen_addr,listen_port,target_addr,target_port,tunnel_type,ws_path,tls_cert_path,tls_key_path,tls_skip_verify FROM forward_rules WHERE id=?")
+    let r = sqlx::query("SELECT fr.id,fr.node_id,fr.name,fr.mode,fr.protocol,fr.listen_addr,fr.listen_port,fr.target_addr,fr.target_port,fr.tunnel_type,fr.ws_path,fr.tls_cert_path,fr.tls_key_path,fr.tls_skip_verify,n.public_ip FROM forward_rules fr LEFT JOIN nodes n ON fr.node_id=n.node_id WHERE fr.id=?")
         .bind(rule_id).fetch_optional(&state.pool).await;
     #[allow(clippy::type_complexity)]
-    let (nid, mode, proto, la, lp, ta, tp, tt, wp, tcp, tkp, tsv): (
-        String,
-        String,
-        String,
-        String,
-        i32,
-        String,
-        i32,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        i32,
+    let (nid, rule_name, mode, proto, la, lp, ta, tp, tt, wp, tcp, tkp, tsv, public_ip): (
+        String, String, String, String, String, i32, String, i32, String,
+        Option<String>, Option<String>, Option<String>, i32, Option<String>,
     ) = match r {
         Ok(Some(row)) => (
             row.get("node_id"),
+            row.get("name"),
             row.get("mode"),
             row.get("protocol"),
             row.get("listen_addr"),
@@ -217,6 +208,7 @@ async fn create_rule_task(state: &AppState, rule_id: i64, task_type: &str) -> im
             row.get("tls_cert_path"),
             row.get("tls_key_path"),
             row.get("tls_skip_verify"),
+            row.get("public_ip"),
         ),
         _ => {
             return (
@@ -226,7 +218,7 @@ async fn create_rule_task(state: &AppState, rule_id: i64, task_type: &str) -> im
         }
     };
     let tid = format!("task_{}", zachary_panel_common::random_hex(16));
-    let payload = serde_json::json!({"rule_id":rule_id,"mode":mode,"protocol":proto,"listen_addr":la,"listen_port":lp,"target_addr":ta,"target_port":tp,"tunnel_type":tt,"ws_path":wp,"tls_cert_path":tcp,"tls_key_path":tkp,"tls_skip_verify":tsv!=0});
+    let payload = serde_json::json!({"rule_id":rule_id,"rule_name":rule_name,"mode":mode,"protocol":proto,"listen_addr":la,"public_ip":public_ip.unwrap_or_default(),"listen_port":lp,"target_addr":ta,"target_port":tp,"tunnel_type":tt,"ws_path":wp,"tls_cert_path":tcp,"tls_key_path":tkp,"tls_skip_verify":tsv!=0});
     let _ = sqlx::query(
         "INSERT INTO tasks(task_id,node_id,type,payload,status) VALUES(?,?,?,?,'pending')",
     )

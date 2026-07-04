@@ -137,8 +137,13 @@ impl NftCommand {
         ])
     }
 
-    pub fn delete_table(&self) -> Vec<String> {
-        args(&[&self.nft_path, "delete", "table", "ip", &self.table])
+    /// 重载 zachary-panel 专属规则 — flush forward chain 后重新初始化
+    /// 不触碰系统 /etc/nftables.conf
+    pub fn reload_ruleset(&self) -> Vec<Vec<String>> {
+        vec![
+            self.flush_chain(),
+            self.init_chain(),
+        ]
     }
 
     pub fn list_rules(&self) -> Vec<String> {
@@ -158,10 +163,6 @@ impl NftCommand {
 
     pub fn check_available(&self) -> Vec<String> {
         args(&[&self.nft_path, "--version"])
-    }
-
-    pub fn reload(&self) -> Vec<String> {
-        args(&[&self.nft_path, "-f", "/etc/nftables.conf"])
     }
 }
 

@@ -2,13 +2,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 /// 任务执行模块
 /// 负责接收 Server 下发的任务，分发执行，返回结果
-use zachary_panel_common::{TaskResult, TaskType};
-use zachary_panel_core::NftCommand;
+use zachary_panel_common::{ForwardProtocol, TaskResult, TaskType, TunnelType};
+use zachary_panel_core::{GostCommand, NftCommand};
+
+use crate::gost_manager::GostManager;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct TaskExecutor {
     nft_path: String,
     gost_path: String,
+    gost_manager: Arc<GostManager>,
 }
 
 /// nft 命令参数验证 — 防止命令注入
@@ -21,18 +25,28 @@ fn validate_nft_args(args: &[String]) -> Result<(), String> {
         }
     }
     // 所有 nft 命令必须限定在 zachary-panel table
+    // 例外仅限: --version (check_available)
     let combined = args.join(" ");
-    if !combined.contains("zachary-panel") && !combined.contains("--version") {
+    if combined.contains("--version") {
+        return Ok(());
+    }
+    if !combined.contains("zachary-panel") {
         return Err(format!("nft command must reference zachary-panel table: {}", combined));
+    }
+    // 额外检查: 禁止 -f / --file 参数 (全局 flush 危险)
+    if combined.contains(" -f ") || combined.contains(" --file ") {
+        return Err("nft -f/--file is forbidden (global flush risk)".into());
     }
     Ok(())
 }
 
 impl TaskExecutor {
     pub fn new(nft_path: &str, gost_path: &str) -> Self {
+        let gost_manager = Arc::new(GostManager::new(gost_path, "/etc/zachary-panel/gost"));
         Self {
             nft_path: nft_path.to_string(),
             gost_path: gost_path.to_string(),
+            gost_manager,
         }
     }
 
@@ -130,12 +144,27 @@ impl TaskExecutor {
     // ═══════════════════════════════════════════════════════════════
 
     async fn exec_forward_rule(&self, payload: &serde_json::Value, _dry_run: bool) -> TaskResult {
+        let mode = payload
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("nft");
+
+        match mode {
+            "gost" => self.exec_gost_forward(payload).await,
+            _ => self.exec_nft_forward(payload).await,
+        }
+    }
+
+    /// nft DNAT 转发
+    async fn exec_nft_forward(&self, payload: &serde_json::Value) -> TaskResult {
         let protocol = payload
             .get("protocol")
             .and_then(|v| v.as_str())
             .unwrap_or("tcp");
+        // public_ip: 优先从 payload 取，否则从节点信息取，否则用 0.0.0.0
         let public_ip = payload
             .get("public_ip")
+            .or_else(|| payload.get("listen_addr"))
             .and_then(|v| v.as_str())
             .unwrap_or("0.0.0.0");
         let listen_port = payload
@@ -151,13 +180,12 @@ impl TaskExecutor {
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32;
 
-        let proto = zachary_panel_common::ForwardProtocol::parse(protocol);
+        let proto = ForwardProtocol::parse(protocol);
         let start_ts = now_ts();
 
         match proto {
             Some(p) => {
                 let nft = NftCommand::new(&self.nft_path);
-                // Ensure table and chain exist
                 let mut results = Vec::new();
                 results.push(run_cmd_validated(&nft.init_table()));
                 results.push(run_cmd_validated(&nft.init_chain()));
@@ -170,10 +198,7 @@ impl TaskExecutor {
                 let msg = if last.success {
                     "nft forward rule added".into()
                 } else {
-                    last.stderr
-                        .as_deref()
-                        .unwrap_or("unknown error")
-                        .to_string()
+                    last.stderr.as_deref().unwrap_or("unknown error").to_string()
                 };
                 TaskResult {
                     task_id: String::new(),
@@ -199,7 +224,181 @@ impl TaskExecutor {
         }
     }
 
+    /// gost 转发 — 支持 plain / ws / wss 隐道
+    async fn exec_gost_forward(&self, payload: &serde_json::Value) -> TaskResult {
+        let protocol = payload
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tcp");
+        let listen_port = payload
+            .get("listen_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let target_addr = payload
+            .get("target_addr")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let target_port = payload
+            .get("target_port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let tunnel_type = payload
+            .get("tunnel_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("plain");
+        let ws_path = payload.get("ws_path").and_then(|v| v.as_str());
+        let cert_path = payload.get("tls_cert_path").and_then(|v| v.as_str());
+        let key_path = payload.get("tls_key_path").and_then(|v| v.as_str());
+        let tls_skip_verify = payload
+            .get("tls_skip_verify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let rule_name = payload
+            .get("rule_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("rule");
+        let rule_id = payload
+            .get("rule_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let start_ts = now_ts();
+
+        let proto = match ForwardProtocol::parse(protocol) {
+            Some(p) => p,
+            None => {
+                return TaskResult {
+                    task_id: String::new(),
+                    success: false,
+                    message: format!("Invalid protocol: {}", protocol),
+                    stdout: None,
+                    stderr: None,
+                    exit_code: None,
+                    started_at: start_ts,
+                    finished_at: now_ts(),
+                };
+            }
+        };
+
+        let tunnel = match TunnelType::parse(tunnel_type) {
+            Some(t) => t,
+            None => {
+                return TaskResult {
+                    task_id: String::new(),
+                    success: false,
+                    message: format!("Invalid tunnel_type: {}", tunnel_type),
+                    stdout: None,
+                    stderr: None,
+                    exit_code: None,
+                    started_at: start_ts,
+                    finished_at: now_ts(),
+                };
+            }
+        };
+
+        let gost = GostCommand::new(&self.gost_path);
+        let args = match gost.generate_forward(
+            "gost",
+            &proto,
+            listen_port,
+            target_addr,
+            target_port,
+            &tunnel,
+            ws_path,
+            cert_path,
+            key_path,
+            tls_skip_verify,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                return TaskResult {
+                    task_id: String::new(),
+                    success: false,
+                    message: e,
+                    stdout: None,
+                    stderr: None,
+                    exit_code: None,
+                    started_at: start_ts,
+                    finished_at: now_ts(),
+                };
+            }
+        };
+
+        info!("gost forward: rule={} args={:?}", rule_name, args);
+
+        // 使用 GostManager 启动 gost 进程
+        let gost_name = format!("rule_{}", rule_id);
+        match self.gost_manager.start_forward(&gost_name, &args).await {
+            Ok(()) => TaskResult {
+                task_id: String::new(),
+                success: true,
+                message: format!("gost forward started: {} ({})", gost_name, tunnel_type),
+                stdout: Some(args.join(" ")),
+                stderr: None,
+                exit_code: Some(0),
+                started_at: start_ts,
+                finished_at: now_ts(),
+            },
+            Err(e) => TaskResult {
+                task_id: String::new(),
+                success: false,
+                message: format!("gost forward failed: {}", e),
+                stdout: None,
+                stderr: Some(e.to_string()),
+                exit_code: None,
+                started_at: start_ts,
+                finished_at: now_ts(),
+            },
+        }
+    }
+
     async fn exec_delete_forward_rule(&self, payload: &serde_json::Value) -> TaskResult {
+        let mode = payload
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("nft");
+
+        match mode {
+            "gost" => self.exec_gost_stop(payload).await,
+            _ => self.exec_nft_delete(payload).await,
+        }
+    }
+
+    /// gost 停止转发
+    async fn exec_gost_stop(&self, payload: &serde_json::Value) -> TaskResult {
+        let rule_id = payload
+            .get("rule_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let start_ts = now_ts();
+        let gost_name = format!("rule_{}", rule_id);
+
+        match self.gost_manager.stop_forward(&gost_name).await {
+            Ok(()) => TaskResult {
+                task_id: String::new(),
+                success: true,
+                message: format!("gost forward stopped: {}", gost_name),
+                stdout: None,
+                stderr: None,
+                exit_code: Some(0),
+                started_at: start_ts,
+                finished_at: now_ts(),
+            },
+            Err(e) => TaskResult {
+                task_id: String::new(),
+                success: false,
+                message: format!("gost stop failed: {}", e),
+                stdout: None,
+                stderr: Some(e.to_string()),
+                exit_code: None,
+                started_at: start_ts,
+                finished_at: now_ts(),
+            },
+        }
+    }
+
+    /// nft 精确删除转发规则
+    async fn exec_nft_delete(&self, payload: &serde_json::Value) -> TaskResult {
         let listen_port = payload
             .get("listen_port")
             .and_then(|v| v.as_i64())
@@ -316,19 +515,28 @@ impl TaskExecutor {
     async fn exec_nft_reload(&self) -> TaskResult {
         let nft = NftCommand::new(&self.nft_path);
         let start_ts = now_ts();
-        let r = run_cmd_validated(&nft.reload());
-        let msg = if r.success {
-            "nftables reloaded".into()
+        // 安全重载: 只 flush + 重建 zachary-panel forward chain
+        let mut all_success = true;
+        let mut msgs = Vec::new();
+        for cmd in nft.reload_ruleset() {
+            let r = run_cmd_validated(&cmd);
+            if !r.success {
+                all_success = false;
+                msgs.push(r.stderr.unwrap_or_else(|| "unknown error".into()));
+            }
+        }
+        let msg = if all_success {
+            "zachary-panel nft ruleset reloaded".into()
         } else {
-            r.stderr.as_deref().unwrap_or("unknown error").to_string()
+            msgs.join("; ")
         };
         TaskResult {
             task_id: String::new(),
-            success: r.success,
+            success: all_success,
             message: msg,
-            stdout: r.stdout,
-            stderr: r.stderr,
-            exit_code: r.exit_code,
+            stdout: None,
+            stderr: if msgs.is_empty() { None } else { Some(msgs.join("; ")) },
+            exit_code: Some(if all_success { 0 } else { 1 }),
             started_at: start_ts,
             finished_at: now_ts(),
         }
