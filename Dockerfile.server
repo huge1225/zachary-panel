@@ -1,4 +1,12 @@
-# Build stage
+# ─── Frontend build stage ───
+FROM node:20-slim AS frontend-builder
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ─── Rust build stage ───
 FROM rust:1-bookworm AS builder
 
 WORKDIR /app
@@ -40,8 +48,11 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/zachary-panel-server /app/zachary-panel-server
 
-# Copy frontend dist if available
-COPY --from=builder /app/frontend/dist /app/frontend/dist
+# Copy frontend dist from frontend builder
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+
+# Copy deploy scripts (install-agent.sh, install-server.sh, etc.)
+COPY --from=builder /app/deploy/ /app/deploy/
 
 # Data directory
 RUN mkdir -p /app/data
