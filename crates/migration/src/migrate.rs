@@ -296,8 +296,22 @@ async fn migrate_v2(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     for sql in &migrations {
         let _ = sqlx::query(sql).execute(pool).await;
     }
-    // 使用 println 因为 migration crate 可能没有 tracing 依赖
-    println!("v2 migrations applied");
+    // v3 增量迁移：节点监控字段
+    let v3_migrations = [
+        "ALTER TABLE nodes ADD COLUMN cpu_usage REAL DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN disk_total_gb REAL",
+        "ALTER TABLE nodes ADD COLUMN disk_used_gb REAL",
+        "ALTER TABLE nodes ADD COLUMN network_rx_bytes INTEGER DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN network_tx_bytes INTEGER DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN swap_total_mb INTEGER DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN swap_used_mb INTEGER DEFAULT 0",
+        "ALTER TABLE nodes ADD COLUMN kernel TEXT",
+        "ALTER TABLE nodes ADD COLUMN hostname TEXT",
+    ];
+    for sql in &v3_migrations {
+        let _ = sqlx::query(sql).execute(pool).await;
+    }
+    println!("v2+v3 migrations applied");
     Ok(())
 }
 

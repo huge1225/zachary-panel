@@ -1,5 +1,5 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 /// 任务执行模块
 /// 负责接收 Server 下发的任务，分发执行，返回结果
 use zachary_panel_common::{TaskResult, TaskType};
@@ -9,6 +9,23 @@ use zachary_panel_core::NftCommand;
 pub struct TaskExecutor {
     nft_path: String,
     gost_path: String,
+}
+
+/// nft 命令参数验证 — 防止命令注入
+fn validate_nft_args(args: &[String]) -> Result<(), String> {
+    // 危险字符黑名单
+    const DANGEROUS: &[char] = &[';', '|', '&', '$', '`', '(', ')', '<', '>', '\n', '\r'];
+    for arg in args {
+        if arg.chars().any(|c| DANGEROUS.contains(&c)) {
+            return Err(format!("Dangerous character in nft argument: {}", arg));
+        }
+    }
+    // 所有 nft 命令必须限定在 zachary-panel table
+    let combined = args.join(" ");
+    if !combined.contains("zachary-panel") && !combined.contains("--version") {
+        return Err(format!("nft command must reference zachary-panel table: {}", combined));
+    }
+    Ok(())
 }
 
 impl TaskExecutor {
@@ -64,8 +81,8 @@ impl TaskExecutor {
             TaskType::CheckForwardChain => self.exec_nft_list().await,
 
             // ═══ gost 任务 ═══
-            TaskType::InstallGost => self.exec_gost_install(payload).await,
             TaskType::CheckGostVersion => self.exec_gost_version().await,
+            // InstallGost 已移除 — Agent 不应自行下载安装软件
 
             // ═══ 检测任务 ═══
             TaskType::CheckPort => self.exec_check_port(payload).await,
@@ -142,11 +159,11 @@ impl TaskExecutor {
                 let nft = NftCommand::new(&self.nft_path);
                 // Ensure table and chain exist
                 let mut results = Vec::new();
-                results.push(run_cmd(&nft.init_table()));
-                results.push(run_cmd(&nft.init_chain()));
+                results.push(run_cmd_validated(&nft.init_table()));
+                results.push(run_cmd_validated(&nft.init_chain()));
 
                 for cmds in nft.add_forward(&p, public_ip, listen_port, target_addr, target_port) {
-                    results.push(run_cmd(&cmds));
+                    results.push(run_cmd_validated(&cmds));
                 }
 
                 let last = results.into_iter().last().unwrap();
@@ -202,23 +219,95 @@ impl TaskExecutor {
             };
         }
 
-        // Delete rule by flushing the entire chain and re-applying remaining rules
-        // For now, we flush the chain (simpler approach)
-        let nft = NftCommand::new(&self.nft_path);
-        let r = run_cmd(&nft.flush_chain());
+        // 精确删除：列出规则，找到匹配 listen_port 的 handle，按 handle 删除
+        let _nft = NftCommand::new(&self.nft_path);
 
-        let msg = if r.success {
-            "nft chain flushed".into()
+        // 1. 列出规则（带 handle）
+        let list_args = vec![
+            self.nft_path.clone(),
+            "list".into(),
+            "chain".into(),
+            "ip".into(),
+            "zachary-panel".into(),
+            "forward".into(),
+            "-a".into(),
+        ];
+        if let Err(e) = validate_nft_args(&list_args) {
+            warn!("nft validation failed: {}", e);
+            return TaskResult {
+                task_id: String::new(),
+                success: false,
+                message: e,
+                stdout: None,
+                stderr: None,
+                exit_code: None,
+                started_at: start_ts,
+                finished_at: now_ts(),
+            };
+        }
+        let list_result = run_cmd(&list_args);
+        if !list_result.success {
+            return TaskResult {
+                task_id: String::new(),
+                success: false,
+                message: list_result.stderr.clone().unwrap_or_else(|| "Failed to list nft rules".into()),
+                stdout: list_result.stdout,
+                stderr: list_result.stderr,
+                exit_code: list_result.exit_code,
+                started_at: start_ts,
+                finished_at: now_ts(),
+            };
+        }
+
+        let rules_text = list_result.stdout.unwrap_or_default();
+        let port_str = listen_port.to_string();
+        let mut deleted_any = false;
+        let mut errors = Vec::new();
+
+        // 2. 解析输出，找到匹配 listen_port 的规则并提取 handle
+        for line in rules_text.lines() {
+            if line.contains(&port_str) && line.contains("dport") {
+                if let Some(handle) = extract_handle(line) {
+                    let del_args = vec![
+                        self.nft_path.clone(),
+                        "delete".into(),
+                        "rule".into(),
+                        "ip".into(),
+                        "zachary-panel".into(),
+                        "forward".into(),
+                        "handle".into(),
+                        handle.to_string(),
+                    ];
+                    if let Err(e) = validate_nft_args(&del_args) {
+                        warn!("nft delete validation failed: {}", e);
+                        errors.push(e);
+                        continue;
+                    }
+                    let r = run_cmd(&del_args);
+                    if r.success {
+                        deleted_any = true;
+                        info!("Deleted nft rule handle {} (port {})", handle, listen_port);
+                    } else {
+                        errors.push(r.stderr.unwrap_or_default());
+                    }
+                }
+            }
+        }
+
+        let msg = if deleted_any {
+            format!("nft rule(s) for port {} deleted", listen_port)
+        } else if errors.is_empty() {
+            format!("No nft rule found for port {}", listen_port)
         } else {
-            r.stderr.as_deref().unwrap_or("unknown error").to_string()
+            errors.join("; ")
         };
         TaskResult {
             task_id: String::new(),
-            success: r.success,
+            success: deleted_any || errors.is_empty(),
             message: msg,
-            stdout: r.stdout,
-            stderr: r.stderr,
-            exit_code: r.exit_code,
+            stdout: None,
+            stderr: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+            exit_code: Some(0),
             started_at: start_ts,
             finished_at: now_ts(),
         }
@@ -227,7 +316,7 @@ impl TaskExecutor {
     async fn exec_nft_reload(&self) -> TaskResult {
         let nft = NftCommand::new(&self.nft_path);
         let start_ts = now_ts();
-        let r = run_cmd(&nft.reload());
+        let r = run_cmd_validated(&nft.reload());
         let msg = if r.success {
             "nftables reloaded".into()
         } else {
@@ -248,7 +337,7 @@ impl TaskExecutor {
     async fn exec_nft_list(&self) -> TaskResult {
         let nft = NftCommand::new(&self.nft_path);
         let start_ts = now_ts();
-        let r = run_cmd(&nft.list_rules());
+        let r = run_cmd_validated(&nft.list_rules());
         let msg = if r.success {
             "nft rules listed".into()
         } else {
@@ -297,21 +386,6 @@ impl TaskExecutor {
             stdout: r.stdout,
             stderr: r.stderr,
             exit_code: r.exit_code,
-            started_at: start_ts,
-            finished_at: now_ts(),
-        }
-    }
-
-    async fn exec_gost_install(&self, _payload: &serde_json::Value) -> TaskResult {
-        let start_ts = now_ts();
-        // Download and install gost - placeholder
-        TaskResult {
-            task_id: String::new(),
-            success: false,
-            message: "gost auto-install not yet implemented".into(),
-            stdout: None,
-            stderr: None,
-            exit_code: None,
             started_at: start_ts,
             finished_at: now_ts(),
         }
@@ -706,11 +780,35 @@ fn run_cmd(args: &[String]) -> CmdResult {
     }
 }
 
+/// Execute an nft command with argument validation
+fn run_cmd_validated(args: &[String]) -> CmdResult {
+    if let Err(e) = validate_nft_args(args) {
+        return CmdResult {
+            success: false,
+            stdout: None,
+            stderr: Some(e),
+            exit_code: None,
+        };
+    }
+    run_cmd(args)
+}
+
 fn now_ts() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "0".into())
+}
+
+/// 从 nft list 输出行中提取 handle 号
+/// nft -a 输出格式: ... counter dnat to 10.0.0.5:80 # handle 3
+fn extract_handle(line: &str) -> Option<u64> {
+    let line = line.trim();
+    if let Some(idx) = line.rfind("# handle ") {
+        let handle_str = &line[idx + 9..];
+        return handle_str.trim().parse().ok();
+    }
+    None
 }
 
 trait IfStd {

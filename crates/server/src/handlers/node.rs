@@ -24,7 +24,7 @@ pub async fn list(
         .await
         .map(|r| r.get(0))
         .unwrap_or(0);
-    let rows = sqlx::query("SELECT id,node_id,name,public_ip,os,arch,agent_version,agent_sha256,gost_version,nft_status,gost_status,status,tls_verify,tls_pinning,last_signature_verified_at,last_heartbeat_at,last_task_at,last_ip,security_alerts,remark,created_at,updated_at FROM nodes ORDER BY id DESC LIMIT ? OFFSET ?")
+    let rows = sqlx::query("SELECT id,node_id,name,public_ip,os,arch,agent_version,agent_sha256,gost_version,nft_status,gost_status,status,tls_verify,tls_pinning,last_signature_verified_at,last_heartbeat_at,last_task_at,last_ip,security_alerts,remark,created_at,updated_at,cpu_usage,cpu_cores,disk_total_gb,disk_used_gb,network_rx_bytes,network_tx_bytes,swap_total_mb,swap_used_mb,kernel,hostname FROM nodes ORDER BY id DESC LIMIT ? OFFSET ?")
         .bind(ps).bind(off).fetch_all(&state.pool).await.unwrap_or_default();
     let items: Vec<serde_json::Value> = rows.iter().map(|r| serde_json::json!({
         "id": r.get::<i64,_>("id"), "node_id": r.get::<String,_>("node_id"), "name": r.get::<String,_>("name"),
@@ -41,6 +41,16 @@ pub async fn list(
         "security_alerts": r.get::<String,_>("security_alerts"),
         "remark": r.get::<Option<String>,_>("remark"),
         "created_at": r.get::<String,_>("created_at"), "updated_at": r.get::<String,_>("updated_at"),
+        "cpu_usage": r.get::<f64,_>("cpu_usage"),
+        "cpu_cores": r.get::<Option<i64>,_>("cpu_cores").map(|v| v as usize),
+        "disk_total_gb": r.get::<Option<f64>,_>("disk_total_gb"),
+        "disk_used_gb": r.get::<Option<f64>,_>("disk_used_gb"),
+        "network_rx_bytes": r.get::<i64,_>("network_rx_bytes") as u64,
+        "network_tx_bytes": r.get::<i64,_>("network_tx_bytes") as u64,
+        "swap_total_mb": r.get::<i64,_>("swap_total_mb") as u64,
+        "swap_used_mb": r.get::<i64,_>("swap_used_mb") as u64,
+        "kernel": r.get::<Option<String>,_>("kernel"),
+        "hostname": r.get::<Option<String>,_>("hostname"),
     })).collect();
     (
         StatusCode::OK,
@@ -85,7 +95,7 @@ pub async fn get(
     Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    let r = sqlx::query("SELECT id,node_id,name,public_ip,os,arch,agent_version,agent_sha256,gost_version,nft_status,gost_status,status,tls_verify,tls_pinning,last_signature_verified_at,last_heartbeat_at,last_task_at,last_ip,security_alerts,remark,created_at,updated_at FROM nodes WHERE id=?")
+    let r = sqlx::query("SELECT id,node_id,name,public_ip,os,arch,agent_version,agent_sha256,gost_version,nft_status,gost_status,status,tls_verify,tls_pinning,last_signature_verified_at,last_heartbeat_at,last_task_at,last_ip,security_alerts,remark,created_at,updated_at,cpu_usage,cpu_cores,disk_total_gb,disk_used_gb,network_rx_bytes,network_tx_bytes,swap_total_mb,swap_used_mb,kernel,hostname FROM nodes WHERE id=?")
         .bind(id).fetch_optional(&state.pool).await;
     match r {
         Ok(Some(row)) => (StatusCode::OK, Json(node_to_json(&row))),
@@ -350,5 +360,15 @@ fn node_to_json(r: &sqlx::sqlite::SqliteRow) -> serde_json::Value {
         "last_heartbeat_at": r.get::<Option<String>,_>("last_heartbeat_at"), "last_task_at": r.get::<Option<String>,_>("last_task_at"),
         "last_ip": r.get::<Option<String>,_>("last_ip"), "security_alerts": r.get::<String,_>("security_alerts"),
         "remark": r.get::<Option<String>,_>("remark"), "created_at": r.get::<String,_>("created_at"), "updated_at": r.get::<String,_>("updated_at"),
+        "cpu_usage": r.get::<f64,_>("cpu_usage"),
+        "cpu_cores": r.get::<Option<i64>,_>("cpu_cores").map(|v| v as usize),
+        "disk_total_gb": r.get::<Option<f64>,_>("disk_total_gb"),
+        "disk_used_gb": r.get::<Option<f64>,_>("disk_used_gb"),
+        "network_rx_bytes": r.get::<i64,_>("network_rx_bytes") as u64,
+        "network_tx_bytes": r.get::<i64,_>("network_tx_bytes") as u64,
+        "swap_total_mb": r.get::<i64,_>("swap_total_mb") as u64,
+        "swap_used_mb": r.get::<i64,_>("swap_used_mb") as u64,
+        "kernel": r.get::<Option<String>,_>("kernel"),
+        "hostname": r.get::<Option<String>,_>("hostname"),
     })
 }

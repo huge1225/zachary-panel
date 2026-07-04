@@ -158,7 +158,6 @@ pub enum TaskType {
     CheckPort,
     CheckTarget,
     ReloadNftables,
-    InstallGost,
     CheckGostVersion,
     GetSystemInfo,
     LatencyTest,
@@ -184,7 +183,6 @@ impl TaskType {
             TaskType::CheckPort => "check_port",
             TaskType::CheckTarget => "check_target",
             TaskType::ReloadNftables => "reload_nftables",
-            TaskType::InstallGost => "install_gost",
             TaskType::CheckGostVersion => "check_gost_version",
             TaskType::GetSystemInfo => "get_system_info",
             TaskType::LatencyTest => "latency_test",
@@ -211,7 +209,6 @@ impl TaskType {
             "check_port" => Some(TaskType::CheckPort),
             "check_target" => Some(TaskType::CheckTarget),
             "reload_nftables" => Some(TaskType::ReloadNftables),
-            "install_gost" => Some(TaskType::InstallGost),
             "check_gost_version" => Some(TaskType::CheckGostVersion),
             "get_system_info" => Some(TaskType::GetSystemInfo),
             "latency_test" => Some(TaskType::LatencyTest),
@@ -315,6 +312,17 @@ pub struct NodeInfo {
     pub remark: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    // VPS 监控字段
+    pub cpu_usage: f64,
+    pub cpu_cores: Option<usize>,
+    pub disk_total_gb: Option<f64>,
+    pub disk_used_gb: Option<f64>,
+    pub network_rx_bytes: u64,
+    pub network_tx_bytes: u64,
+    pub swap_total_mb: u64,
+    pub swap_used_mb: u64,
+    pub kernel: Option<String>,
+    pub hostname: Option<String>,
 }
 
 /// 安装命令响应
@@ -505,6 +513,17 @@ pub struct HeartbeatPayload {
     pub gost_status: String,
     pub gost_version: Option<String>,
     pub agent_version: String,
+    // VPS 监控字段
+    pub cpu_usage: f64,
+    pub cpu_cores: usize,
+    pub disk_total_gb: f64,
+    pub disk_used_gb: f64,
+    pub network_rx_bytes: u64,
+    pub network_tx_bytes: u64,
+    pub swap_total_mb: u64,
+    pub swap_used_mb: u64,
+    pub kernel: Option<String>,
+    pub hostname: Option<String>,
 }
 
 /// 心跳请求（Agent WebSocket → Server）

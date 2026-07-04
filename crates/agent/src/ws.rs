@@ -200,6 +200,14 @@ pub async fn heartbeat_sender(
 
         // Collect system stats
         let sys = system::collect();
+        let cpu_usage = system::collect_cpu_usage();
+        let cpu_cores = system::collect_cpu_cores();
+        let (disk_used_gb, disk_total_gb) = system::collect_disk_usage();
+        let (net_rx, net_tx) = system::collect_network_stats();
+        let (swap_used_mb, swap_total_mb) = system::collect_swap();
+        let hostname = system::collect_hostname();
+        let kernel = system::collect_kernel();
+
         let payload = serde_json::json!({
             "status": "online",
             "load_avg": sys.load_avg,
@@ -209,6 +217,16 @@ pub async fn heartbeat_sender(
             "nft_status": nft_status,
             "gost_status": gost_status,
             "agent_version": env!("CARGO_PKG_VERSION"),
+            "cpu_usage": cpu_usage,
+            "cpu_cores": cpu_cores,
+            "disk_total_gb": disk_total_gb,
+            "disk_used_gb": disk_used_gb,
+            "network_rx_bytes": net_rx,
+            "network_tx_bytes": net_tx,
+            "swap_total_mb": swap_total_mb,
+            "swap_used_mb": swap_used_mb,
+            "kernel": kernel,
+            "hostname": hostname,
         });
 
         let msg = build_signed_json(&node_id, &node_token, "heartbeat", &payload);

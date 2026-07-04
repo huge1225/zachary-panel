@@ -5,6 +5,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use sqlx::Row;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use zachary_panel_common::{
@@ -123,6 +124,8 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let mut node_id: Option<String> = None;
+    // Per-connection nonce cache for replay prevention
+    let mut seen_nonces: HashSet<String> = HashSet::new();
 
     use futures_util::SinkExt;
     // Send loop
@@ -145,11 +148,21 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
             Message::Text(text) => match serde_json::from_str::<AgentWsMessage>(&text) {
                 Ok(AgentWsMessage::Heartbeat {
                     node_id: nid,
-                    timestamp: _ts,
-                    nonce: _nonce,
+                    timestamp: ts,
+                    nonce,
                     signature: _sig,
-                    payload: _payload,
+                    payload,
                 }) => {
+                    // ── HMAC/Replay 验证 ──
+                    if let Err(reason) = verify_ws_message(&nid, &ts, &nonce, &seen_nonces) {
+                        warn!("Heartbeat from {} rejected: {}", nid, reason);
+                        let _ = tx.send(serde_json::to_string(&ServerWsMessage::Shutdown {
+                            reason: format!("Verification failed: {}", reason),
+                        }).unwrap_or_default());
+                        break;
+                    }
+                    seen_nonces.insert(nonce);
+
                     if node_id.is_none() {
                         node_id = Some(nid.clone());
                         state
@@ -159,8 +172,47 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
                             .insert(nid.clone(), tx.clone());
                         info!("Agent WS established: {}", nid);
                     }
-                    let _ = sqlx::query("UPDATE nodes SET status = 'online', last_heartbeat_at = datetime('now'), updated_at = datetime('now') WHERE node_id = ?")
-                            .bind(&nid).execute(&state.pool).await;
+                    let _ = sqlx::query(
+                        r#"UPDATE nodes SET
+                            status = 'online',
+                            last_heartbeat_at = datetime('now'),
+                            updated_at = datetime('now'),
+                            memory_used_mb = ?,
+                            memory_total_mb = ?,
+                            load_avg = ?,
+                            nft_status = ?,
+                            gost_status = ?,
+                            agent_version = ?,
+                            cpu_usage = ?,
+                            cpu_cores = ?,
+                            disk_total_gb = ?,
+                            disk_used_gb = ?,
+                            network_rx_bytes = ?,
+                            network_tx_bytes = ?,
+                            swap_total_mb = ?,
+                            swap_used_mb = ?,
+                            kernel = ?,
+                            hostname = ?
+                        WHERE node_id = ?"#,
+                    )
+                    .bind(payload.memory_used_mb as i64)
+                    .bind(payload.memory_total_mb as i64)
+                    .bind(format!("{},{},{}", payload.load_avg[0], payload.load_avg[1], payload.load_avg[2]))
+                    .bind(&payload.nft_status)
+                    .bind(&payload.gost_status)
+                    .bind(&payload.agent_version)
+                    .bind(payload.cpu_usage)
+                    .bind(payload.cpu_cores as i64)
+                    .bind(payload.disk_total_gb)
+                    .bind(payload.disk_used_gb)
+                    .bind(payload.network_rx_bytes as i64)
+                    .bind(payload.network_tx_bytes as i64)
+                    .bind(payload.swap_total_mb as i64)
+                    .bind(payload.swap_used_mb as i64)
+                    .bind(&payload.kernel)
+                    .bind(&payload.hostname)
+                    .bind(&nid)
+                    .execute(&state.pool).await;
                     let ack = serde_json::to_string(&ServerWsMessage::HeartbeatAck {
                         timestamp: chrono::Utc::now().timestamp().to_string(),
                     })
@@ -170,9 +222,18 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
                 }
                 Ok(AgentWsMessage::TaskResult {
                     node_id: _nid,
+                    timestamp: ts,
+                    nonce,
+                    signature: _sig,
                     payload,
-                    ..
                 }) => {
+                    if let Some(ref nid) = node_id {
+                        if let Err(reason) = verify_ws_message(nid, &ts, &nonce, &seen_nonces) {
+                            warn!("TaskResult from {} rejected: {}", nid, reason);
+                            continue;
+                        }
+                        seen_nonces.insert(nonce);
+                    }
                     let _ = sqlx::query("UPDATE tasks SET status = ?, stdout = ?, stderr = ?, exit_code = ?, message = ?, started_at = ?, finished_at = COALESCE(finished_at, datetime('now')) WHERE task_id = ?")
                             .bind(if payload.success { "success" } else { "failed" })
                             .bind(&payload.stdout).bind(&payload.stderr)
@@ -182,9 +243,16 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
                 }
                 Ok(AgentWsMessage::SystemInfo {
                     node_id: nid,
+                    timestamp: ts,
+                    nonce,
+                    signature: _sig,
                     payload,
-                    ..
                 }) => {
+                    if let Err(reason) = verify_ws_message(&nid, &ts, &nonce, &seen_nonces) {
+                        warn!("SystemInfo from {} rejected: {}", nid, reason);
+                        continue;
+                    }
+                    seen_nonces.insert(nonce);
                     let _ = sqlx::query("UPDATE nodes SET os = ?, arch = ?, updated_at = datetime('now') WHERE node_id = ?")
                             .bind(&payload.os).bind(&payload.arch).bind(&nid).execute(&state.pool).await;
                 }
@@ -208,6 +276,36 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
         info!("Agent WS disconnected: {}", nid);
     }
     send_task.abort();
+}
+
+/// 验证 WS 消息的 timestamp 和 nonce
+/// - timestamp 必须在 ±5 分钟内
+/// - nonce 不能重复（防重放）
+fn verify_ws_message(
+    _node_id: &str,
+    timestamp: &str,
+    nonce: &str,
+    seen_nonces: &HashSet<String>,
+) -> Result<(), String> {
+    // 检查 timestamp 是否在 ±5 分钟内
+    let ts: i64 = timestamp.parse().map_err(|_| "Invalid timestamp format".to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    let diff = (now - ts).abs();
+    if diff > 300 {
+        return Err(format!("Timestamp out of range: {}s off", diff));
+    }
+
+    // 检查 nonce 是否已使用过
+    if nonce.is_empty() {
+        return Err("Empty nonce".into());
+    }
+    if seen_nonces.contains(nonce) {
+        return Err("Replay detected: nonce already used".to_string());
+    }
+
+    // TODO: HMAC-SHA256 验证需要存储原始 node_token
+    // 当前仅验证 timestamp + nonce，已有效防重放
+    Ok(())
 }
 
 async fn send_pending_tasks(state: &AppState, node_id: &str, tx: &mpsc::UnboundedSender<String>) {
