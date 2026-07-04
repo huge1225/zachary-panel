@@ -195,6 +195,7 @@ pub async fn install_command(
     State(state): State<AppState>,
     Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let row = sqlx::query("SELECT node_id FROM nodes WHERE id=?")
         .bind(id)
@@ -215,8 +216,15 @@ pub async fn install_command(
         + chrono::Duration::minutes(state.config.install_token_ttl_minutes))
     .to_rfc3339();
     let _ = sqlx::query("UPDATE nodes SET install_token_hash=?,install_token_expired_at=?,updated_at=datetime('now') WHERE id=?").bind(&ith).bind(&exp).bind(id).execute(&state.pool).await;
-    let server = std::env::var("SERVER_URL")
-        .unwrap_or_else(|_| format!("http://{}:{}", state.config.host, state.config.port));
+    // Determine server URL: env override > Host header > config default
+    let server = std::env::var("SERVER_URL").unwrap_or_else(|_| {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or(&state.config.host);
+        let scheme = if state.config.port == 443 { "https" } else { "http" };
+        format!("{}://{}", scheme, host)
+    });
     let cmd = format!("curl -fsSL {server}/install-agent.sh | bash -s -- --server {server} --node-id {node_id} --install-token {it}");
     (
         StatusCode::OK,
