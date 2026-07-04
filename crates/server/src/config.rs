@@ -43,7 +43,7 @@ pub fn load() -> anyhow::Result<ServerConfig> {
     // Also try reading from config.yaml
     if let Ok(config_str) = std::fs::read_to_string("config.yaml") {
         if let Ok(config_map) = serde_yaml::from_str::<serde_yaml::Value>(&config_str) {
-            let host = config_map
+            let _host = config_map
                 .get("host")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&host);

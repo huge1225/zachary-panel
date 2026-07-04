@@ -51,7 +51,7 @@ pub async fn login(
         }
     };
 
-    if verify_password(&req.password, &password_hash).unwrap_or(false) == false {
+    if !verify_password(&req.password, &password_hash).unwrap_or(false) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({

@@ -46,7 +46,7 @@ impl PaginationQuery {
         self.page.unwrap_or(1).max(1)
     }
     pub fn page_size(&self) -> u32 {
-        self.page_size.unwrap_or(20).min(100).max(1)
+        self.page_size.unwrap_or(20).clamp(1, 100)
     }
     pub fn offset(&self) -> u32 {
         (self.page() - 1) * self.page_size()

@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
-use zachary_panel_common::{hmac_sha256_hex, random_hex, AgentWsMessage, ServerWsMessage};
+use zachary_panel_common::{hmac_sha256_hex, random_hex, ServerWsMessage};
 
 /// 启动 Agent WebSocket 连接（含自动重连）
 pub async fn run(config: AgentConfig) {
@@ -90,7 +90,7 @@ async fn connect_and_run(config: &AgentConfig, executor: &TaskExecutor) -> anyho
         "system_info",
         &serde_json::to_value(&sys_info).unwrap_or_default(),
     );
-    if out_tx.send(Message::Text(sys_msg.into())).is_err() {
+    if out_tx.send(Message::Text(sys_msg)).is_err() {
         anyhow::bail!("Failed to send initial system info");
     }
 
@@ -150,7 +150,7 @@ async fn handle_server_message(
                 &serde_json::to_value(&result).unwrap_or_default(),
             );
 
-            if out_tx.send(Message::Text(result_msg.into())).is_err() {
+            if out_tx.send(Message::Text(result_msg)).is_err() {
                 error!("Failed to send task result for {}", task_id);
             }
 
@@ -187,8 +187,8 @@ pub async fn heartbeat_sender(
     gost_path: String,
     tx: mpsc::UnboundedSender<Message>,
 ) {
-    let mut nft_status = system::nft_available(&nft_path);
-    let mut gost_status = system::gost_available(&gost_path);
+    let mut nft_status;
+    let mut gost_status;
 
     loop {
         // Wait between heartbeats
@@ -213,7 +213,7 @@ pub async fn heartbeat_sender(
 
         let msg = build_signed_json(&node_id, &node_token, "heartbeat", &payload);
 
-        if tx.send(Message::Text(msg.into())).is_err() {
+        if tx.send(Message::Text(msg)).is_err() {
             break; // Channel closed, connection dead
         }
 

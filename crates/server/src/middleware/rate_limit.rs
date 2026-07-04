@@ -1,7 +1,6 @@
 /// 登录限流模块
 /// 基于 IP 的滑动窗口限流，防止暴力破解
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -67,7 +66,6 @@ impl LoginLimiter {
     }
 }
 
-use axum::extract::ConnectInfo;
 use std::net::SocketAddr;
 
 /// 从请求中提取客户端 IP

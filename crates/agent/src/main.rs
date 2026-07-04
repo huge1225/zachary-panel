@@ -17,7 +17,6 @@ mod ws;
 
 use config::AgentConfig;
 use tracing::{error, info, warn, Level};
-use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

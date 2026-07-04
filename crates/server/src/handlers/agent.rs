@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use sqlx::Row;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -61,7 +61,7 @@ pub async fn register(
         Some(stored) if *stored == install_token_hash => {}
         _ => {
             let _ = sqlx::query("INSERT INTO security_events (node_id, event_type, severity, message) VALUES (?, 'install_token_invalid', 'warning', ?)")
-                .bind(&req.node_id).bind(format!("Invalid install token attempt")).execute(&state.pool).await;
+                .bind(&req.node_id).bind("Invalid install token attempt".to_string()).execute(&state.pool).await;
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(ApiResponse::<()>::error(40104, "Invalid install token")),
@@ -126,7 +126,7 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
 
     use futures_util::SinkExt;
     // Send loop
-    let mut send_task = tokio::spawn(async move {
+    let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender
                 .send(axum::extract::ws::Message::Text(msg.into()))

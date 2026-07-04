@@ -2,7 +2,7 @@
 /// 使用 install_token 向 Server 注册，获取 node_token
 use crate::config::AgentConfig;
 use tracing::{error, info};
-use zachary_panel_common::{sha256_hex, AgentRegisterRequest};
+use zachary_panel_common::AgentRegisterRequest;
 
 /// 获取本机 Agent 版本
 fn agent_version() -> String {

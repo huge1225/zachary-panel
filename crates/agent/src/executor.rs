@@ -1,5 +1,5 @@
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::info;
 /// 任务执行模块
 /// 负责接收 Server 下发的任务，分发执行，返回结果
 use zachary_panel_common::{TaskResult, TaskType};
@@ -630,7 +630,7 @@ impl TaskExecutor {
         let start_ts = now_ts();
 
         let result = std::process::Command::new("ping")
-            .args(&["-c", &count.to_string(), "-W", "5", target])
+            .args(["-c", &count.to_string(), "-W", "5", target])
             .output();
 
         match result {

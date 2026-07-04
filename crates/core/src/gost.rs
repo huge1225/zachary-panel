@@ -69,6 +69,7 @@ impl GostCommand {
         vec![self.gost_path.clone(), "-L".into(), url]
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ws_client(
         &self,
         listen_port: i32,
@@ -91,6 +92,7 @@ impl GostCommand {
         ]
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_forward(
         &self,
         mode: &str,

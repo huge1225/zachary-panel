@@ -1,5 +1,4 @@
-/// 密码哈希工具
-use bcrypt::{hash, verify, DEFAULT_COST};
+//! 密码哈希工具
 
 /// 使用 bcrypt 哈希密码
 pub fn hash_password(password: &str) -> Result<String, anyhow::Error> {

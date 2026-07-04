@@ -1,5 +1,6 @@
-/// gost 进程管理模块
-/// 借鉴 flux-panel 的方式：用配置文件管理 gost 转发，支持热重载
+//! gost 进程管理模块
+//! 借鉴 flux-panel 的方式：用配置文件管理 gost 转发，支持热重载
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -73,7 +74,7 @@ impl GostManager {
         let mut procs = self.processes.lock().await;
         if let Some(pid) = procs.remove(rule_name) {
             let _ = tokio::process::Command::new("kill")
-                .args(&["-TERM", &pid.to_string()])
+                .args(["-TERM", &pid.to_string()])
                 .output()
                 .await;
             info!("gost rule '{}' stopped (PID {})", rule_name, pid);
@@ -89,7 +90,7 @@ impl GostManager {
         let procs = self.processes.lock().await;
         if let Some(pid) = procs.get(rule_name) {
             let _ = tokio::process::Command::new("kill")
-                .args(&["-HUP", &pid.to_string()])
+                .args(["-HUP", &pid.to_string()])
                 .output()
                 .await;
             info!("gost rule '{}' reloaded (SIGHUP {})", rule_name, pid);
@@ -102,7 +103,7 @@ impl GostManager {
         let mut procs = self.processes.lock().await;
         for (name, pid) in procs.drain() {
             let _ = tokio::process::Command::new("kill")
-                .args(&["-TERM", &pid.to_string()])
+                .args(["-TERM", &pid.to_string()])
                 .output()
                 .await;
             info!("gost rule '{}' stopped", name);

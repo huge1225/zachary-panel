@@ -145,42 +145,42 @@ pub async fn delete(
 
 pub async fn start(
     State(state): State<AppState>,
-    Extension(c): Extension<JwtClaims>,
+    Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     create_rule_task(&state, id, "start_forward_rule").await
 }
 pub async fn stop(
     State(state): State<AppState>,
-    Extension(c): Extension<JwtClaims>,
+    Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     create_rule_task(&state, id, "stop_forward_rule").await
 }
 pub async fn restart(
     State(state): State<AppState>,
-    Extension(c): Extension<JwtClaims>,
+    Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     create_rule_task(&state, id, "restart_forward_rule").await
 }
 pub async fn test_listen(
     State(state): State<AppState>,
-    Extension(c): Extension<JwtClaims>,
+    Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     create_rule_task(&state, id, "check_listen_port").await
 }
 pub async fn test_target(
     State(state): State<AppState>,
-    Extension(c): Extension<JwtClaims>,
+    Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     create_rule_task(&state, id, "check_target_reachable").await
 }
 pub async fn test_chain(
     State(state): State<AppState>,
-    Extension(c): Extension<JwtClaims>,
+    Extension(_c): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     create_rule_task(&state, id, "check_forward_chain").await
@@ -189,6 +189,7 @@ pub async fn test_chain(
 async fn create_rule_task(state: &AppState, rule_id: i64, task_type: &str) -> impl IntoResponse {
     let r = sqlx::query("SELECT id,node_id,mode,protocol,listen_addr,listen_port,target_addr,target_port,tunnel_type,ws_path,tls_cert_path,tls_key_path,tls_skip_verify FROM forward_rules WHERE id=?")
         .bind(rule_id).fetch_optional(&state.pool).await;
+    #[allow(clippy::type_complexity)]
     let (nid, mode, proto, la, lp, ta, tp, tt, wp, tcp, tkp, tsv): (
         String,
         String,

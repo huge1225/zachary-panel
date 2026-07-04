@@ -1,4 +1,4 @@
-/// 输入校验工具
+//! 输入校验工具
 
 /// 校验 IP 地址合法性
 pub fn validate_ip(ip: &str) -> bool {
