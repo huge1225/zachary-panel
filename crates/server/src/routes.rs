@@ -74,8 +74,8 @@ fn protected_routes(state: AppState) -> Router<AppState> {
 
 fn node_routes() -> Router<AppState> {
     Router::new()
-        .route("/", axum::routing::get(handlers::node::list))
-        .route("/", axum::routing::post(handlers::node::create))
+        .route("", axum::routing::get(handlers::node::list))
+        .route("", axum::routing::post(handlers::node::create))
         .route("/{id}", axum::routing::get(handlers::node::get))
         .route("/{id}", axum::routing::put(handlers::node::update))
         .route("/{id}", axum::routing::delete(handlers::node::delete))
@@ -105,8 +105,8 @@ fn node_routes() -> Router<AppState> {
 
 fn rule_routes() -> Router<AppState> {
     Router::new()
-        .route("/", axum::routing::get(handlers::rule::list))
-        .route("/", axum::routing::post(handlers::rule::create))
+        .route("", axum::routing::get(handlers::rule::list))
+        .route("", axum::routing::post(handlers::rule::create))
         .route("/{id}", axum::routing::get(handlers::rule::get))
         .route("/{id}", axum::routing::put(handlers::rule::update))
         .route("/{id}", axum::routing::delete(handlers::rule::delete))
@@ -132,13 +132,13 @@ fn rule_routes() -> Router<AppState> {
 
 fn task_routes() -> Router<AppState> {
     Router::new()
-        .route("/", axum::routing::get(handlers::task::list))
+        .route("", axum::routing::get(handlers::task::list))
         .route("/{id}", axum::routing::get(handlers::task::get))
 }
 
 fn latency_test_routes() -> Router<AppState> {
     Router::new()
-        .route("/", axum::routing::get(handlers::latency_test::list))
+        .route("", axum::routing::get(handlers::latency_test::list))
         .route("/{id}", axum::routing::get(handlers::latency_test::get))
         .route(
             "/{id}",
@@ -153,7 +153,7 @@ fn latency_test_routes() -> Router<AppState> {
 
 fn security_event_routes() -> Router<AppState> {
     Router::new()
-        .route("/", axum::routing::get(handlers::security::list))
+        .route("", axum::routing::get(handlers::security::list))
         .route("/{id}", axum::routing::get(handlers::security::get))
 }
 
