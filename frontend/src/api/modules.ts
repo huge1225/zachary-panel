@@ -25,6 +25,12 @@ export const nodesApi = {
   delete(id: number) {
     return api.delete(`/nodes/${id}`)
   },
+  disable(id: number) {
+    return api.post(`/nodes/${id}/disable`)
+  },
+  enable(id: number) {
+    return api.post(`/nodes/${id}/enable`)
+  },
   installCommand(id: number, ttlMinutes?: number) {
     return api.get(`/nodes/${id}/install-command`, { params: { ttl_minutes: ttlMinutes || 30 } })
   },
@@ -55,6 +61,15 @@ export const rulesApi = {
   restart(id: number) {
     return api.post(`/rules/${id}/restart`)
   },
+  testListen(id: number) {
+    return api.post(`/rules/${id}/test-listen`)
+  },
+  testTarget(id: number) {
+    return api.post(`/rules/${id}/test-target`)
+  },
+  testChain(id: number) {
+    return api.post(`/rules/${id}/test-chain`)
+  },
 }
 
 export const tasksApi = {
@@ -73,11 +88,17 @@ export const dashboardApi = {
 }
 
 export const latencyApi = {
-  test(data: any) {
-    return api.post('/latency-tests', data)
+  single(data: any) {
+    return api.post('/latency-tests/single', data)
+  },
+  batch(data: any) {
+    return api.post('/latency-tests/batch', data)
   },
   list(params?: { page?: number; page_size?: number }) {
     return api.get('/latency-tests', { params })
+  },
+  delete(id: number) {
+    return api.delete(`/latency-tests/${id}`)
   },
 }
 
