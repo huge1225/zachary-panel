@@ -6,20 +6,20 @@ services:
     container_name: zachary-panel
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "38088:38088"
     environment:
       - JWT_SECRET=${JWT_SECRET:-change-me-to-a-random-secret}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change-me}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - DATABASE_URL=sqlite:///app/data/zachary-panel.db?mode=rwc
       - HOST=0.0.0.0
-      - PORT=3000
+      - PORT=38088
       - RUST_LOG=info
       - WS_HEARTBEAT_INTERVAL=30
     volumes:
       - zachary-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/auth/login"]
+      test: ["CMD", "curl", "-f", "http://localhost:38088/api/auth/login"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -48,9 +48,9 @@ RUN mkdir -p /app/data
 
 ENV DATABASE_URL=sqlite:///app/data/zachary-panel.db?mode=rwc
 ENV HOST=0.0.0.0
-ENV PORT=3000
+ENV PORT=38088
 ENV RUST_LOG=info
 
-EXPOSE 3000
+EXPOSE 38088
 
 ENTRYPOINT ["/app/zachary-panel-server"]

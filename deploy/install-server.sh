@@ -47,7 +47,7 @@ ADMIN_PASSWORD=${ADMIN_PASS}
 ADMIN_USERNAME=admin
 DATABASE_URL=sqlite://${INSTALL_DIR}/data/zachary-panel.db?mode=rwc
 HOST=0.0.0.0
-PORT=3000
+PORT=38088
 RUST_LOG=info
 EOF
     chown zachary:zachary "$INSTALL_DIR/.env"
@@ -60,4 +60,4 @@ chown -R zachary:zachary "$INSTALL_DIR"
 echo "✅ 安装完成！"
 echo "启动: systemctl start zachary-panel"
 echo "开机启动: systemctl enable zachary-panel"
-echo "访问: http://$(hostname -I | awk '{print $1}'):3000"
+echo "访问: http://$(hostname -I | awk '{print $1}'):38088"

@@ -23,7 +23,7 @@ impl ServerConfig {
 
 pub fn load() -> anyhow::Result<ServerConfig> {
     let host = env_or("HOST", "0.0.0.0");
-    let port: u16 = env_or("PORT", "3000").parse().unwrap_or(3000);
+    let port: u16 = env_or("PORT", "38088").parse().unwrap_or(38088);
     let database_url = env_or("DATABASE_URL", "sqlite://data/zachary-panel.db?mode=rwc");
     let jwt_secret = std::env::var("JWT_SECRET")
         .map_err(|_| anyhow::anyhow!("JWT_SECRET is required. Set via environment variable."))?;
