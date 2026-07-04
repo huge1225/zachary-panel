@@ -232,7 +232,11 @@ pub async fn install_command(
             .get(axum::http::header::HOST)
             .and_then(|h| h.to_str().ok())
             .unwrap_or(&state.config.host);
-        let scheme = if state.config.port == 443 { "https" } else { "http" };
+        let scheme = if state.config.port == 443 {
+            "https"
+        } else {
+            "http"
+        };
         format!("{}://{}", scheme, host)
     });
     let cmd = format!("curl -fsSL {server}/install-agent.sh | bash -s -- --server {server} --node-id {node_id} --install-token {it}");

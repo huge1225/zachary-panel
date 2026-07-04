@@ -140,10 +140,7 @@ impl NftCommand {
     /// 重载 zachary-panel 专属规则 — flush forward chain 后重新初始化
     /// 不触碰系统 /etc/nftables.conf
     pub fn reload_ruleset(&self) -> Vec<Vec<String>> {
-        vec![
-            self.flush_chain(),
-            self.init_chain(),
-        ]
+        vec![self.flush_chain(), self.init_chain()]
     }
 
     pub fn list_rules(&self) -> Vec<String> {

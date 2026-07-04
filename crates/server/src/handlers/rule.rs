@@ -191,8 +191,20 @@ async fn create_rule_task(state: &AppState, rule_id: i64, task_type: &str) -> im
         .bind(rule_id).fetch_optional(&state.pool).await;
     #[allow(clippy::type_complexity)]
     let (nid, rule_name, mode, proto, la, lp, ta, tp, tt, wp, tcp, tkp, tsv, public_ip): (
-        String, String, String, String, String, i32, String, i32, String,
-        Option<String>, Option<String>, Option<String>, i32, Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i32,
+        String,
+        i32,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i32,
+        Option<String>,
     ) = match r {
         Ok(Some(row)) => (
             row.get("node_id"),

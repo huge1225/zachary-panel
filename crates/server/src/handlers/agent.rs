@@ -156,9 +156,12 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
                     // ── HMAC/Replay 验证 ──
                     if let Err(reason) = verify_ws_message(&nid, &ts, &nonce, &seen_nonces) {
                         warn!("Heartbeat from {} rejected: {}", nid, reason);
-                        let _ = tx.send(serde_json::to_string(&ServerWsMessage::Shutdown {
-                            reason: format!("Verification failed: {}", reason),
-                        }).unwrap_or_default());
+                        let _ = tx.send(
+                            serde_json::to_string(&ServerWsMessage::Shutdown {
+                                reason: format!("Verification failed: {}", reason),
+                            })
+                            .unwrap_or_default(),
+                        );
                         break;
                     }
                     seen_nonces.insert(nonce);
@@ -197,7 +200,10 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
                     )
                     .bind(payload.memory_used_mb as i64)
                     .bind(payload.memory_total_mb as i64)
-                    .bind(format!("{},{},{}", payload.load_avg[0], payload.load_avg[1], payload.load_avg[2]))
+                    .bind(format!(
+                        "{},{},{}",
+                        payload.load_avg[0], payload.load_avg[1], payload.load_avg[2]
+                    ))
                     .bind(&payload.nft_status)
                     .bind(&payload.gost_status)
                     .bind(&payload.agent_version)
@@ -212,7 +218,8 @@ async fn handle_agent_ws(state: AppState, socket: axum::extract::ws::WebSocket) 
                     .bind(&payload.kernel)
                     .bind(&payload.hostname)
                     .bind(&nid)
-                    .execute(&state.pool).await;
+                    .execute(&state.pool)
+                    .await;
                     let ack = serde_json::to_string(&ServerWsMessage::HeartbeatAck {
                         timestamp: chrono::Utc::now().timestamp().to_string(),
                     })
@@ -288,7 +295,9 @@ fn verify_ws_message(
     seen_nonces: &HashSet<String>,
 ) -> Result<(), String> {
     // 检查 timestamp 是否在 ±5 分钟内
-    let ts: i64 = timestamp.parse().map_err(|_| "Invalid timestamp format".to_string())?;
+    let ts: i64 = timestamp
+        .parse()
+        .map_err(|_| "Invalid timestamp format".to_string())?;
     let now = chrono::Utc::now().timestamp();
     let diff = (now - ts).abs();
     if diff > 300 {

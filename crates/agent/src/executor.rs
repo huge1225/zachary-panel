@@ -31,7 +31,10 @@ fn validate_nft_args(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     if !combined.contains("zachary-panel") {
-        return Err(format!("nft command must reference zachary-panel table: {}", combined));
+        return Err(format!(
+            "nft command must reference zachary-panel table: {}",
+            combined
+        ));
     }
     // 额外检查: 禁止 -f / --file 参数 (全局 flush 危险)
     if combined.contains(" -f ") || combined.contains(" --file ") {
@@ -198,7 +201,10 @@ impl TaskExecutor {
                 let msg = if last.success {
                     "nft forward rule added".into()
                 } else {
-                    last.stderr.as_deref().unwrap_or("unknown error").to_string()
+                    last.stderr
+                        .as_deref()
+                        .unwrap_or("unknown error")
+                        .to_string()
                 };
                 TaskResult {
                     task_id: String::new(),
@@ -257,10 +263,7 @@ impl TaskExecutor {
             .get("rule_name")
             .and_then(|v| v.as_str())
             .unwrap_or("rule");
-        let rule_id = payload
-            .get("rule_id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let rule_id = payload.get("rule_id").and_then(|v| v.as_i64()).unwrap_or(0);
 
         let start_ts = now_ts();
 
@@ -366,10 +369,7 @@ impl TaskExecutor {
 
     /// gost 停止转发
     async fn exec_gost_stop(&self, payload: &serde_json::Value) -> TaskResult {
-        let rule_id = payload
-            .get("rule_id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let rule_id = payload.get("rule_id").and_then(|v| v.as_i64()).unwrap_or(0);
         let start_ts = now_ts();
         let gost_name = format!("rule_{}", rule_id);
 
@@ -449,7 +449,10 @@ impl TaskExecutor {
             return TaskResult {
                 task_id: String::new(),
                 success: false,
-                message: list_result.stderr.clone().unwrap_or_else(|| "Failed to list nft rules".into()),
+                message: list_result
+                    .stderr
+                    .clone()
+                    .unwrap_or_else(|| "Failed to list nft rules".into()),
                 stdout: list_result.stdout,
                 stderr: list_result.stderr,
                 exit_code: list_result.exit_code,
@@ -505,7 +508,11 @@ impl TaskExecutor {
             success: deleted_any || errors.is_empty(),
             message: msg,
             stdout: None,
-            stderr: if errors.is_empty() { None } else { Some(errors.join("; ")) },
+            stderr: if errors.is_empty() {
+                None
+            } else {
+                Some(errors.join("; "))
+            },
             exit_code: Some(0),
             started_at: start_ts,
             finished_at: now_ts(),
@@ -535,7 +542,11 @@ impl TaskExecutor {
             success: all_success,
             message: msg,
             stdout: None,
-            stderr: if msgs.is_empty() { None } else { Some(msgs.join("; ")) },
+            stderr: if msgs.is_empty() {
+                None
+            } else {
+                Some(msgs.join("; "))
+            },
             exit_code: Some(if all_success { 0 } else { 1 }),
             started_at: start_ts,
             finished_at: now_ts(),
