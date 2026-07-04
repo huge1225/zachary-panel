@@ -33,7 +33,7 @@ RUN touch crates/common/src/lib.rs crates/core/src/lib.rs \
 FROM debian:bookworm-slim AS server
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates nftables \
+    ca-certificates nftables curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
