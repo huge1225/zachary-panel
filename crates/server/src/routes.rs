@@ -74,6 +74,21 @@ pub async fn serve(state: AppState) -> anyhow::Result<()> {
         // 安全事件
         .route("/api/security-events", axum::routing::get(handlers::security::list))
         .route("/api/security-events/{id}", axum::routing::get(handlers::security::get))
+        // 安装脚本（必须在 SPA fallback 之前）
+        .route_service(
+            "/install-agent.sh",
+            ServeFile::new_with_mime(
+                "deploy/install-agent.sh",
+                &"text/x-shellscript".parse().unwrap(),
+            ),
+        )
+        .route_service(
+            "/install-server.sh",
+            ServeFile::new_with_mime(
+                "deploy/install-server.sh",
+                &"text/x-shellscript".parse().unwrap(),
+            ),
+        )
         // 静态文件（前端 SPA）
         .fallback_service(serve_frontend_service())
         .layer(cors)
