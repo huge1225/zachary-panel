@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  nexus-master:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.master
+    container_name: nexus-master
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      - NEXUS_LISTEN=:8080
+      - NEXUS_DB_DRIVER=sqlite
+      - NEXUS_DB_DSN=/data/nexus_panel.db
+    volumes:
+      - ./data:/data

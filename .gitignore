@@ -1,4 +1,26 @@
-target/
-data/
+# Binaries & Build Artifacts
+bin/
+dist/
+web/dist/
+web/node_modules/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Runtime Databases & Logs
+*.db
+*.db-shm
+*.db-wal
+deploy/data/
+*.log
+
+# Local Env & IDE
 .env
-node_modules/
+.env.local
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

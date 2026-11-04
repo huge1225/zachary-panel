@@ -1,0 +1,3963 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nexus Panel</title>
+  <style>
+    :root {
+      --bg-canvas: #f1f5f9;
+      --bg-canvas-gradient: radial-gradient(1200px 600px at 15% -10%, rgba(59, 130, 246, 0.08), transparent 60%),
+                            radial-gradient(1000px 500px at 90% 0%, rgba(139, 92, 246, 0.07), transparent 55%);
+      --bg-surface: #ffffff;
+      --bg-surface-glass: rgba(255, 255, 255, 0.86);
+      --bg-subtle: #f8fafc;
+      --bg-hover: #f1f5f9;
+      --bg-sidebar: #0f172a;
+      --bg-sidebar-hover: rgba(255, 255, 255, 0.06);
+      --bg-sidebar-active: linear-gradient(90deg, rgba(59, 130, 246, 0.22) 0%, rgba(99, 102, 241, 0.10) 100%);
+      --bg-code: #0b1120;
+
+      --text-main: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #94a3b8;
+
+      --sidebar-text: #94a3b8;
+      --sidebar-text-active: #ffffff;
+      --sidebar-border: rgba(255, 255, 255, 0.08);
+
+      --border-color: #e2e8f0;
+      --border-subtle: #f1f5f9;
+
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --primary-gradient: linear-gradient(135deg, #2563eb 0%, #4f46e5 55%, #7c3aed 100%);
+      --primary-soft: #eff6ff;
+      --primary-border: #bfdbfe;
+      --primary-text: #2563eb;
+
+      --success-soft: #ecfdf5;
+      --success-border: #a7f3d0;
+      --success-text: #059669;
+
+      --warning-soft: #fffbeb;
+      --warning-border: #fde68a;
+      --warning-text: #d97706;
+
+      --danger-soft: #fef2f2;
+      --danger-border: #fecaca;
+      --danger-text: #dc2626;
+
+      --purple-soft: #f5f3ff;
+      --purple-border: #ddd6fe;
+      --purple-text: #7c3aed;
+
+      --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
+      --shadow-sm: 0 2px 8px -2px rgba(15, 23, 42, 0.06), 0 1px 3px -1px rgba(15, 23, 42, 0.04);
+      --shadow-md: 0 10px 25px -5px rgba(15, 23, 42, 0.08), 0 4px 10px -3px rgba(15, 23, 42, 0.04);
+      --shadow-lg: 0 20px 40px -12px rgba(15, 23, 42, 0.16);
+
+      --radius-md: 8px;
+      --radius-lg: 14px;
+      --radius-xl: 18px;
+    }
+
+    html.dark {
+      --bg-canvas: #090d16;
+      --bg-canvas-gradient: radial-gradient(1200px 600px at 15% -10%, rgba(59, 130, 246, 0.14), transparent 60%),
+                            radial-gradient(1000px 500px at 90% 0%, rgba(139, 92, 246, 0.12), transparent 55%);
+      --bg-surface: #111827;
+      --bg-surface-glass: rgba(17, 24, 39, 0.84);
+      --bg-subtle: #0f172a;
+      --bg-hover: #1e293b;
+      --bg-sidebar: #060911;
+      --bg-sidebar-hover: rgba(255, 255, 255, 0.06);
+      --bg-sidebar-active: linear-gradient(90deg, rgba(59, 130, 246, 0.25) 0%, rgba(139, 92, 246, 0.12) 100%);
+      --bg-code: #030712;
+
+      --text-main: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+
+      --border-color: #1e293b;
+      --border-subtle: #162032;
+
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --primary-soft: rgba(59, 130, 246, 0.14);
+      --primary-border: rgba(59, 130, 246, 0.32);
+      --primary-text: #60a5fa;
+
+      --success-soft: rgba(16, 185, 129, 0.14);
+      --success-border: rgba(16, 185, 129, 0.32);
+      --success-text: #34d399;
+
+      --warning-soft: rgba(245, 158, 11, 0.14);
+      --warning-border: rgba(245, 158, 11, 0.32);
+      --warning-text: #fbbf24;
+
+      --danger-soft: rgba(239, 68, 68, 0.14);
+      --danger-border: rgba(239, 68, 68, 0.32);
+      --danger-text: #f87171;
+
+      --purple-soft: rgba(139, 92, 246, 0.15);
+      --purple-border: rgba(139, 92, 246, 0.34);
+      --purple-text: #c084fc;
+
+      --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.25);
+      --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.3);
+      --shadow-md: 0 12px 28px rgba(0, 0, 0, 0.4);
+      --shadow-lg: 0 24px 48px rgba(0, 0, 0, 0.6);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'HarmonyOS Sans SC', 'Microsoft YaHei UI', 'Segoe UI', sans-serif;
+      background-color: var(--bg-canvas);
+      background-image: var(--bg-canvas-gradient);
+      background-attachment: fixed;
+      color: var(--text-main);
+      font-size: 13.5px;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .app-shell {
+      display: flex;
+      min-height: 100vh;
+    }
+
+    /* --- 高定深邃侧边导航栏 --- */
+    .sidebar {
+      width: 244px;
+      background: var(--bg-sidebar);
+      background-image: radial-gradient(320px 260px at 0% 0%, rgba(59, 130, 246, 0.16), transparent 70%),
+                        radial-gradient(280px 260px at 100% 100%, rgba(124, 58, 237, 0.14), transparent 70%);
+      border-right: 1px solid var(--sidebar-border);
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 30;
+      user-select: none;
+      box-shadow: 4px 0 24px rgba(2, 6, 23, 0.18);
+    }
+
+    .sidebar-brand {
+      height: 68px;
+      padding: 0 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid var(--sidebar-border);
+    }
+
+    .brand-logo {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: var(--primary-gradient);
+      color: #fff;
+      font-weight: 700;
+      font-size: 14px;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.45), inset 0 1px 1px rgba(255, 255, 255, 0.35);
+      flex-shrink: 0;
+    }
+
+    .brand-title-wrap {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .brand-title {
+      color: #ffffff;
+      font-weight: 700;
+      font-size: 15.5px;
+      letter-spacing: -0.2px;
+      line-height: 1.2;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .brand-subtitle {
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      color: #60a5fa;
+      text-transform: uppercase;
+      margin-top: 2px;
+    }
+
+    .sidebar-nav {
+      flex: 1;
+      padding: 14px 12px;
+      overflow-y: auto;
+    }
+
+    .nav-group-label {
+      padding: 10px 12px 6px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.7px;
+      text-transform: uppercase;
+      color: #64748b;
+    }
+
+    .nav-item {
+      position: relative;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      margin-bottom: 4px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--sidebar-text);
+      font-size: 13.5px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: left;
+      transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .nav-item-left {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+    }
+
+    .nav-icon {
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255, 255, 255, 0.04);
+      color: #94a3b8;
+      transition: all 0.18s ease;
+      flex-shrink: 0;
+    }
+
+    .nav-icon svg {
+      width: 16px;
+      height: 16px;
+      stroke-width: 2;
+    }
+
+    .nav-item:hover {
+      background: var(--bg-sidebar-hover);
+      color: #e2e8f0;
+      transform: translateX(2px);
+    }
+
+    .nav-item:hover .nav-icon {
+      background: rgba(255, 255, 255, 0.08);
+      color: #e2e8f0;
+    }
+
+    .nav-item.active {
+      background: var(--bg-sidebar-active);
+      border-color: rgba(96, 165, 250, 0.24);
+      color: var(--sidebar-text-active);
+      font-weight: 600;
+      box-shadow: 0 4px 14px rgba(2, 6, 23, 0.25);
+    }
+
+    .nav-item.active::before {
+      content: '';
+      position: absolute;
+      left: -12px;
+      top: 8px;
+      bottom: 8px;
+      width: 4px;
+      border-radius: 0 4px 4px 0;
+      background: linear-gradient(180deg, #60a5fa, #818cf8);
+      box-shadow: 0 0 10px rgba(96, 165, 250, 0.8);
+    }
+
+    .nav-item.active .nav-icon {
+      background: var(--primary-gradient);
+      color: #ffffff;
+      box-shadow: 0 3px 10px rgba(59, 130, 246, 0.45);
+    }
+
+    .nav-badge {
+      font-size: 11.5px;
+      font-weight: 600;
+      padding: 1px 8px;
+      border-radius: 99px;
+      background: rgba(255, 255, 255, 0.07);
+      color: #94a3b8;
+      font-variant-numeric: tabular-nums;
+      transition: all 0.18s ease;
+    }
+
+    .nav-item.active .nav-badge {
+      background: rgba(59, 130, 246, 0.28);
+      color: #93c5fd;
+      border: 1px solid rgba(96, 165, 250, 0.35);
+    }
+
+    .sidebar-footer {
+      margin: 12px;
+      padding: 14px;
+      border-radius: 12px;
+      background: linear-gradient(145deg, rgba(30, 41, 59, 0.78), rgba(15, 23, 42, 0.92));
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 12px;
+      color: #cbd5e1;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+
+    /* --- 主内容区与毛玻璃顶栏 --- */
+    .main-area {
+      flex: 1;
+      margin-left: 244px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .topbar {
+      height: 68px;
+      background: var(--bg-surface-glass);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--border-color);
+      padding: 0 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+
+    .topbar-title-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .topbar-title {
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+      color: var(--text-main);
+    }
+
+    .topbar-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border-radius: 99px;
+      font-size: 11.5px;
+      font-weight: 500;
+      background: var(--success-soft);
+      color: var(--success-text);
+      border: 1px solid var(--success-border);
+    }
+
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10b981;
+      box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.22);
+    }
+
+    .user-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      padding: 4px 10px 4px 5px;
+      border-radius: 99px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+    }
+
+    .user-avatar {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      background: var(--primary-gradient);
+      color: #ffffff;
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-transform: uppercase;
+    }
+
+    .page-container {
+      padding: 24px 28px 36px;
+      max-width: 1380px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      box-shadow: var(--shadow-sm);
+      contain: content;
+      font-variant-numeric: tabular-nums;
+      transition: box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+
+    .card:hover {
+      box-shadow: var(--shadow-md);
+    }
+
+    .stat-card {
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .stat-card::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3px;
+      background: var(--primary-gradient);
+      opacity: 0.85;
+    }
+
+    .stat-icon-box {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .stat-icon-box svg {
+      width: 20px;
+      height: 20px;
+    }
+
+    table {
+      font-variant-numeric: tabular-nums;
+    }
+
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+    }
+
+    @media (max-width: 1024px) {
+      .grid-4, .grid-3, .grid-2 { grid-template-columns: repeat(1, 1fr); }
+    }
+
+    .metric-label {
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+
+    .metric-value {
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: -0.4px;
+      margin-top: 6px;
+      color: var(--text-main);
+    }
+
+    .progress-track {
+      height: 7px;
+      width: 100%;
+      background: var(--bg-hover);
+      border-radius: 99px;
+      overflow: hidden;
+      margin-top: 8px;
+      contain: strict;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--primary-gradient);
+      border-radius: 99px;
+      transition: width 0.35s linear;
+      will-change: width;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: var(--radius-md);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid transparent;
+      user-select: none;
+      transition: all 0.16s ease;
+    }
+
+    .btn:active {
+      transform: scale(0.98);
+    }
+
+    .btn-primary {
+      background: var(--primary-gradient);
+      color: #ffffff;
+      box-shadow: 0 2px 8px rgba(37, 99, 235, 0.28);
+    }
+
+    .btn-primary:hover {
+      filter: brightness(1.07);
+      box-shadow: 0 4px 14px rgba(37, 99, 235, 0.38);
+    }
+
+    .btn-outline {
+      background: var(--bg-surface);
+      border-color: var(--border-color);
+      color: var(--text-main);
+      box-shadow: var(--shadow-xs);
+    }
+
+    .btn-outline:hover {
+      background: var(--bg-hover);
+      border-color: var(--text-muted);
+    }
+
+    .btn-soft {
+      background: var(--primary-soft);
+      border-color: var(--primary-border);
+      color: var(--primary-text);
+    }
+
+    .btn-soft:hover {
+      background: var(--primary);
+      color: #ffffff;
+      border-color: var(--primary);
+    }
+
+    .btn-danger {
+      background: var(--danger-soft);
+      border-color: var(--danger-border);
+      color: var(--danger-text);
+    }
+
+    .btn-danger:hover {
+      background: var(--danger-text);
+      color: #ffffff;
+    }
+
+    .btn-sm {
+      padding: 4px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+    }
+
+    .input, .select, .textarea {
+      width: 100%;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-family: inherit;
+      color: var(--text-main);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .input:focus, .select:focus, .textarea:focus {
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px var(--primary-soft);
+    }
+
+    .copy-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 3.5px 9px;
+      border-radius: 6px;
+      background: var(--primary-soft);
+      border: 1px solid var(--primary-border);
+      color: var(--primary-text);
+      font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .copy-pill:hover {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #ffffff;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2.5px 9px;
+      font-size: 11.5px;
+      font-weight: 600;
+      border-radius: 99px;
+      border: 1px solid transparent;
+    }
+
+    .badge-success {
+      background: var(--success-soft);
+      color: var(--success-text);
+      border-color: var(--success-border);
+    }
+
+    .badge-primary {
+      background: var(--primary-soft);
+      color: var(--primary-text);
+      border-color: var(--primary-border);
+    }
+
+    .badge-purple {
+      background: var(--purple-soft);
+      color: var(--purple-text);
+      border-color: var(--purple-border);
+    }
+
+    .badge-warning {
+      background: var(--warning-soft);
+      color: var(--warning-text);
+      border-color: var(--warning-border);
+    }
+
+    .badge-danger {
+      background: var(--danger-soft);
+      color: var(--danger-text);
+      border-color: var(--danger-border);
+    }
+
+    .badge-neutral {
+      background: var(--bg-subtle);
+      color: var(--text-secondary);
+      border-color: var(--border-color);
+    }
+
+    .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .table-wrap {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-sm);
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13px;
+    }
+
+    th {
+      background: var(--bg-subtle);
+      color: var(--text-secondary);
+      font-weight: 600;
+      font-size: 12px;
+      letter-spacing: 0.3px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border-color);
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--border-subtle);
+      vertical-align: middle;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    tr:hover td {
+      background: var(--bg-subtle);
+    }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(9, 13, 22, 0.55);
+      backdrop-filter: blur(5px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+
+    .modal-box {
+      width: 100%;
+      max-width: 500px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-xl);
+      padding: 24px;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 24px;
+      z-index: 100;
+      background: #0f172a;
+      color: #ffffff;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-size: 13px;
+      font-weight: 500;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .form-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      margin-bottom: 5px;
+    }
+
+    .mode-card {
+      padding: 11px 14px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border-color);
+      background: var(--bg-subtle);
+      cursor: pointer;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all 0.15s ease;
+    }
+
+    .mode-card.selected {
+      border-color: var(--primary);
+      background: var(--primary-soft);
+      color: var(--primary-text);
+      font-weight: 600;
+      box-shadow: 0 0 0 2px var(--primary-soft);
+    }
+
+    .plan-card {
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .plan-card.vip-featured {
+      border-color: var(--purple-border);
+      background: linear-gradient(180deg, var(--purple-soft) 0%, var(--bg-surface) 38%);
+    }
+  </style>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
+
+    <!-- 登录页 -->
+    <div v-if="!token" style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;">
+      <div class="card" style="width: 100%; max-width: 410px; padding: 32px; border-radius: 20px; box-shadow: var(--shadow-lg);">
+        <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 24px;">
+          <div class="brand-logo" style="width: 42px; height: 42px; font-size: 16px;">{{ siteConfig.site_logo || 'NX' }}</div>
+          <div>
+            <div style="font-size: 18px; font-weight: 700; letter-spacing: -0.3px;">{{ siteConfig.site_name || 'Nexus Panel' }}</div>
+            <div style="font-size: 12px; color: var(--text-secondary);">分布式多引擎专线与端口转发控制台</div>
+          </div>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 14px;">
+          <div>
+            <label class="form-label">邮箱账号</label>
+            <input v-model="emailInput" type="email" class="input" placeholder="输入邮箱" />
+          </div>
+          <div>
+            <label class="form-label">登录密码</label>
+            <input v-model="passwordInput" type="password" class="input" placeholder="输入密码" @keyup.enter="handleAuth" />
+          </div>
+          <button @click="handleAuth" class="btn btn-primary" style="width: 100%; padding: 10px; font-size: 14px;">
+            {{ isRegisterMode ? '立即注册' : '进入控制台' }}
+          </button>
+
+          <div v-if="siteConfig.allow_register" style="text-align: center; font-size: 12.5px; color: var(--text-secondary);">
+            <a href="javascript:void(0)" @click="isRegisterMode = !isRegisterMode" style="color: var(--primary-text); text-decoration: none; font-weight: 500;">
+              {{ isRegisterMode ? '已有账号？返回登录' : '没有账号？注册新账号' }}
+            </a>
+          </div>
+
+          <div style="border-top: 1px solid var(--border-color); padding-top: 14px; margin-top: 4px;">
+            <div style="font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 10px;">一键体验预设账号：</div>
+            <div class="grid-2" style="gap: 10px;">
+              <button @click="quickLoginAs('admin@nexus.local', 'admin123')" class="btn btn-soft" style="width: 100%; justify-content: center;">
+                管理员 (admin)
+              </button>
+              <button @click="quickLoginAs('user@nexus.local', 'user123')" class="btn btn-outline" style="width: 100%; justify-content: center;">
+                普通用户 (user)
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 主界面 -->
+    <div v-else class="app-shell">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <div class="brand-logo">{{ siteConfig.site_logo || 'NX' }}</div>
+          <div class="brand-title-wrap">
+            <span class="brand-title">{{ siteConfig.site_name || 'Nexus Panel' }}</span>
+            <span class="brand-subtitle">Cloud Relay OS</span>
+          </div>
+        </div>
+
+        <nav class="sidebar-nav">
+          <div class="nav-group-label">业务中心</div>
+          <button class="nav-item" :class="{ active: activeTab === 'dashboard' }" @click="switchTab('dashboard')">
+            <span class="nav-item-left">
+              <span class="nav-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="7" height="7" rx="1.5"></rect>
+                  <rect x="14" y="3" width="7" height="7" rx="1.5"></rect>
+                  <rect x="14" y="14" width="7" height="7" rx="1.5"></rect>
+                  <rect x="3" y="14" width="7" height="7" rx="1.5"></rect>
+                </svg>
+              </span>
+              <span>概览</span>
+            </span>
+          </button>
+
+          <button class="nav-item" :class="{ active: activeTab === 'rules' }" @click="switchTab('rules')">
+            <span class="nav-item-left">
+              <span class="nav-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="16 3 21 3 21 8"></polyline>
+                  <line x1="4" y1="20" x2="21" y2="3"></line>
+                  <polyline points="21 16 21 21 16 21"></polyline>
+                  <line x1="15" y1="15" x2="21" y2="21"></line>
+                  <line x1="4" y1="4" x2="9" y2="9"></line>
+                </svg>
+              </span>
+              <span>转发管理</span>
+            </span>
+            <span class="nav-badge">{{ visibleRules.length }}</span>
+          </button>
+
+          <button class="nav-item" :class="{ active: activeTab === 'store' }" @click="switchTab('store')">
+            <span class="nav-item-left">
+              <span class="nav-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"></path>
+                  <line x1="3" y1="6" x2="21" y2="6"></line>
+                  <path d="M16 10a4 4 0 0 1-8 0"></path>
+                </svg>
+              </span>
+              <span>套餐管理</span>
+            </span>
+            <span class="nav-badge">{{ plans.length }}</span>
+          </button>
+
+          <template v-if="isAdmin">
+            <div class="nav-group-label" style="margin-top: 8px;">基础设施</div>
+            <button class="nav-item" :class="{ active: activeTab === 'lines' }" @click="switchTab('lines')">
+              <span class="nav-item-left">
+                <span class="nav-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                  </svg>
+                </span>
+                <span>隧道管理</span>
+              </span>
+              <span class="nav-badge">{{ lines.length }}</span>
+            </button>
+
+            <button class="nav-item" :class="{ active: activeTab === 'nodes' }" @click="switchTab('nodes')">
+              <span class="nav-item-left">
+                <span class="nav-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+                    <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+                    <line x1="6" y1="6" x2="6.01" y2="6"></line>
+                    <line x1="6" y1="18" x2="6.01" y2="18"></line>
+                  </svg>
+                </span>
+                <span>节点管理</span>
+              </span>
+              <span class="nav-badge">{{ nodes.length }}</span>
+            </button>
+
+            <div class="nav-group-label" style="margin-top: 8px;">权限与系统</div>
+            <button class="nav-item" :class="{ active: activeTab === 'roles' }" @click="switchTab('roles')">
+              <span class="nav-item-left">
+                <span class="nav-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                    <path d="m9 12 2 2 4-4"></path>
+                  </svg>
+                </span>
+                <span>角色管理</span>
+              </span>
+              <span class="nav-badge">{{ rolesList.length }}</span>
+            </button>
+
+            <button class="nav-item" :class="{ active: activeTab === 'users' }" @click="switchTab('users')">
+              <span class="nav-item-left">
+                <span class="nav-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                  </svg>
+                </span>
+                <span>用户管理</span>
+              </span>
+              <span class="nav-badge">{{ usersList.length }}</span>
+            </button>
+
+            <button class="nav-item" :class="{ active: activeTab === 'settings' }" @click="switchTab('settings')">
+              <span class="nav-item-left">
+                <span class="nav-icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                  </svg>
+                </span>
+                <span>系统设置</span>
+              </span>
+            </button>
+          </template>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <span style="font-weight: 600; color: #f8fafc;">{{ isAdmin ? '管理员配额' : planNameById(user.plan_id) }}</span>
+            <span style="font-weight: 700; color: #60a5fa;">{{ quotaPercent }}%</span>
+          </div>
+          <div class="progress-track" style="background: rgba(255, 255, 255, 0.1); margin-top: 4px;">
+            <div class="progress-fill" :style="{ width: quotaPercent + '%' }"></div>
+          </div>
+          <div style="display: flex; justify-content: space-between; color: #94a3b8; margin-top: 8px; font-size: 11.5px;">
+            <span>{{ formatBytes(user.used_bytes) }} / {{ formatBytes(user.quota_bytes) }}</span>
+            <span>{{ user.speed_mbps }}M</span>
+          </div>
+        </div>
+      </aside>
+
+      <div class="main-area">
+        <header class="topbar">
+          <div class="topbar-title-group">
+            <span class="topbar-title">{{ currentTabTitle }}</span>
+            <span class="topbar-pill">
+              <span class="pulse-dot"></span>
+              <span>实时同步</span>
+            </span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <button
+              @click="switchAccountQuick"
+              class="btn btn-soft btn-sm"
+              title="一键切换管理员与普通用户视角"
+            >
+              切换至{{ isAdmin ? '普通用户' : '管理员' }}
+            </button>
+            <button @click="toggleTheme" class="btn btn-outline btn-sm">
+              {{ isDark ? '浅色' : '深色' }}
+            </button>
+            <div class="user-chip">
+              <span class="user-avatar">{{ (user.email || 'U').charAt(0) }}</span>
+              <span style="font-size: 12.5px; font-weight: 600;">{{ user.email }}</span>
+              <span class="badge" :class="isAdmin ? 'badge-purple' : 'badge-primary'">
+                {{ isAdmin ? '管理员' : roleNameById(user.role_group_id) }}
+              </span>
+            </div>
+            <button @click="logout" class="btn btn-outline btn-sm">退出</button>
+          </div>
+        </header>
+
+        <main class="page-container">
+          <!-- 概览 -->
+          <div v-if="activeTab === 'dashboard'" style="display: flex; flex-direction: column; gap: 18px;">
+            <div
+              v-if="siteConfig.announcement"
+              class="card"
+              style="padding: 12px 18px; display: flex; align-items: center; gap: 10px; background: var(--primary-soft); border-color: var(--primary-border); color: var(--primary-text); font-size: 13px;"
+            >
+              <span class="badge badge-primary">公告</span>
+              <span style="font-weight: 500;">{{ siteConfig.announcement }}</span>
+            </div>
+
+            <div class="grid-4">
+              <div class="card stat-card">
+                <div style="flex: 1; min-width: 0;">
+                  <div class="metric-label">已用流量</div>
+                  <div class="metric-value" style="font-size: 20px; margin-top: 6px;">
+                    {{ formatBytes(user.used_bytes) }}
+                    <span style="font-size: 12.5px; font-weight: 500; color: var(--text-muted);">/ {{ formatBytes(user.quota_bytes) }}</span>
+                  </div>
+                  <div class="progress-track">
+                    <div class="progress-fill" :style="{ width: quotaPercent + '%' }"></div>
+                  </div>
+                </div>
+                <div class="stat-icon-box" style="background: var(--primary-soft); color: var(--primary-text);">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                  </svg>
+                </div>
+              </div>
+
+              <div class="card stat-card">
+                <div>
+                  <div class="metric-label">转发规则</div>
+                  <div class="metric-value">
+                    {{ visibleRules.filter(r => r.enabled).length }}
+                    <span style="font-size: 13px; font-weight: 500; color: var(--text-muted);">/ {{ user.max_rules }}</span>
+                  </div>
+                </div>
+                <div class="stat-icon-box" style="background: var(--purple-soft); color: var(--purple-text);">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="16 3 21 3 21 8"></polyline>
+                    <line x1="4" y1="20" x2="21" y2="3"></line>
+                    <polyline points="21 16 21 21 16 21"></polyline>
+                  </svg>
+                </div>
+              </div>
+
+              <div class="card stat-card">
+                <div>
+                  <div class="metric-label">{{ isAdmin ? '隧道数量' : '授权隧道' }}</div>
+                  <div class="metric-value">{{ authorizedLines.length }}</div>
+                </div>
+                <div class="stat-icon-box" style="background: var(--primary-soft); color: var(--primary-text);">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                  </svg>
+                </div>
+              </div>
+
+              <div v-if="isAdmin" class="card stat-card">
+                <div>
+                  <div class="metric-label">在线节点</div>
+                  <div class="metric-value">
+                    {{ nodes.filter(n => n.status === 'online').length }}
+                    <span style="font-size: 13px; font-weight: 500; color: var(--text-muted);">/ {{ nodes.length }}</span>
+                  </div>
+                </div>
+                <div class="stat-icon-box" style="background: var(--success-soft); color: var(--success-text);">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+                    <rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect>
+                  </svg>
+                </div>
+              </div>
+              <div v-else class="card stat-card">
+                <div>
+                  <div class="metric-label">带宽限速</div>
+                  <div class="metric-value">
+                    {{ user.speed_mbps }}
+                    <span style="font-size: 13px; font-weight: 500; color: var(--text-muted);">Mbps</span>
+                  </div>
+                </div>
+                <div class="stat-icon-box" style="background: var(--success-soft); color: var(--success-text);">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path>
+                  </svg>
+                </div>
+              </div>
+            </div>
+
+            <!-- 管理员可见：节点探针 -->
+            <div v-if="isAdmin" class="grid-3">
+              <div v-for="node in nodes" :key="node.id" class="card" style="display: flex; flex-direction: column; gap: 12px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-weight: 600; font-size: 14px;">{{ node.name }}</span>
+                  <span class="badge" :class="node.status === 'online' ? 'badge-success' : 'badge-danger'">
+                    <span class="dot"></span> {{ node.status === 'online' ? '在线' : '离线' }}
+                  </span>
+                </div>
+
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+                    <span style="color: var(--text-secondary);">CPU ({{ node.cpu_cores || 4 }} 核) · 负载 {{ (node.load_1 || 0).toFixed(2) }} / {{ (node.load_5 || 0).toFixed(2) }} / {{ (node.load_15 || 0).toFixed(2) }}</span>
+                    <span style="font-weight: 600;">{{ (node.cpu_usage || 0).toFixed(1) }}%</span>
+                  </div>
+                  <div class="progress-track" style="margin-top: 0;">
+                    <div class="progress-fill" :style="{ width: Math.min(100, node.cpu_usage || 0) + '%', background: (node.cpu_usage || 0) > 80 ? 'var(--danger-text)' : 'var(--primary)' }"></div>
+                  </div>
+                </div>
+
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+                    <span style="color: var(--text-secondary);">内存 {{ formatBytes(node.mem_used_bytes) }} / {{ formatBytes(node.mem_total_bytes) }}</span>
+                    <span style="font-weight: 600;">{{ (node.mem_usage || 0).toFixed(1) }}%</span>
+                  </div>
+                  <div class="progress-track" style="margin-top: 0;">
+                    <div class="progress-fill" :style="{ width: Math.min(100, node.mem_usage || 0) + '%', background: (node.mem_usage || 0) > 85 ? 'var(--warning-text)' : 'var(--primary)' }"></div>
+                  </div>
+                </div>
+
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+                    <span style="color: var(--text-secondary);">硬盘 {{ formatBytes(node.disk_used_bytes) }} / {{ formatBytes(node.disk_total_bytes) }}</span>
+                    <span style="font-weight: 600;">{{ (node.disk_usage || 0).toFixed(1) }}%</span>
+                  </div>
+                  <div class="progress-track" style="margin-top: 0;">
+                    <div class="progress-fill" :style="{ width: Math.min(100, node.disk_usage || 0) + '%' }"></div>
+                  </div>
+                </div>
+
+                <div>
+                  <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px;">
+                    <span style="color: var(--text-secondary);">
+                      流量 {{ formatBytes(node.used_bytes) }} / {{ node.quota_bytes > 0 ? formatBytes(node.quota_bytes) : '不限' }}
+                    </span>
+                    <span style="font-weight: 600;">{{ nodeTrafficPercent(node) }}%</span>
+                  </div>
+                  <div class="progress-track" style="margin-top: 0;">
+                    <div class="progress-fill" :style="{ width: nodeTrafficPercent(node) + '%', background: nodeTrafficPercent(node) > 90 ? 'var(--danger-text)' : '#10b981' }"></div>
+                  </div>
+                </div>
+
+                <div style="display: flex; justify-content: space-between; align-items: center; padding-top: 8px; border-top: 1px solid var(--border-color); font-size: 11.5px; color: var(--text-muted);">
+                  <span>↑ {{ formatBytes(node.speed_up_bps || 0) }}/s · ↓ {{ formatBytes(node.speed_down_bps || 0) }}/s</span>
+                  <span>连接 {{ node.active_conns || 0 }} · {{ formatUptime(node.uptime_seconds) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 普通用户可见：已授权隧道列表 -->
+            <div v-else class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>授权隧道</th>
+                    <th>类型</th>
+                    <th>转发方式</th>
+                    <th>入口地址</th>
+                    <th>计费</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="authorizedLines.length === 0">
+                    <td colspan="6" style="text-align: center; padding: 28px; color: var(--text-muted);">
+                      暂无授权隧道，请联系管理员分配隧道权限
+                    </td>
+                  </tr>
+                  <tr v-for="line in authorizedLines" :key="line.id">
+                    <td style="font-weight: 500;">{{ line.name }}</td>
+                    <td>
+                      <span class="badge" :class="line.type === 'encrypt' ? 'badge-purple' : 'badge-primary'">
+                        {{ line.type === 'encrypt' ? '隧道转发' : '端口转发' }}
+                      </span>
+                    </td>
+                    <td><span class="badge badge-neutral">{{ line.engine }}</span></td>
+                    <td>{{ nodeConnectIPById(line.ingress_node_id) }}</td>
+                    <td>{{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x</td>
+                    <td style="text-align: right;">
+                      <button @click="quickCreateRuleForTunnel(line)" class="btn btn-soft btn-sm">添加转发</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 转发管理 -->
+          <div v-if="activeTab === 'rules'" style="display: flex; flex-direction: column; gap: 14px;">
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+              <button @click="exportRulesToClipboard" class="btn btn-outline">导出规则</button>
+              <button @click="openBatchModal" class="btn btn-soft">批量导入</button>
+              <button @click="openCreateRuleModal" class="btn btn-primary">+ 新增转发</button>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th v-if="isAdmin">用户</th>
+                    <th>隧道</th>
+                    <th>转发方式</th>
+                    <th>连接地址</th>
+                    <th>目标地址</th>
+                    <th>流量</th>
+                    <th>状态</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="visibleRules.length === 0">
+                    <td :colspan="isAdmin ? 9 : 8" style="text-align: center; padding: 32px; color: var(--text-muted);">暂无数据</td>
+                  </tr>
+                  <tr v-for="rule in visibleRules" :key="rule.id">
+                    <td>
+                      <div style="font-weight: 500;">{{ rule.name }}</div>
+                      <div style="font-size: 12px; color: var(--text-muted);">{{ rule.protocol.toUpperCase() }}</div>
+                    </td>
+                    <td v-if="isAdmin" style="color: var(--text-secondary);">
+                      {{ userEmailById(rule.user_id) }}
+                    </td>
+                    <td>
+                      <span
+                        class="badge"
+                        :class="getTunnelById(rule.tunnel_line_id)?.type === 'encrypt' ? 'badge-purple' : 'badge-primary'"
+                      >
+                        {{ getTunnelById(rule.tunnel_line_id)?.name || '-' }}
+                      </span>
+                    </td>
+                    <td>
+                      <span class="badge badge-neutral">
+                        {{ getTunnelById(rule.tunnel_line_id)?.engine || rule.engine }}
+                      </span>
+                    </td>
+                    <td>
+                      <button
+                        class="copy-pill"
+                        title="点击复制"
+                        @click="copyConnectAddr(nodeConnectIPById(rule.ingress_node_id) + ':' + rule.listen_port)"
+                      >
+                        {{ nodeConnectIPById(rule.ingress_node_id) }}:{{ rule.listen_port }}
+                      </button>
+                    </td>
+                    <td>
+                      <div v-for="(t, idx) in parseTargets(rule.targets_json)" :key="idx" style="display: flex; align-items: center; gap: 6px;">
+                        <span>{{ t.address }}</span>
+                        <span
+                          v-if="probeResults[rule.id] && probeResults[rule.id].latencies && probeResults[rule.id].latencies[t.address] !== undefined"
+                          class="badge"
+                          :class="probeResults[rule.id].latencies[t.address] > 0 ? 'badge-success' : 'badge-danger'"
+                        >
+                          <template v-if="probeResults[rule.id].latencies[t.address] > 0">
+                            {{ probeResults[rule.id].tunnel_ms > 0 ? `隧道 ${probeResults[rule.id].tunnel_ms}ms + 落地 ${probeResults[rule.id].latencies[t.address]}ms` : `${probeResults[rule.id].latencies[t.address]}ms` }}
+                          </template>
+                          <template v-else>超时</template>
+                        </span>
+                      </div>
+                    </td>
+                    <td>{{ formatBytes(rule.billed_bytes) }}</td>
+                    <td>
+                      <span class="badge" :class="rule.enabled ? 'badge-success' : 'badge-neutral'">
+                        <span class="dot"></span>
+                        {{ rule.enabled ? '正常' : '暂停' }}
+                      </span>
+                    </td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button @click="openEditRuleModal(rule)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                        编辑
+                      </button>
+                      <button @click="handleProbeRule(rule)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        {{ probingRuleId === rule.id ? '...' : '测速' }}
+                      </button>
+                      <button @click="handleToggleRule(rule)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        {{ rule.enabled ? '暂停' : '启用' }}
+                      </button>
+                      <button @click="handleDeleteRule(rule.id)" class="btn btn-danger btn-sm">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 隧道管理 (仅管理员) -->
+          <div v-if="activeTab === 'lines' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
+            <div style="display: flex; justify-content: flex-end;">
+              <button @click="openCreateLineModal" class="btn btn-primary">+ 新增隧道</button>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>类型</th>
+                    <th>转发方式</th>
+                    <th>入口节点</th>
+                    <th>出口节点</th>
+                    <th>计费</th>
+                    <th>规则数</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="line in lines" :key="line.id">
+                    <td style="font-weight: 500;">{{ line.name }}</td>
+                    <td>
+                      <span class="badge" :class="line.type === 'encrypt' ? 'badge-purple' : 'badge-primary'">
+                        {{ line.type === 'encrypt' ? '隧道转发' : '端口转发' }}
+                      </span>
+                    </td>
+                    <td><span class="badge badge-neutral">{{ line.engine }}</span></td>
+                    <td>{{ nodeNameById(line.ingress_node_id) }}</td>
+                    <td>
+                      <span v-if="line.type === 'encrypt'">
+                        {{ nodeNameById(line.egress_node_id) }} ({{ line.transport.toUpperCase() }})
+                      </span>
+                      <span v-else style="color: var(--text-muted);">-</span>
+                    </td>
+                    <td>
+                      {{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x
+                    </td>
+                    <td>
+                      {{ rules.filter(r => r.tunnel_line_id === line.id).length }} / {{ line.max_port_count || 50 }}
+                    </td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button @click="quickCreateRuleForTunnel(line)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                        添加转发
+                      </button>
+                      <button @click="openEditLineModal(line)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        编辑
+                      </button>
+                      <button @click="deleteLine(line.id)" class="btn btn-danger btn-sm">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 节点管理 (仅管理员) -->
+          <div v-if="activeTab === 'nodes' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
+            <div style="display: flex; justify-content: flex-end;">
+              <button @click="openCreateNodeModal" class="btn btn-primary">+ 新增节点</button>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th>连接地址</th>
+                    <th>节点 IP</th>
+                    <th>端口范围</th>
+                    <th>倍率</th>
+                    <th>流量</th>
+                    <th>状态</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="node in nodes" :key="node.id">
+                    <td style="font-weight: 500;">{{ node.name }}</td>
+                    <td>
+                      <button class="copy-pill" @click="copyConnectAddr(node.connect_ip || node.public_host)">
+                        {{ node.connect_ip || node.public_host }}
+                      </button>
+                    </td>
+                    <td style="color: var(--text-secondary);">{{ node.server_ip }}</td>
+                    <td style="color: var(--text-secondary);">{{ node.port_range }}</td>
+                    <td>{{ node.traffic_rate }}x</td>
+                    <td>{{ formatBytes(node.used_bytes) }} / {{ node.quota_bytes > 0 ? formatBytes(node.quota_bytes) : '不限' }}</td>
+                    <td>
+                      <span class="badge" :class="node.status === 'online' ? 'badge-success' : 'badge-danger'">
+                        <span class="dot"></span> {{ node.status === 'online' ? '在线' : '离线' }}
+                      </span>
+                    </td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button @click="openInstallCmd(node)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                        对接
+                      </button>
+                      <button @click="resyncNodeRules(node)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        同步
+                      </button>
+                      <button @click="openEditNodeModal(node)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        编辑
+                      </button>
+                      <button @click="deleteNode(node.id)" class="btn btn-danger btn-sm">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 角色管理 (仅管理员：角色决定了可以使用哪些隧道) -->
+          <div v-if="activeTab === 'roles' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
+            <div style="display: flex; justify-content: flex-end;">
+              <button @click="openCreateRoleModal" class="btn btn-primary">+ 新增角色</button>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>角色名称</th>
+                    <th>说明</th>
+                    <th>可用隧道</th>
+                    <th>绑定套餐</th>
+                    <th>关联用户</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="rg in rolesList" :key="rg.id">
+                    <td style="font-weight: 600;">{{ rg.name }}</td>
+                    <td style="color: var(--text-secondary);">{{ rg.description || '-' }}</td>
+                    <td>
+                      <div v-if="parseTunnelIds(rg.allowed_tunnels).length > 0" style="display: flex; flex-wrap: wrap; gap: 4px;">
+                        <span
+                          v-for="tid in parseTunnelIds(rg.allowed_tunnels)"
+                          :key="tid"
+                          class="badge"
+                          :class="getTunnelById(tid)?.type === 'encrypt' ? 'badge-purple' : 'badge-primary'"
+                        >
+                          {{ getTunnelById(tid)?.name || ('#' + tid) }}
+                        </span>
+                      </div>
+                      <span v-else class="badge badge-neutral">无可用隧道</span>
+                    </td>
+                    <td>{{ plans.filter(p => p.role_group_id === rg.id).length }} 个套餐</td>
+                    <td>{{ usersList.filter(u => u.role !== 'admin' && u.role_group_id === rg.id).length }} 人</td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button @click="openEditRoleModal(rg)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                        编辑
+                      </button>
+                      <button @click="deleteRoleGroup(rg.id)" class="btn btn-danger btn-sm">删除</button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 用户管理 (仅管理员：为用户分配套餐和角色) -->
+          <div v-if="activeTab === 'users' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
+            <div style="display: flex; justify-content: flex-end;">
+              <button @click="openCreateUserModal" class="btn btn-primary">+ 新增用户</button>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>用户</th>
+                    <th>身份</th>
+                    <th>所属角色</th>
+                    <th>绑定套餐</th>
+                    <th>可用隧道</th>
+                    <th>流量</th>
+                    <th>规则数</th>
+                    <th>限速</th>
+                    <th>状态</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="u in usersList" :key="u.id">
+                    <td style="font-weight: 500;">{{ u.email }}</td>
+                    <td>
+                      <span class="badge" :class="u.role === 'admin' ? 'badge-purple' : 'badge-neutral'">
+                        {{ u.role === 'admin' ? '管理员' : '普通用户' }}
+                      </span>
+                    </td>
+                    <td>
+                      <span v-if="u.role === 'admin'" class="badge badge-purple">全权管理员</span>
+                      <span v-else class="badge badge-primary">{{ roleNameById(u.role_group_id) }}</span>
+                    </td>
+                    <td>
+                      <span class="badge badge-neutral">{{ planNameById(u.plan_id) }}</span>
+                    </td>
+                    <td>
+                      <span v-if="u.role === 'admin' || u.allowed_tunnels === '*'" class="badge badge-purple">全部隧道</span>
+                      <div v-else-if="parseTunnelIds(u.allowed_tunnels).length > 0" style="display: flex; flex-wrap: wrap; gap: 4px;">
+                        <span
+                          v-for="tid in parseTunnelIds(u.allowed_tunnels)"
+                          :key="tid"
+                          class="badge badge-primary"
+                        >
+                          {{ getTunnelById(tid)?.name || ('#' + tid) }}
+                        </span>
+                      </div>
+                      <span v-else class="badge badge-neutral">未分配</span>
+                    </td>
+                    <td>
+                      <div>{{ formatBytes(u.used_bytes) }} / {{ formatBytes(u.quota_bytes) }}</div>
+                    </td>
+                    <td>{{ u.max_rules }}</td>
+                    <td>{{ u.speed_mbps }} Mbps</td>
+                    <td>
+                      <span class="badge" :class="u.status === 'active' ? 'badge-success' : 'badge-danger'">
+                        <span class="dot"></span> {{ u.status === 'active' ? '正常' : '封禁' }}
+                      </span>
+                    </td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button @click="openEditUserModal(u)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                        分配套餐/角色
+                      </button>
+                      <button @click="resetUserTraffic(u)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        重置流量
+                      </button>
+                      <button
+                        v-if="u.role !== 'admin'"
+                        @click="toggleUserBan(u)"
+                        class="btn btn-sm"
+                        :class="u.status === 'active' ? 'btn-danger' : 'btn-outline'"
+                      >
+                        {{ u.status === 'active' ? '封禁' : '解封' }}
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 套餐管理 (管理员可新增/编辑套餐并绑定角色；用户可购买套餐自动获得对应角色与隧道权限) -->
+          <div v-if="activeTab === 'store'" style="display: flex; flex-direction: column; gap: 16px;">
+            <div v-if="isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
+              <div style="display: flex; justify-content: flex-end;">
+                <button @click="openCreatePlanModal" class="btn btn-primary">+ 新增套餐</button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>套餐名称</th>
+                      <th>绑定角色</th>
+                      <th>可用隧道 (随角色自动同步)</th>
+                      <th>流量配额</th>
+                      <th>规则数</th>
+                      <th>限速</th>
+                      <th>价格 / 周期</th>
+                      <th style="text-align: right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="plan in plans" :key="plan.id">
+                      <td style="font-weight: 600;">{{ plan.name }}</td>
+                      <td>
+                        <span class="badge badge-purple">{{ roleNameById(plan.role_group_id) }}</span>
+                      </td>
+                      <td>
+                        <div style="display: flex; flex-wrap: wrap; gap: 4px;">
+                          <span
+                            v-for="tid in parseTunnelIds(getRoleById(plan.role_group_id)?.allowed_tunnels || plan.allowed_tunnels)"
+                            :key="tid"
+                            class="badge badge-primary"
+                          >
+                            {{ getTunnelById(tid)?.name || ('#' + tid) }}
+                          </span>
+                        </div>
+                      </td>
+                      <td>{{ formatBytes(plan.quota_bytes) }}</td>
+                      <td>{{ plan.max_rules }}</td>
+                      <td>{{ plan.speed_mbps }} Mbps</td>
+                      <td>¥{{ (plan.price_cents / 100).toFixed(2) }} / {{ plan.duration_days }}天</td>
+                      <td style="text-align: right; white-space: nowrap;">
+                        <button @click="openEditPlanModal(plan)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                          编辑
+                        </button>
+                        <button @click="deletePlan(plan.id)" class="btn btn-danger btn-sm">删除</button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; align-items: center; gap: 10px;">
+              <input v-model="redeemInput" class="input" style="max-width: 280px;" placeholder="输入兑换码" />
+              <button @click="handleRedeem" class="btn btn-primary">兑换</button>
+            </div>
+
+            <div class="grid-2">
+              <div
+                v-for="plan in plans"
+                :key="plan.id"
+                class="card plan-card"
+                :class="{ 'vip-featured': plan.role_group_id === 2 }"
+              >
+                <div>
+                  <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                    <div>
+                      <div style="display: flex; align-items: center; gap: 8px;">
+                        <span style="font-weight: 700; font-size: 16px;">{{ plan.name }}</span>
+                        <span class="badge badge-purple">{{ roleNameById(plan.role_group_id) }}</span>
+                      </div>
+                      <div style="font-size: 12px; color: var(--text-secondary); margin-top: 4px;">
+                        购买后自动分配「{{ roleNameById(plan.role_group_id) }}」并解锁对应专线隧道
+                      </div>
+                    </div>
+                    <div style="text-align: right;">
+                      <span style="font-size: 22px; font-weight: 800; color: var(--primary-text);">
+                        ¥{{ (plan.price_cents / 100).toFixed(2) }}
+                      </span>
+                      <span style="font-size: 12px; color: var(--text-muted);"> / {{ plan.duration_days }}天</span>
+                    </div>
+                  </div>
+                  <div style="margin-top: 14px; padding: 10px 12px; border-radius: 10px; background: var(--bg-subtle); font-size: 13px; color: var(--text-secondary); display: flex; justify-content: space-between;">
+                    <span>月流量 <strong style="color: var(--text-main);">{{ formatBytes(plan.quota_bytes) }}</strong></span>
+                    <span>转发规则 <strong style="color: var(--text-main);">{{ plan.max_rules }} 条</strong></span>
+                    <span>带宽峰值 <strong style="color: var(--text-main);">{{ plan.speed_mbps }} Mbps</strong></span>
+                  </div>
+                  <div style="margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--text-muted);">
+                    <span>角色可用隧道：</span>
+                    <span
+                      v-for="tid in parseTunnelIds(getRoleById(plan.role_group_id)?.allowed_tunnels || plan.allowed_tunnels)"
+                      :key="tid"
+                      class="badge badge-primary"
+                    >
+                      {{ getTunnelById(tid)?.name || ('#' + tid) }}
+                    </span>
+                  </div>
+                </div>
+                <button @click="handleBuyPlan(plan)" class="btn btn-primary" style="width: 100%; padding: 9px;">
+                  {{ user.plan_id === plan.id ? '续费 / 重新激活套餐' : '立即订阅并激活角色' }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 系统设置 (仅管理员) -->
+          <div v-if="activeTab === 'settings' && isAdmin" style="display: flex; flex-direction: column; gap: 16px; max-width: 680px;">
+            <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">面板名称</label>
+                  <input v-model="settingsForm.site_name" class="input" placeholder="Nexus Panel" />
+                </div>
+                <div>
+                  <label class="form-label">Logo 标识</label>
+                  <input v-model="settingsForm.site_logo" class="input" placeholder="NX" maxlength="4" />
+                </div>
+              </div>
+
+              <div>
+                <label class="form-label">系统公告</label>
+                <input v-model="settingsForm.announcement" class="input" placeholder="留空不显示公告" />
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">开放注册</label>
+                  <select v-model="settingsForm.allow_register" class="select">
+                    <option :value="true">开启</option>
+                    <option :value="false">关闭</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="form-label">新注册用户默认角色</label>
+                  <select v-model.number="settingsForm.default_role_group_id" class="select">
+                    <option v-for="rg in rolesList" :key="rg.id" :value="rg.id">
+                      {{ rg.name }}
+                    </option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="grid-3">
+                <div>
+                  <label class="form-label">新用户默认流量 (GB)</label>
+                  <input v-model.number="settingsForm.default_quota_gb" type="number" class="input" />
+                </div>
+                <div>
+                  <label class="form-label">新用户默认规则数</label>
+                  <input v-model.number="settingsForm.default_max_rules" type="number" class="input" />
+                </div>
+                <div>
+                  <label class="form-label">新用户默认限速 (Mbps)</label>
+                  <input v-model.number="settingsForm.default_speed_mbps" type="number" class="input" />
+                </div>
+              </div>
+
+              <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
+                <button @click="saveSystemSettings" class="btn btn-primary">保存设置</button>
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑转发弹窗 -->
+    <div v-if="showRuleModal" class="modal-backdrop" @click.self="showRuleModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ editingRuleId ? '编辑转发' : '新增转发' }}</span>
+          <button @click="showRuleModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label class="form-label">隧道</label>
+            <select v-model="ruleForm.tunnel_line_id" class="select">
+              <option v-for="l in authorizedLines" :key="l.id" :value="l.id">
+                {{ l.name }} ({{ l.engine }})
+              </option>
+            </select>
+          </div>
+
+          <div>
+            <label class="form-label">名称</label>
+            <input v-model="ruleForm.name" class="input" placeholder="规则名称" />
+          </div>
+
+          <div class="grid-3">
+            <div>
+              <label class="form-label">协议</label>
+              <select v-model="ruleForm.protocol" class="select">
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="both">TCP+UDP</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">监听端口</label>
+              <input v-model.number="ruleForm.listen_port" type="number" class="input" placeholder="0 随机分配" />
+            </div>
+            <div>
+              <label class="form-label">负载均衡</label>
+              <select v-model="ruleForm.load_balance" class="select">
+                <option value="round_robin">轮询</option>
+                <option value="failover">主备</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">目标地址</label>
+            <textarea v-model="ruleForm.targetsText" rows="3" class="textarea" placeholder="每行一个 IP:端口"></textarea>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showRuleModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitRule" class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑隧道弹窗 -->
+    <div v-if="showLineModal" class="modal-backdrop" @click.self="showLineModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ editingLineId ? '编辑隧道' : '新增隧道' }}</span>
+          <button @click="showLineModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div class="grid-2">
+            <div
+              class="mode-card"
+              :class="{ selected: lineForm.type === 'direct' }"
+              @click="lineForm.type = 'direct'"
+            >
+              端口转发
+            </div>
+            <div
+              class="mode-card"
+              :class="{ selected: lineForm.type === 'encrypt' }"
+              @click="lineForm.type = 'encrypt'"
+            >
+              隧道转发
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">名称</label>
+              <input v-model="lineForm.name" class="input" placeholder="隧道名称" />
+            </div>
+            <div>
+              <label class="form-label">转发方式</label>
+              <select v-model="lineForm.engine" class="select">
+                <option value="realm">realm</option>
+                <option value="gost">gost</option>
+                <option value="nftables">nftables</option>
+                <option value="native">native</option>
+              </select>
+            </div>
+          </div>
+
+          <div v-if="lineForm.type === 'direct'">
+            <label class="form-label">入口节点</label>
+            <select v-model="lineForm.ingress_node_id" class="select">
+              <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+            </select>
+          </div>
+
+          <div v-else class="grid-3">
+            <div>
+              <label class="form-label">入口节点</label>
+              <select v-model="lineForm.ingress_node_id" class="select">
+                <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">出口节点</label>
+              <select v-model="lineForm.egress_node_id" class="select">
+                <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">传输协议</label>
+              <select v-model="lineForm.transport" class="select">
+                <option value="tls">TLS</option>
+                <option value="wss">WSS</option>
+                <option value="ws">WS</option>
+                <option value="quic">QUIC</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div>
+              <label class="form-label">计费方式</label>
+              <select v-model="lineForm.billing_mode" class="select">
+                <option value="one_way">单向计费</option>
+                <option value="two_way">双向计费</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">流量倍率</label>
+              <input v-model.number="lineForm.rate_multiplier" type="number" step="0.1" class="input" />
+            </div>
+            <div>
+              <label class="form-label">端口配额</label>
+              <input v-model.number="lineForm.max_port_count" type="number" class="input" />
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showLineModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitLine" class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑节点弹窗 -->
+    <div v-if="showNodeModal" class="modal-backdrop" @click.self="showNodeModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ editingNodeId ? '编辑节点' : '新增节点' }}</span>
+          <button @click="showNodeModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label class="form-label">名称</label>
+            <input v-model="nodeForm.name" class="input" placeholder="节点名称" />
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="form-label">连接地址</label>
+              <input v-model="nodeForm.connect_ip" class="input" placeholder="IP 或域名" />
+            </div>
+            <div>
+              <label class="form-label">节点 IP</label>
+              <input v-model="nodeForm.server_ip" class="input" placeholder="留空默认同连接地址" />
+            </div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="form-label">端口范围</label>
+              <input v-model="nodeForm.port_range" class="input" placeholder="10000-50000" />
+            </div>
+            <div>
+              <label class="form-label">流量倍率</label>
+              <input v-model.number="nodeForm.traffic_rate" type="number" step="0.1" class="input" />
+            </div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="form-label">流量限额 (GB)</label>
+              <input v-model.number="nodeForm.quota_gb" type="number" step="1" class="input" placeholder="0 表示不限" />
+            </div>
+            <div>
+              <label class="form-label">已用流量 (GB)</label>
+              <input v-model.number="nodeForm.used_gb" type="number" step="0.1" class="input" placeholder="0" />
+            </div>
+          </div>
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showNodeModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitNode" class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 节点对接弹窗 -->
+    <div v-if="showInstallModal && installInfo" class="modal-backdrop" @click.self="showInstallModal = false">
+      <div class="modal-box" style="max-width: 600px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <span style="font-weight: 600;">节点对接 · {{ installInfo.node_name }}</span>
+          <button @click="showInstallModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px; font-size: 12.5px;">
+          <div class="grid-2">
+            <div
+              class="mode-card"
+              :class="{ selected: installMode === 'systemd' }"
+              @click="installMode = 'systemd'"
+            >
+              Systemd 服务
+            </div>
+            <div
+              class="mode-card"
+              :class="{ selected: installMode === 'docker' }"
+              @click="installMode = 'docker'"
+            >
+              Docker 容器
+            </div>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <span style="font-weight: 500;">安装命令</span>
+              <button
+                @click="copyConnectAddr(installMode === 'systemd' ? installInfo.systemd_install : installInfo.docker_install)"
+                class="btn btn-primary btn-sm"
+              >
+                复制
+              </button>
+            </div>
+            <pre style="background: var(--bg-code); color: #34d399; padding: 12px; border-radius: var(--radius-md); overflow-x: auto; white-space: pre-wrap; word-break: break-all;">{{ installMode === 'systemd' ? installInfo.systemd_install : installInfo.docker_install }}</pre>
+          </div>
+
+          <div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <span style="font-weight: 500;">卸载命令</span>
+              <button
+                @click="copyConnectAddr(installMode === 'systemd' ? installInfo.systemd_uninstall : installInfo.docker_uninstall)"
+                class="btn btn-danger btn-sm"
+              >
+                复制
+              </button>
+            </div>
+            <pre style="background: var(--bg-code); color: #f87171; padding: 10px 12px; border-radius: var(--radius-md); overflow-x: auto; white-space: pre-wrap; word-break: break-all;">{{ installMode === 'systemd' ? installInfo.systemd_uninstall : installInfo.docker_uninstall }}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 批量导入弹窗 -->
+    <div v-if="showBatchModal" class="modal-backdrop" @click.self="showBatchModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">批量导入</span>
+          <button @click="showBatchModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div class="grid-2">
+            <div>
+              <label class="form-label">隧道</label>
+              <select v-model="batchForm.tunnel_line_id" class="select">
+                <option v-for="l in authorizedLines" :key="l.id" :value="l.id">
+                  {{ l.name }} ({{ l.engine }})
+                </option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">协议</label>
+              <select v-model="batchForm.protocol" class="select">
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="both">TCP+UDP</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label class="form-label">规则列表</label>
+            <textarea v-model="batchForm.rawText" rows="5" class="textarea" placeholder="每行一条：名称|监听端口|目标IP:端口"></textarea>
+          </div>
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showBatchModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitBatchRules" class="btn btn-primary">确定</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑角色弹窗 (仅管理员：角色决定了可以使用哪些隧道) -->
+    <div v-if="showRoleModal && isAdmin" class="modal-backdrop" @click.self="showRoleModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ editingRoleId ? '编辑角色' : '新增角色' }}</span>
+          <button @click="showRoleModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label class="form-label">角色名称</label>
+            <input v-model="roleForm.name" class="input" placeholder="例如：VIP 专线角色" />
+          </div>
+          <div>
+            <label class="form-label">角色说明</label>
+            <input v-model="roleForm.description" class="input" placeholder="角色权限简要说明" />
+          </div>
+          <div>
+            <label class="form-label">可用隧道 (决定属于该角色的用户与套餐可使用哪些隧道)</label>
+            <div style="display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-subtle);">
+              <label
+                v-for="l in lines"
+                :key="l.id"
+                style="display: flex; align-items: center; justify-content: space-between; font-size: 13px; cursor: pointer;"
+              >
+                <span style="display: flex; align-items: center; gap: 8px;">
+                  <input type="checkbox" :value="l.id" v-model="roleForm.tunnel_ids" />
+                  <span style="font-weight: 500;">{{ l.name }}</span>
+                </span>
+                <span class="badge" :class="l.type === 'encrypt' ? 'badge-purple' : 'badge-primary'">
+                  {{ l.type === 'encrypt' ? '隧道转发' : '端口转发' }} · {{ l.engine }}
+                </span>
+              </label>
+            </div>
+          </div>
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showRoleModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitRoleGroup" class="btn btn-primary">保存角色</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑套餐弹窗 (仅管理员：套餐绑定角色) -->
+    <div v-if="showPlanModal && isAdmin" class="modal-backdrop" @click.self="showPlanModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ editingPlanId ? '编辑套餐' : '新增套餐' }}</span>
+          <button @click="showPlanModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div class="grid-2">
+            <div>
+              <label class="form-label">套餐名称</label>
+              <input v-model="planForm.name" class="input" placeholder="例如：专线旗舰套餐" />
+            </div>
+            <div>
+              <label class="form-label">绑定角色 (决定套餐解锁的隧道)</label>
+              <select v-model.number="planForm.role_group_id" class="select">
+                <option v-for="rg in rolesList" :key="rg.id" :value="rg.id">
+                  {{ rg.name }}
+                </option>
+              </select>
+            </div>
+          </div>
+
+          <div style="padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-subtle); font-size: 12px;">
+            <span style="color: var(--text-secondary);">所绑定角色包含隧道：</span>
+            <span
+              v-for="tid in parseTunnelIds(getRoleById(planForm.role_group_id)?.allowed_tunnels)"
+              :key="tid"
+              class="badge badge-primary"
+              style="margin-right: 4px;"
+            >
+              {{ getTunnelById(tid)?.name || ('#' + tid) }}
+            </span>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">价格 (元)</label>
+              <input v-model.number="planForm.price_yuan" type="number" step="1" class="input" />
+            </div>
+            <div>
+              <label class="form-label">周期 (天)</label>
+              <input v-model.number="planForm.duration_days" type="number" class="input" />
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div>
+              <label class="form-label">流量配额 (GB)</label>
+              <input v-model.number="planForm.quota_gb" type="number" class="input" />
+            </div>
+            <div>
+              <label class="form-label">最大规则数</label>
+              <input v-model.number="planForm.max_rules" type="number" class="input" />
+            </div>
+            <div>
+              <label class="form-label">限速 (Mbps)</label>
+              <input v-model.number="planForm.speed_mbps" type="number" class="input" />
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showPlanModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitPlan" class="btn btn-primary">保存套餐</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑用户弹窗 (仅管理员：为用户分配套餐和角色) -->
+    <div v-if="showUserModal && isAdmin" class="modal-backdrop" @click.self="showUserModal = false">
+      <div class="modal-box">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ userForm.isCreate ? '新增用户' : ('分配套餐与角色 · ' + userForm.email) }}</span>
+          <button @click="showUserModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div v-if="userForm.isCreate" class="grid-2">
+            <div>
+              <label class="form-label">邮箱</label>
+              <input v-model="userForm.email" type="email" class="input" placeholder="user@nexus.local" />
+            </div>
+            <div>
+              <label class="form-label">密码</label>
+              <input v-model="userForm.password" type="text" class="input" placeholder="不少于6位" />
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">系统身份</label>
+              <select v-model="userForm.role" class="select">
+                <option value="user">普通用户</option>
+                <option value="admin">管理员</option>
+              </select>
+            </div>
+            <div v-if="!userForm.isCreate">
+              <label class="form-label">重置密码</label>
+              <input v-model="userForm.password" type="text" class="input" placeholder="留空不修改" />
+            </div>
+          </div>
+
+          <div v-if="userForm.role !== 'admin'" class="grid-2">
+            <div>
+              <label class="form-label">分配套餐 (选择后自动带出对应角色与配额)</label>
+              <select v-model.number="userForm.plan_id" @change="onUserPlanSelectChange" class="select">
+                <option :value="0">自定义配额</option>
+                <option v-for="p in plans" :key="p.id" :value="p.id">
+                  {{ p.name }} ({{ roleNameById(p.role_group_id) }})
+                </option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">分配角色 (决定该用户可使用的隧道)</label>
+              <select v-model.number="userForm.role_group_id" class="select">
+                <option v-for="rg in rolesList" :key="rg.id" :value="rg.id">
+                  {{ rg.name }}
+                </option>
+              </select>
+            </div>
+          </div>
+
+          <div v-if="userForm.role !== 'admin'" style="padding: 8px 10px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-subtle); font-size: 12px;">
+            <span style="color: var(--text-secondary);">当前所选角色可用隧道：</span>
+            <span
+              v-for="tid in parseTunnelIds(getRoleById(userForm.role_group_id)?.allowed_tunnels)"
+              :key="tid"
+              class="badge badge-primary"
+              style="margin-right: 4px;"
+            >
+              {{ getTunnelById(tid)?.name || ('#' + tid) }}
+            </span>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">流量配额 (GB)</label>
+              <input v-model.number="userForm.quota_gb" type="number" step="1" class="input" />
+            </div>
+            <div>
+              <label class="form-label">已用流量 (GB)</label>
+              <input v-model.number="userForm.used_gb" type="number" step="0.1" class="input" />
+            </div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="form-label">规则数量</label>
+              <input v-model.number="userForm.max_rules" type="number" class="input" />
+            </div>
+            <div>
+              <label class="form-label">限速 (Mbps)</label>
+              <input v-model.number="userForm.speed_mbps" type="number" class="input" />
+            </div>
+          </div>
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showUserModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitUserEdit" class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp, ref, computed, onMounted, onUnmounted } = Vue
+
+    createApp({
+      setup() {
+        const isDark = ref(false)
+        function toggleTheme() {
+          isDark.value = !isDark.value
+          document.documentElement.classList.toggle('dark', isDark.value)
+        }
+
+        const autoRefresh = ref(true)
+        function toggleAutoRefresh() {
+          autoRefresh.value = !autoRefresh.value
+        }
+
+        const GB = 1024 * 1024 * 1024
+
+        // 角色列表 (类 Xboard 权限组：角色决定了可以用哪些隧道)
+        const rolesList = ref([
+          {
+            id: 1,
+            name: '标准角色',
+            description: '仅可使用标准直转隧道 (#1 深港专线直转)',
+            allowed_tunnels: '1',
+          },
+          {
+            id: 2,
+            name: 'VIP 专线角色',
+            description: '解锁全部直转与双端加密隧道 (#1 深港直转 + #2 广港加密)',
+            allowed_tunnels: '1,2',
+          },
+        ])
+
+        // 面板基础配置 (管理员在「系统设置」可修改)
+        const siteConfig = ref({
+          site_name: 'Nexus Panel',
+          site_logo: 'NX',
+          announcement: '',
+          allow_register: true,
+          default_role_group_id: 1,
+          default_quota_gb: 10,
+          default_max_rules: 5,
+          default_speed_mbps: 50,
+          default_tunnels: '1',
+        })
+
+        const settingsForm = ref({
+          site_name: 'Nexus Panel',
+          site_logo: 'NX',
+          announcement: '',
+          allow_register: true,
+          default_role_group_id: 1,
+          default_quota_gb: 10,
+          default_max_rules: 5,
+          default_speed_mbps: 50,
+        })
+
+        function saveSystemSettings() {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可修改系统设置')
+            return
+          }
+          const rg = getRoleById(settingsForm.value.default_role_group_id) || rolesList.value[0]
+          siteConfig.value = {
+            site_name: (settingsForm.value.site_name || 'Nexus Panel').trim(),
+            site_logo: (settingsForm.value.site_logo || 'NX').trim(),
+            announcement: (settingsForm.value.announcement || '').trim(),
+            allow_register: Boolean(settingsForm.value.allow_register),
+            default_role_group_id: rg ? rg.id : 1,
+            default_quota_gb: Math.max(1, Number(settingsForm.value.default_quota_gb) || 10),
+            default_max_rules: Math.max(1, Number(settingsForm.value.default_max_rules) || 5),
+            default_speed_mbps: Math.max(1, Number(settingsForm.value.default_speed_mbps) || 50),
+            default_tunnels: rg ? rg.allowed_tunnels : '1',
+          }
+          document.title = siteConfig.value.site_name
+          showToast('系统设置已保存')
+        }
+
+        // 两套预设账号：
+        // 1. 管理员账号：admin@nexus.local / admin123 (拥有面板基础配置、节点维护、隧道维护、角色管理、套餐管理、用户分配等全部权限)
+        // 2. 普通用户账号：user@nexus.local / user123 (默认分配「标准套餐」与「标准角色」，仅可使用该角色授权的隧道 #1「深港专线直转」)
+        const usersList = ref([
+          {
+            id: 1,
+            email: 'admin@nexus.local',
+            password: 'admin123',
+            role: 'admin',
+            role_group_id: 2,
+            plan_id: 2,
+            status: 'active',
+            allowed_tunnels: '*',
+            balance_cents: 100000,
+            quota_bytes: 1024 * GB,
+            used_bytes: 148 * GB,
+            max_rules: 100,
+            speed_mbps: 1000,
+          },
+          {
+            id: 2,
+            email: 'user@nexus.local',
+            password: 'user123',
+            role: 'user',
+            role_group_id: 1,
+            plan_id: 1,
+            status: 'active',
+            allowed_tunnels: '1',
+            balance_cents: 20000,
+            quota_bytes: 200 * GB,
+            used_bytes: 38 * GB,
+            max_rules: 10,
+            speed_mbps: 100,
+          },
+        ])
+
+        const token = ref('demo-jwt-token')
+        const isRegisterMode = ref(false)
+        const emailInput = ref('admin@nexus.local')
+        const passwordInput = ref('admin123')
+        const activeTab = ref('dashboard')
+
+        const user = ref({ ...usersList.value[0] })
+        const isAdmin = computed(() => user.value && user.value.role === 'admin')
+
+        const adminOnlyTabs = ['lines', 'nodes', 'roles', 'users', 'settings']
+        const tabTitleMap = {
+          dashboard: '概览',
+          rules: '转发管理',
+          lines: '隧道管理',
+          nodes: '节点管理',
+          roles: '角色管理',
+          users: '用户管理',
+          store: '套餐管理',
+          settings: '系统设置',
+        }
+        const currentTabTitle = computed(() => tabTitleMap[activeTab.value] || '')
+
+        function switchTab(tab) {
+          if (adminOnlyTabs.includes(tab) && !isAdmin.value) {
+            showToast('权限不足：仅管理员可访问')
+            activeTab.value = 'dashboard'
+            return
+          }
+          if (tab === 'settings') {
+            settingsForm.value = {
+              site_name: siteConfig.value.site_name,
+              site_logo: siteConfig.value.site_logo,
+              announcement: siteConfig.value.announcement,
+              allow_register: siteConfig.value.allow_register,
+              default_role_group_id: siteConfig.value.default_role_group_id || 1,
+              default_quota_gb: siteConfig.value.default_quota_gb,
+              default_max_rules: siteConfig.value.default_max_rules,
+              default_speed_mbps: siteConfig.value.default_speed_mbps,
+            }
+          }
+          activeTab.value = tab
+        }
+
+        function parseTunnelIds(str) {
+          if (!str || str === '*') return []
+          return String(str)
+            .split(',')
+            .map(s => Number(s.trim()))
+            .filter(n => n > 0)
+        }
+
+        function getRoleById(id) {
+          return rolesList.value.find(r => r.id === Number(id))
+        }
+
+        function roleNameById(id) {
+          return getRoleById(id)?.name || '未分配角色'
+        }
+
+        function planNameById(id) {
+          if (!id) return '自定义'
+          return plans.value.find(p => p.id === Number(id))?.name || '自定义'
+        }
+
+        function hasTunnelPermission(u, tunnelId) {
+          if (!u) return false
+          if (u.role === 'admin' || u.allowed_tunnels === '*') return true
+          const rg = getRoleById(u.role_group_id)
+          const raw = rg ? rg.allowed_tunnels : u.allowed_tunnels
+          return parseTunnelIds(raw).includes(Number(tunnelId))
+        }
+
+        const nodes = ref([
+          {
+            id: 1,
+            name: '深港 IEPL 专线-01',
+            server_ip: '10.10.0.1',
+            connect_ip: 'sz-iepl.nexus.local',
+            public_host: 'sz-iepl.nexus.local',
+            port_range: '10000-30000',
+            traffic_rate: 1.0,
+            quota_bytes: 2000 * GB,
+            used_bytes: 312 * GB,
+            supported_engines: 'native,gost,realm,nftables',
+            status: 'online',
+            cpu_cores: 8,
+            cpu_usage: 11.4,
+            load_1: 0.42,
+            load_5: 0.38,
+            load_15: 0.31,
+            mem_used_bytes: Math.round(3.6 * GB),
+            mem_total_bytes: 16 * GB,
+            mem_usage: 22.5,
+            disk_used_bytes: Math.round(28.4 * GB),
+            disk_total_bytes: 160 * GB,
+            disk_usage: 17.8,
+            speed_up_bps: 18.5 * 1024 * 1024,
+            speed_down_bps: 42.3 * 1024 * 1024,
+            active_conns: 186,
+            uptime_seconds: 18 * 86400 + 6 * 3600,
+          },
+          {
+            id: 2,
+            name: '广州移动入口-02',
+            server_ip: '183.60.92.15',
+            connect_ip: 'gz-cmcc.nexus.local',
+            public_host: 'gz-cmcc.nexus.local',
+            port_range: '20000-40000',
+            traffic_rate: 1.0,
+            quota_bytes: 1500 * GB,
+            used_bytes: 420 * GB,
+            supported_engines: 'native,gost,realm,nftables',
+            status: 'online',
+            cpu_cores: 4,
+            cpu_usage: 18.2,
+            load_1: 0.65,
+            load_5: 0.54,
+            load_15: 0.49,
+            mem_used_bytes: Math.round(2.5 * GB),
+            mem_total_bytes: 8 * GB,
+            mem_usage: 31.2,
+            disk_used_bytes: Math.round(19.2 * GB),
+            disk_total_bytes: 80 * GB,
+            disk_usage: 24.0,
+            speed_up_bps: 12.1 * 1024 * 1024,
+            speed_down_bps: 29.8 * 1024 * 1024,
+            active_conns: 124,
+            uptime_seconds: 11 * 86400 + 14 * 3600,
+          },
+          {
+            id: 3,
+            name: '香港 BGP 出口-01',
+            server_ip: '45.207.19.88',
+            connect_ip: '45.207.19.88',
+            public_host: '45.207.19.88',
+            port_range: '30001-55000',
+            traffic_rate: 1.0,
+            quota_bytes: 3000 * GB,
+            used_bytes: 510 * GB,
+            supported_engines: 'native,gost,realm',
+            status: 'online',
+            cpu_cores: 4,
+            cpu_usage: 9.5,
+            load_1: 0.28,
+            load_5: 0.30,
+            load_15: 0.25,
+            mem_used_bytes: Math.round(1.9 * GB),
+            mem_total_bytes: 8 * GB,
+            mem_usage: 23.8,
+            disk_used_bytes: Math.round(14.5 * GB),
+            disk_total_bytes: 100 * GB,
+            disk_usage: 14.5,
+            speed_up_bps: 24.6 * 1024 * 1024,
+            speed_down_bps: 51.2 * 1024 * 1024,
+            active_conns: 215,
+            uptime_seconds: 34 * 86400 + 9 * 3600,
+          },
+        ])
+
+        const lines = ref([
+          {
+            id: 1,
+            name: '深港专线直转',
+            type: 'direct',
+            ingress_node_id: 1,
+            egress_node_id: 0,
+            transport: 'raw',
+            engine: 'realm',
+            billing_mode: 'one_way',
+            rate_multiplier: 1.0,
+            max_port_count: 50,
+          },
+          {
+            id: 2,
+            name: '广港加密隧道',
+            type: 'encrypt',
+            ingress_node_id: 2,
+            egress_node_id: 3,
+            transport: 'tls',
+            engine: 'gost',
+            billing_mode: 'two_way',
+            rate_multiplier: 1.5,
+            max_port_count: 50,
+          },
+        ])
+
+        // 当前登录用户可使用的隧道列表 (普通用户仅能看到管理员分配的隧道)
+        const authorizedLines = computed(() => {
+          if (isAdmin.value) return lines.value
+          return lines.value.filter(l => hasTunnelPermission(user.value, l.id))
+        })
+
+        const rules = ref([
+          {
+            id: 101,
+            user_id: 2,
+            name: '用户深港专线转发',
+            mode: 'direct',
+            ingress_node_id: 1,
+            tunnel_line_id: 1,
+            engine: 'realm',
+            protocol: 'both',
+            listen_port: 10088,
+            relay_port: 0,
+            load_balance: 'round_robin',
+            targets_json: JSON.stringify([{ address: '104.16.132.229:443' }]),
+            upload_bytes: 12 * 1024 * 1024 * 1024,
+            down_bytes: 38 * 1024 * 1024 * 1024,
+            billed_bytes: 38 * 1024 * 1024 * 1024,
+            enabled: true,
+          },
+          {
+            id: 102,
+            user_id: 1,
+            name: '管理员广港加密落地',
+            mode: 'tunnel',
+            ingress_node_id: 2,
+            tunnel_line_id: 2,
+            engine: 'gost',
+            protocol: 'tcp',
+            listen_port: 20168,
+            relay_port: 34210,
+            load_balance: 'failover',
+            targets_json: JSON.stringify([{ address: '1.1.1.1:443' }]),
+            upload_bytes: 10 * 1024 * 1024 * 1024,
+            down_bytes: 30 * 1024 * 1024 * 1024,
+            billed_bytes: 60 * 1024 * 1024 * 1024,
+            enabled: true,
+          },
+        ])
+
+        // 普通用户仅可见自己的转发规则，管理员可见全站规则
+        const visibleRules = computed(() => {
+          if (isAdmin.value) return rules.value
+          return rules.value.filter(r => r.user_id === user.value.id)
+        })
+
+        const plans = ref([
+          {
+            id: 1,
+            name: '标准套餐',
+            role_group_id: 1,
+            price_cents: 1900,
+            duration_days: 30,
+            quota_bytes: 200 * 1024 * 1024 * 1024,
+            max_rules: 10,
+            speed_mbps: 100,
+            allowed_tunnels: '1',
+          },
+          {
+            id: 2,
+            name: '专线旗舰套餐',
+            role_group_id: 2,
+            price_cents: 8900,
+            duration_days: 30,
+            quota_bytes: 1024 * 1024 * 1024 * 1024,
+            max_rules: 50,
+            speed_mbps: 500,
+            allowed_tunnels: '1,2',
+          },
+        ])
+
+        const toastMsg = ref('')
+        let toastTimer = null
+        function showToast(msg) {
+          toastMsg.value = msg
+          if (toastTimer) clearTimeout(toastTimer)
+          toastTimer = setTimeout(() => {
+            toastMsg.value = ''
+          }, 2200)
+        }
+
+        function copyConnectAddr(text) {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+              showToast(`已复制: ${text}`)
+            }).catch(() => fallbackCopy(text))
+          } else {
+            fallbackCopy(text)
+          }
+        }
+
+        function fallbackCopy(text) {
+          const ta = document.createElement('textarea')
+          ta.value = text
+          document.body.appendChild(ta)
+          ta.select()
+          document.execCommand('copy')
+          document.body.removeChild(ta)
+          showToast(`已复制: ${text}`)
+        }
+
+        // --- 登录、注册与账号切换 ---
+        function loginWithAccount(acc) {
+          if (acc.status === 'banned') {
+            showToast('该账号已被封禁')
+            return
+          }
+          user.value = acc
+          token.value = `jwt-${acc.role}-${acc.id}`
+          if (!isAdmin.value && adminOnlyTabs.includes(activeTab.value)) {
+            activeTab.value = 'dashboard'
+          }
+          showToast(`已登录：${acc.email} (${acc.role === 'admin' ? '管理员' : '普通用户'})`)
+        }
+
+        function quickLoginAs(email, pwd) {
+          emailInput.value = email
+          passwordInput.value = pwd
+          isRegisterMode.value = false
+          handleAuth()
+        }
+
+        function switchAccountQuick() {
+          const targetEmail = isAdmin.value ? 'user@nexus.local' : 'admin@nexus.local'
+          const targetAcc = usersList.value.find(u => u.email === targetEmail)
+          if (targetAcc) {
+            loginWithAccount(targetAcc)
+          }
+        }
+
+        function handleAuth() {
+          const email = emailInput.value.trim().toLowerCase()
+          const pwd = passwordInput.value
+          if (!email || !pwd) {
+            showToast('请输入邮箱和密码')
+            return
+          }
+
+          if (isRegisterMode.value) {
+            if (!siteConfig.value.allow_register) {
+              showToast('管理员已关闭公开注册')
+              return
+            }
+            if (usersList.value.some(u => u.email.toLowerCase() === email)) {
+              showToast('该邮箱已注册')
+              return
+            }
+            const defRg = getRoleById(siteConfig.value.default_role_group_id) || rolesList.value[0]
+            const newAcc = {
+              id: usersList.value.length + 1,
+              email,
+              password: pwd,
+              role: 'user',
+              role_group_id: defRg ? defRg.id : 1,
+              plan_id: 0,
+              status: 'active',
+              allowed_tunnels: defRg ? defRg.allowed_tunnels : (siteConfig.value.default_tunnels || '1'),
+              balance_cents: 0,
+              quota_bytes: (siteConfig.value.default_quota_gb || 10) * GB,
+              used_bytes: 0,
+              max_rules: siteConfig.value.default_max_rules || 5,
+              speed_mbps: siteConfig.value.default_speed_mbps || 50,
+            }
+            usersList.value.push(newAcc)
+            isRegisterMode.value = false
+            loginWithAccount(newAcc)
+            return
+          }
+
+          const found = usersList.value.find(u => u.email.toLowerCase() === email && u.password === pwd)
+          if (!found) {
+            showToast('邮箱或密码错误')
+            return
+          }
+          loginWithAccount(found)
+        }
+
+        function logout() {
+          token.value = null
+        }
+
+        // --- 转发新增与编辑 ---
+        const showRuleModal = ref(false)
+        const editingRuleId = ref(null)
+        const ruleForm = ref({
+          name: '',
+          tunnel_line_id: 1,
+          protocol: 'tcp',
+          listen_port: 0,
+          load_balance: 'round_robin',
+          targetsText: '1.1.1.1:443',
+        })
+
+        function openCreateRuleModal() {
+          if (authorizedLines.value.length === 0) {
+            showToast('暂无可用隧道权限，请联系管理员分配')
+            return
+          }
+          editingRuleId.value = null
+          ruleForm.value = {
+            name: '',
+            tunnel_line_id: authorizedLines.value[0].id,
+            protocol: 'tcp',
+            listen_port: 0,
+            load_balance: 'round_robin',
+            targetsText: '1.1.1.1:443',
+          }
+          showRuleModal.value = true
+        }
+
+        function openEditRuleModal(rule) {
+          if (!isAdmin.value && rule.user_id !== user.value.id) {
+            showToast('无权修改他人规则')
+            return
+          }
+          editingRuleId.value = rule.id
+          const targets = parseTargets(rule.targets_json)
+          ruleForm.value = {
+            name: rule.name,
+            tunnel_line_id: rule.tunnel_line_id,
+            protocol: rule.protocol,
+            listen_port: rule.listen_port,
+            load_balance: rule.load_balance,
+            targetsText: targets.map(t => t.address).join('\n'),
+          }
+          showRuleModal.value = true
+        }
+
+        function quickCreateRuleForTunnel(line) {
+          if (!hasTunnelPermission(user.value, line.id)) {
+            showToast('无权使用该隧道')
+            return
+          }
+          activeTab.value = 'rules'
+          editingRuleId.value = null
+          ruleForm.value = {
+            name: '',
+            tunnel_line_id: line.id,
+            protocol: 'tcp',
+            listen_port: 0,
+            load_balance: 'round_robin',
+            targetsText: '1.1.1.1:443',
+          }
+          showRuleModal.value = true
+        }
+
+        // --- 隧道新增与编辑 (仅管理员) ---
+        const showLineModal = ref(false)
+        const editingLineId = ref(null)
+        const lineForm = ref({
+          name: '',
+          type: 'direct',
+          ingress_node_id: 1,
+          egress_node_id: 3,
+          transport: 'tls',
+          engine: 'realm',
+          billing_mode: 'one_way',
+          rate_multiplier: 1.0,
+          max_port_count: 50,
+        })
+
+        function openCreateLineModal() {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护隧道')
+            return
+          }
+          editingLineId.value = null
+          lineForm.value = {
+            name: '',
+            type: 'direct',
+            ingress_node_id: nodes.value[0]?.id || 1,
+            egress_node_id: nodes.value[nodes.value.length - 1]?.id || 1,
+            transport: 'tls',
+            engine: 'realm',
+            billing_mode: 'one_way',
+            rate_multiplier: 1.0,
+            max_port_count: 50,
+          }
+          showLineModal.value = true
+        }
+
+        function openEditLineModal(line) {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护隧道')
+            return
+          }
+          editingLineId.value = line.id
+          lineForm.value = {
+            name: line.name,
+            type: line.type,
+            ingress_node_id: line.ingress_node_id,
+            egress_node_id: line.egress_node_id || nodes.value[0]?.id || 1,
+            transport: line.transport || 'tls',
+            engine: line.engine,
+            billing_mode: line.billing_mode || 'one_way',
+            rate_multiplier: line.rate_multiplier,
+            max_port_count: line.max_port_count || 50,
+          }
+          showLineModal.value = true
+        }
+
+        // --- 节点新增与编辑 (仅管理员) ---
+        const showNodeModal = ref(false)
+        const editingNodeId = ref(null)
+        const nodeForm = ref({
+          name: '',
+          connect_ip: '',
+          server_ip: '',
+          port_range: '10000-50000',
+          traffic_rate: 1.0,
+          quota_gb: 2000,
+          used_gb: 0,
+        })
+
+        function openCreateNodeModal() {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护节点')
+            return
+          }
+          editingNodeId.value = null
+          nodeForm.value = {
+            name: '',
+            connect_ip: '',
+            server_ip: '',
+            port_range: '10000-50000',
+            traffic_rate: 1.0,
+            quota_gb: 2000,
+            used_gb: 0,
+          }
+          showNodeModal.value = true
+        }
+
+        function openEditNodeModal(node) {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护节点')
+            return
+          }
+          editingNodeId.value = node.id
+          nodeForm.value = {
+            name: node.name,
+            connect_ip: node.connect_ip || node.public_host,
+            server_ip: node.server_ip,
+            port_range: node.port_range,
+            traffic_rate: node.traffic_rate,
+            quota_gb: Math.round((node.quota_bytes || 0) / GB),
+            used_gb: Number(((node.used_bytes || 0) / GB).toFixed(1)),
+          }
+          showNodeModal.value = true
+        }
+
+        const probeResults = ref({})
+        const probingRuleId = ref(null)
+        const showInstallModal = ref(false)
+        const installInfo = ref(null)
+        const installMode = ref('systemd')
+        const redeemInput = ref('NEXUS-VIP-2026')
+
+        const quotaPercent = computed(() => {
+          if (!user.value.quota_bytes) return 0
+          return Math.min(100, Number(((user.value.used_bytes / user.value.quota_bytes) * 100).toFixed(1)))
+        })
+
+        function nodeTrafficPercent(node) {
+          if (!node.quota_bytes || node.quota_bytes <= 0) return 0
+          return Math.min(100, Number((((node.used_bytes || 0) / node.quota_bytes) * 100).toFixed(1)))
+        }
+
+        function formatUptime(sec) {
+          if (!sec || sec <= 0) return '0分钟'
+          const days = Math.floor(sec / 86400)
+          const hours = Math.floor((sec % 86400) / 3600)
+          if (days > 0) return `${days}天 ${hours}小时`
+          const mins = Math.floor((sec % 3600) / 60)
+          return `${hours}小时 ${mins}分`
+        }
+
+        function formatBytes(bytes) {
+          if (!bytes || bytes <= 0) return '0 B'
+          const units = ['B', 'KB', 'MB', 'GB', 'TB']
+          const i = Math.floor(Math.log(bytes) / Math.log(1024))
+          return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`
+        }
+
+        function isBlockedSSRFTarget(addr) {
+          const lower = addr.toLowerCase()
+          return (
+            lower.startsWith('127.') ||
+            lower.startsWith('10.') ||
+            lower.startsWith('192.168.') ||
+            /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(lower) ||
+            lower.startsWith('169.254.') ||
+            lower.startsWith('100.64.') ||
+            lower.startsWith('0.') ||
+            lower.startsWith('[::1]') ||
+            lower.startsWith('[::ffff:') ||
+            lower.startsWith('localhost:') ||
+            lower.endsWith(':25') ||
+            lower.endsWith(':465') ||
+            lower.endsWith(':587')
+          )
+        }
+
+        const targetsCache = {}
+        function parseTargets(jsonStr) {
+          if (targetsCache[jsonStr]) return targetsCache[jsonStr]
+          try {
+            const parsed = JSON.parse(jsonStr) || []
+            targetsCache[jsonStr] = parsed
+            return parsed
+          } catch {
+            return []
+          }
+        }
+
+        function submitRule() {
+          const rawTargets = ruleForm.value.targetsText
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean)
+
+          if (!ruleForm.value.name || rawTargets.length === 0) {
+            showToast('请填写完整信息')
+            return
+          }
+
+          if (!hasTunnelPermission(user.value, ruleForm.value.tunnel_line_id)) {
+            showToast('无权使用该隧道，请联系管理员分配权限')
+            return
+          }
+
+          for (const addr of rawTargets) {
+            if (isBlockedSSRFTarget(addr)) {
+              showToast(`禁止转发内网或受保护地址: ${addr}`)
+              return
+            }
+          }
+
+          const tun = getTunnelById(ruleForm.value.tunnel_line_id)
+          if (!tun) {
+            showToast('所选隧道不存在')
+            return
+          }
+
+          if (!editingRuleId.value && visibleRules.value.length >= user.value.max_rules) {
+            showToast(`规则数量已达上限 (${user.value.max_rules} 条)`)
+            return
+          }
+
+          const tunRules = rules.value.filter(r => r.tunnel_line_id === tun.id && r.id !== editingRuleId.value)
+          if (tun.max_port_count > 0 && tunRules.length >= tun.max_port_count) {
+            showToast(`该隧道转发规则数已达上限 (${tun.max_port_count} 条)`)
+            return
+          }
+
+          let port = ruleForm.value.listen_port > 0
+            ? ruleForm.value.listen_port
+            : 10100 + rules.value.length
+
+          if (port < 1024 || [22, 3306, 5432, 6379].includes(port)) {
+            showToast(`禁止使用系统保留端口: ${port}`)
+            return
+          }
+
+          const portConflict = rules.value.find(
+            r => r.ingress_node_id === tun.ingress_node_id && r.listen_port === port && r.id !== editingRuleId.value
+          )
+          if (portConflict) {
+            if (ruleForm.value.listen_port > 0) {
+              showToast(`入口端口 ${port} 在该节点已被占用`)
+              return
+            }
+            while (rules.value.some(r => r.ingress_node_id === tun.ingress_node_id && r.listen_port === port && r.id !== editingRuleId.value)) {
+              port++
+            }
+          }
+
+          const newTargetsJSON = JSON.stringify(rawTargets.map(a => ({ address: a })))
+
+          if (editingRuleId.value) {
+            const idx = rules.value.findIndex(r => r.id === editingRuleId.value)
+            if (idx !== -1) {
+              if (!isAdmin.value && rules.value[idx].user_id !== user.value.id) {
+                showToast('无权修改他人规则')
+                return
+              }
+              rules.value[idx] = {
+                ...rules.value[idx],
+                name: ruleForm.value.name,
+                mode: tun.type === 'encrypt' ? 'tunnel' : 'direct',
+                ingress_node_id: tun.ingress_node_id,
+                tunnel_line_id: tun.id,
+                engine: tun.engine,
+                protocol: ruleForm.value.protocol,
+                listen_port: port,
+                load_balance: ruleForm.value.load_balance,
+                targets_json: newTargetsJSON,
+              }
+            }
+            showRuleModal.value = false
+            showToast('修改已保存')
+          } else {
+            rules.value.unshift({
+              id: 101 + rules.value.length,
+              user_id: user.value.id,
+              name: ruleForm.value.name,
+              mode: tun.type === 'encrypt' ? 'tunnel' : 'direct',
+              ingress_node_id: tun.ingress_node_id,
+              tunnel_line_id: tun.id,
+              engine: tun.engine,
+              protocol: ruleForm.value.protocol,
+              listen_port: port,
+              relay_port: tun.type === 'encrypt' ? 35000 + rules.value.length : 0,
+              load_balance: ruleForm.value.load_balance,
+              targets_json: newTargetsJSON,
+              upload_bytes: 0,
+              down_bytes: 0,
+              billed_bytes: 0,
+              enabled: true,
+            })
+            showRuleModal.value = false
+            showToast('创建成功')
+          }
+        }
+
+        function handleToggleRule(rule) {
+          if (!isAdmin.value && rule.user_id !== user.value.id) {
+            showToast('无权操作他人规则')
+            return
+          }
+          if (!rule.enabled && !hasTunnelPermission(user.value, rule.tunnel_line_id)) {
+            showToast('该隧道权限已被收回，无法启用')
+            return
+          }
+          rule.enabled = !rule.enabled
+        }
+
+        function handleProbeRule(rule) {
+          if (!isAdmin.value && rule.user_id !== user.value.id) {
+            showToast('无权探测他人规则')
+            return
+          }
+          probingRuleId.value = rule.id
+          setTimeout(() => {
+            const targets = parseTargets(rule.targets_json)
+            const map = {}
+            targets.forEach(t => {
+              map[t.address] = Math.floor(8 + Math.random() * 14)
+            })
+            const tun = getTunnelById(rule.tunnel_line_id)
+            const tunnelMs = tun && tun.type === 'encrypt' ? Math.floor(6 + Math.random() * 8) : 0
+            probeResults.value[rule.id] = {
+              tunnel_ms: tunnelMs,
+              latencies: map,
+            }
+            probingRuleId.value = null
+          }, 120)
+        }
+
+        // --- 规则批量导入与导出 ---
+        const showBatchModal = ref(false)
+        const batchForm = ref({
+          tunnel_line_id: 1,
+          protocol: 'tcp',
+          rawText: '业务节点A|0|1.1.1.1:443\n业务节点B|0|8.8.8.8:53',
+        })
+
+        function openBatchModal() {
+          if (authorizedLines.value.length === 0) {
+            showToast('暂无可用隧道权限，请联系管理员分配')
+            return
+          }
+          batchForm.value = {
+            tunnel_line_id: authorizedLines.value[0].id,
+            protocol: 'tcp',
+            rawText: '业务节点A|0|1.1.1.1:443\n业务节点B|0|8.8.8.8:53',
+          }
+          showBatchModal.value = true
+        }
+
+        function submitBatchRules() {
+          if (!hasTunnelPermission(user.value, batchForm.value.tunnel_line_id)) {
+            showToast('无权使用该隧道，请联系管理员分配权限')
+            return
+          }
+          const tun = getTunnelById(batchForm.value.tunnel_line_id)
+          if (!tun) {
+            showToast('所选隧道不存在')
+            return
+          }
+          const rows = batchForm.value.rawText.split('\n').map(s => s.trim()).filter(Boolean)
+          if (rows.length === 0) {
+            showToast('请输入需要导入的规则')
+            return
+          }
+          if (visibleRules.value.length + rows.length > user.value.max_rules) {
+            showToast(`超出规则数量上限 (${user.value.max_rules} 条)`)
+            return
+          }
+          let added = 0
+          for (const row of rows) {
+            const parts = row.split('|').map(s => s.trim())
+            if (parts.length < 2) continue
+            const name = parts.length >= 3 ? parts[0] : `批量规则-${rules.value.length + 1}`
+            const reqPort = parts.length >= 3 ? (Number(parts[1]) || 0) : (Number(parts[0]) || 0)
+            const targetAddr = parts.length >= 3 ? parts[2] : parts[1]
+            if (isBlockedSSRFTarget(targetAddr)) {
+              showToast(`拦截内网受保护地址: ${targetAddr}`)
+              return
+            }
+            let port = reqPort > 0 ? reqPort : 10100 + rules.value.length
+            while (rules.value.some(r => r.ingress_node_id === tun.ingress_node_id && r.listen_port === port)) {
+              port++
+            }
+            rules.value.unshift({
+              id: 101 + rules.value.length + added,
+              user_id: user.value.id,
+              name,
+              mode: tun.type === 'encrypt' ? 'tunnel' : 'direct',
+              ingress_node_id: tun.ingress_node_id,
+              tunnel_line_id: tun.id,
+              engine: tun.engine,
+              protocol: batchForm.value.protocol,
+              listen_port: port,
+              relay_port: tun.type === 'encrypt' ? 35000 + rules.value.length : 0,
+              load_balance: 'round_robin',
+              targets_json: JSON.stringify([{ address: targetAddr }]),
+              upload_bytes: 0,
+              down_bytes: 0,
+              billed_bytes: 0,
+              enabled: true,
+            })
+            added++
+          }
+          showBatchModal.value = false
+          showToast(`成功批量导入 ${added} 条规则`)
+        }
+
+        function exportRulesToClipboard() {
+          const text = visibleRules.value.map(r => {
+            const firstTarget = parseTargets(r.targets_json)[0]?.address || ''
+            return `${r.name}|${r.listen_port}|${firstTarget}`
+          }).join('\n')
+          copyConnectAddr(text)
+          showToast(`已导出 ${visibleRules.value.length} 条规则到剪贴板`)
+        }
+
+        // --- 角色管理 (仅管理员：角色决定了可以用哪些隧道) ---
+        const showRoleModal = ref(false)
+        const editingRoleId = ref(null)
+        const roleForm = ref({
+          name: '',
+          description: '',
+          tunnel_ids: [1],
+        })
+
+        function openCreateRoleModal() {
+          if (!isAdmin.value) return
+          editingRoleId.value = null
+          roleForm.value = {
+            name: '',
+            description: '',
+            tunnel_ids: lines.value[0] ? [lines.value[0].id] : [],
+          }
+          showRoleModal.value = true
+        }
+
+        function openEditRoleModal(rg) {
+          if (!isAdmin.value) return
+          editingRoleId.value = rg.id
+          roleForm.value = {
+            name: rg.name,
+            description: rg.description || '',
+            tunnel_ids: parseTunnelIds(rg.allowed_tunnels),
+          }
+          showRoleModal.value = true
+        }
+
+        function submitRoleGroup() {
+          if (!isAdmin.value) return
+          const name = (roleForm.value.name || '').trim()
+          if (!name) {
+            showToast('请输入角色名称')
+            return
+          }
+          const allowedStr = (roleForm.value.tunnel_ids || []).join(',')
+          if (editingRoleId.value) {
+            const idx = rolesList.value.findIndex(r => r.id === editingRoleId.value)
+            if (idx !== -1) {
+              rolesList.value[idx].name = name
+              rolesList.value[idx].description = (roleForm.value.description || '').trim()
+              rolesList.value[idx].allowed_tunnels = allowedStr
+
+              // 级联同步：更新绑定该角色的套餐与用户的可用隧道，并自动暂停无权限隧道下的规则
+              plans.value.forEach(p => {
+                if (p.role_group_id === editingRoleId.value) {
+                  p.allowed_tunnels = allowedStr
+                }
+              })
+              usersList.value.forEach(u => {
+                if (u.role !== 'admin' && u.role_group_id === editingRoleId.value) {
+                  u.allowed_tunnels = allowedStr
+                  rules.value.forEach(r => {
+                    if (r.user_id === u.id && !hasTunnelPermission(u, r.tunnel_line_id)) {
+                      r.enabled = false
+                    }
+                  })
+                }
+              })
+              if (user.value.role !== 'admin' && user.value.role_group_id === editingRoleId.value) {
+                user.value.allowed_tunnels = allowedStr
+              }
+            }
+            showRoleModal.value = false
+            showToast('角色已保存，已同步关联套餐与用户的可用隧道')
+          } else {
+            const newId = rolesList.value.reduce((m, r) => Math.max(m, r.id), 0) + 1
+            rolesList.value.push({
+              id: newId,
+              name,
+              description: (roleForm.value.description || '').trim(),
+              allowed_tunnels: allowedStr,
+            })
+            showRoleModal.value = false
+            showToast('角色已创建')
+          }
+        }
+
+        function deleteRoleGroup(id) {
+          if (!isAdmin.value) return
+          if (plans.value.some(p => p.role_group_id === id)) {
+            showToast('该角色仍被套餐绑定，请先修改或删除关联套餐')
+            return
+          }
+          if (usersList.value.some(u => u.role !== 'admin' && u.role_group_id === id)) {
+            showToast('该角色下仍有用户，请先修改用户的所属角色')
+            return
+          }
+          rolesList.value = rolesList.value.filter(r => r.id !== id)
+          showToast('角色已删除')
+        }
+
+        // --- 套餐管理 (仅管理员：套餐绑定角色) ---
+        const showPlanModal = ref(false)
+        const editingPlanId = ref(null)
+        const planForm = ref({
+          name: '',
+          role_group_id: 1,
+          price_yuan: 19,
+          duration_days: 30,
+          quota_gb: 200,
+          max_rules: 10,
+          speed_mbps: 100,
+        })
+
+        function openCreatePlanModal() {
+          if (!isAdmin.value) return
+          editingPlanId.value = null
+          planForm.value = {
+            name: '',
+            role_group_id: rolesList.value[0]?.id || 1,
+            price_yuan: 29,
+            duration_days: 30,
+            quota_gb: 200,
+            max_rules: 15,
+            speed_mbps: 150,
+          }
+          showPlanModal.value = true
+        }
+
+        function openEditPlanModal(plan) {
+          if (!isAdmin.value) return
+          editingPlanId.value = plan.id
+          planForm.value = {
+            name: plan.name,
+            role_group_id: plan.role_group_id || 1,
+            price_yuan: Number((plan.price_cents / 100).toFixed(2)),
+            duration_days: plan.duration_days || 30,
+            quota_gb: Math.round(plan.quota_bytes / GB),
+            max_rules: plan.max_rules,
+            speed_mbps: plan.speed_mbps,
+          }
+          showPlanModal.value = true
+        }
+
+        function submitPlan() {
+          if (!isAdmin.value) return
+          const name = (planForm.value.name || '').trim()
+          if (!name) {
+            showToast('请填写套餐名称')
+            return
+          }
+          const rg = getRoleById(planForm.value.role_group_id) || rolesList.value[0]
+          const allowedStr = rg ? rg.allowed_tunnels : '1'
+          const payload = {
+            name,
+            role_group_id: rg ? rg.id : 1,
+            price_cents: Math.max(0, Math.round((Number(planForm.value.price_yuan) || 0) * 100)),
+            duration_days: Math.max(1, Number(planForm.value.duration_days) || 30),
+            quota_bytes: Math.max(1, Number(planForm.value.quota_gb) || 100) * GB,
+            max_rules: Math.max(1, Number(planForm.value.max_rules) || 10),
+            speed_mbps: Math.max(1, Number(planForm.value.speed_mbps) || 100),
+            allowed_tunnels: allowedStr,
+          }
+          if (editingPlanId.value) {
+            const idx = plans.value.findIndex(p => p.id === editingPlanId.value)
+            if (idx !== -1) {
+              plans.value[idx] = { ...plans.value[idx], ...payload }
+            }
+            showPlanModal.value = false
+            showToast('套餐已更新')
+          } else {
+            const newId = plans.value.reduce((m, p) => Math.max(m, p.id), 0) + 1
+            plans.value.push({ id: newId, ...payload })
+            showPlanModal.value = false
+            showToast('套餐已创建')
+          }
+        }
+
+        function deletePlan(id) {
+          if (!isAdmin.value) return
+          plans.value = plans.value.filter(p => p.id !== id)
+          showToast('套餐已删除')
+        }
+
+        // --- 用户管理：为用户分配套餐和角色 (仅管理员) ---
+        const showUserModal = ref(false)
+        const userForm = ref({
+          isCreate: false,
+          id: 1,
+          email: '',
+          password: '',
+          role: 'user',
+          plan_id: 1,
+          role_group_id: 1,
+          quota_gb: 200,
+          used_gb: 0,
+          max_rules: 10,
+          speed_mbps: 100,
+        })
+
+        function onUserPlanSelectChange() {
+          const p = plans.value.find(item => item.id === Number(userForm.value.plan_id))
+          if (p) {
+            userForm.value.role_group_id = p.role_group_id || 1
+            userForm.value.quota_gb = Math.round(p.quota_bytes / GB)
+            userForm.value.max_rules = p.max_rules
+            userForm.value.speed_mbps = p.speed_mbps
+          }
+        }
+
+        function openCreateUserModal() {
+          if (!isAdmin.value) return
+          const defaultPlan = plans.value[0]
+          userForm.value = {
+            isCreate: true,
+            id: 0,
+            email: '',
+            password: '',
+            role: 'user',
+            plan_id: defaultPlan ? defaultPlan.id : 0,
+            role_group_id: defaultPlan ? defaultPlan.role_group_id : (rolesList.value[0]?.id || 1),
+            quota_gb: defaultPlan ? Math.round(defaultPlan.quota_bytes / GB) : 100,
+            used_gb: 0,
+            max_rules: defaultPlan ? defaultPlan.max_rules : 10,
+            speed_mbps: defaultPlan ? defaultPlan.speed_mbps : 100,
+          }
+          showUserModal.value = true
+        }
+
+        function openEditUserModal(u) {
+          if (!isAdmin.value) return
+          userForm.value = {
+            isCreate: false,
+            id: u.id,
+            email: u.email,
+            password: '',
+            role: u.role,
+            plan_id: u.plan_id || 0,
+            role_group_id: u.role_group_id || (rolesList.value[0]?.id || 1),
+            quota_gb: Math.round(u.quota_bytes / GB),
+            used_gb: Number(((u.used_bytes || 0) / GB).toFixed(1)),
+            max_rules: u.max_rules,
+            speed_mbps: u.speed_mbps,
+          }
+          showUserModal.value = true
+        }
+
+        function submitUserEdit() {
+          if (!isAdmin.value) {
+            showToast('权限不足')
+            return
+          }
+          const newQuota = Math.max(0, Number(userForm.value.quota_gb) || 0) * GB
+          const newUsed = Math.max(0, Number(userForm.value.used_gb) || 0) * GB
+          const rg = getRoleById(userForm.value.role_group_id) || rolesList.value[0]
+          const allowedStr = userForm.value.role === 'admin'
+            ? '*'
+            : (rg ? rg.allowed_tunnels : '')
+
+          if (userForm.value.isCreate) {
+            const email = (userForm.value.email || '').trim().toLowerCase()
+            const pwd = userForm.value.password || ''
+            if (!email || !pwd) {
+              showToast('请填写邮箱和密码')
+              return
+            }
+            if (usersList.value.some(u => u.email.toLowerCase() === email)) {
+              showToast('该邮箱已存在')
+              return
+            }
+            usersList.value.push({
+              id: usersList.value.length + 1,
+              email,
+              password: pwd,
+              role: userForm.value.role,
+              role_group_id: rg ? rg.id : 1,
+              plan_id: Number(userForm.value.plan_id) || 0,
+              status: 'active',
+              allowed_tunnels: allowedStr,
+              balance_cents: 0,
+              quota_bytes: newQuota,
+              used_bytes: newUsed,
+              max_rules: userForm.value.max_rules || 20,
+              speed_mbps: userForm.value.speed_mbps || 100,
+            })
+            showUserModal.value = false
+            showToast('用户已创建并完成角色与套餐绑定')
+            return
+          }
+
+          const idx = usersList.value.findIndex(u => u.id === userForm.value.id)
+          if (idx !== -1) {
+            const targetUser = usersList.value[idx]
+            targetUser.role = userForm.value.role
+            targetUser.role_group_id = rg ? rg.id : 1
+            targetUser.plan_id = Number(userForm.value.plan_id) || 0
+            targetUser.allowed_tunnels = allowedStr
+            if (userForm.value.password && userForm.value.password.trim()) {
+              targetUser.password = userForm.value.password.trim()
+            }
+            targetUser.quota_bytes = newQuota
+            targetUser.used_bytes = newUsed
+            targetUser.max_rules = userForm.value.max_rules || 20
+            targetUser.speed_mbps = userForm.value.speed_mbps || 100
+
+            // 若切换角色后不再具备某条隧道的权限，自动暂停该用户在未授权隧道下的转发规则
+            if (targetUser.role !== 'admin') {
+              rules.value.forEach(r => {
+                if (r.user_id === targetUser.id && !hasTunnelPermission(targetUser, r.tunnel_line_id)) {
+                  r.enabled = false
+                }
+              })
+            }
+          }
+          if (user.value.id === userForm.value.id) {
+            user.value.role = userForm.value.role
+            user.value.role_group_id = rg ? rg.id : 1
+            user.value.plan_id = Number(userForm.value.plan_id) || 0
+            user.value.allowed_tunnels = allowedStr
+            user.value.quota_bytes = newQuota
+            user.value.used_bytes = newUsed
+            user.value.max_rules = userForm.value.max_rules || 20
+            user.value.speed_mbps = userForm.value.speed_mbps || 100
+          }
+          showUserModal.value = false
+          showToast('用户套餐与角色已保存')
+        }
+
+        function resetUserTraffic(u) {
+          if (!isAdmin.value) return
+          u.used_bytes = 0
+          if (user.value.id === u.id) {
+            user.value.used_bytes = 0
+          }
+          showToast(`已重置 ${u.email} 的已用流量`)
+        }
+
+        function toggleUserBan(u) {
+          if (!isAdmin.value) return
+          u.status = u.status === 'active' ? 'banned' : 'active'
+          if (u.status === 'banned') {
+            rules.value.forEach(r => {
+              if (r.user_id === u.id) r.enabled = false
+            })
+          }
+          showToast(u.status === 'banned' ? `已封禁 ${u.email}` : `已解封 ${u.email}`)
+        }
+
+        function handleDeleteRule(id) {
+          const target = rules.value.find(r => r.id === id)
+          if (!target) return
+          if (!isAdmin.value && target.user_id !== user.value.id) {
+            showToast('无权删除他人规则')
+            return
+          }
+          rules.value = rules.value.filter(r => r.id !== id)
+        }
+
+        function submitLine() {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护隧道')
+            return
+          }
+          if (!lineForm.value.name) {
+            showToast('请填写隧道名称')
+            return
+          }
+          if (editingLineId.value) {
+            const idx = lines.value.findIndex(l => l.id === editingLineId.value)
+            if (idx !== -1) {
+              lines.value[idx] = {
+                ...lines.value[idx],
+                name: lineForm.value.name,
+                type: lineForm.value.type,
+                ingress_node_id: lineForm.value.ingress_node_id,
+                egress_node_id: lineForm.value.type === 'encrypt' ? lineForm.value.egress_node_id : 0,
+                transport: lineForm.value.type === 'encrypt' ? lineForm.value.transport : 'raw',
+                engine: lineForm.value.engine,
+                billing_mode: lineForm.value.billing_mode,
+                rate_multiplier: lineForm.value.rate_multiplier || 1.0,
+                max_port_count: lineForm.value.max_port_count || 50,
+              }
+              // 同步更新该隧道下所有转发规则的转发方式和入口节点
+              rules.value.forEach(r => {
+                if (r.tunnel_line_id === editingLineId.value) {
+                  r.engine = lineForm.value.engine
+                  r.ingress_node_id = lineForm.value.ingress_node_id
+                  r.mode = lineForm.value.type === 'encrypt' ? 'tunnel' : 'direct'
+                }
+              })
+            }
+            showLineModal.value = false
+            showToast('隧道已更新')
+          } else {
+            lines.value.push({
+              id: lines.value.length + 1,
+              name: lineForm.value.name,
+              type: lineForm.value.type,
+              ingress_node_id: lineForm.value.ingress_node_id,
+              egress_node_id: lineForm.value.type === 'encrypt' ? lineForm.value.egress_node_id : 0,
+              transport: lineForm.value.type === 'encrypt' ? lineForm.value.transport : 'raw',
+              engine: lineForm.value.engine,
+              billing_mode: lineForm.value.billing_mode,
+              rate_multiplier: lineForm.value.rate_multiplier || 1.0,
+              max_port_count: lineForm.value.max_port_count || 50,
+            })
+            showLineModal.value = false
+            showToast('隧道已创建')
+          }
+        }
+
+        function deleteLine(id) {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护隧道')
+            return
+          }
+          if (rules.value.some(r => r.tunnel_line_id === id)) {
+            showToast('该隧道下仍有转发规则，请先删除或迁移规则')
+            return
+          }
+          lines.value = lines.value.filter(l => l.id !== id)
+        }
+
+        function submitNode() {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护节点')
+            return
+          }
+          if (!nodeForm.value.name || !nodeForm.value.connect_ip) {
+            showToast('请填写名称和连接地址')
+            return
+          }
+          const connIP = nodeForm.value.connect_ip.trim()
+          const srvIP = (nodeForm.value.server_ip || connIP).trim()
+          const quotaBytes = Math.max(0, Number(nodeForm.value.quota_gb) || 0) * GB
+          const usedBytes = Math.max(0, Number(nodeForm.value.used_gb) || 0) * GB
+
+          if (editingNodeId.value) {
+            const idx = nodes.value.findIndex(n => n.id === editingNodeId.value)
+            if (idx !== -1) {
+              Object.assign(nodes.value[idx], {
+                name: nodeForm.value.name,
+                connect_ip: connIP,
+                server_ip: srvIP,
+                public_host: connIP,
+                port_range: nodeForm.value.port_range || '10000-50000',
+                traffic_rate: nodeForm.value.traffic_rate || 1.0,
+                quota_bytes: quotaBytes,
+                used_bytes: usedBytes,
+              })
+              if (quotaBytes > 0 && usedBytes >= quotaBytes) {
+                rules.value.forEach(r => {
+                  if (r.ingress_node_id === editingNodeId.value) r.enabled = false
+                })
+              }
+            }
+            showNodeModal.value = false
+            showToast('节点配置已保存')
+          } else {
+            nodes.value.push({
+              id: nodes.value.length + 1,
+              name: nodeForm.value.name,
+              connect_ip: connIP,
+              server_ip: srvIP,
+              public_host: connIP,
+              port_range: nodeForm.value.port_range || '10000-50000',
+              traffic_rate: nodeForm.value.traffic_rate || 1.0,
+              quota_bytes: quotaBytes,
+              used_bytes: usedBytes,
+              supported_engines: 'native,gost,realm,nftables',
+              status: 'online',
+              cpu_cores: 4,
+              cpu_usage: 6.5,
+              load_1: 0.18,
+              load_5: 0.15,
+              load_15: 0.12,
+              mem_used_bytes: Math.round(1.4 * GB),
+              mem_total_bytes: 8 * GB,
+              mem_usage: 17.5,
+              disk_used_bytes: Math.round(12 * GB),
+              disk_total_bytes: 80 * GB,
+              disk_usage: 15.0,
+              speed_up_bps: 2.4 * 1024 * 1024,
+              speed_down_bps: 6.8 * 1024 * 1024,
+              active_conns: 18,
+              uptime_seconds: 3600,
+            })
+            showNodeModal.value = false
+            showToast('节点已添加')
+          }
+        }
+
+        function deleteNode(id) {
+          if (!isAdmin.value) {
+            showToast('权限不足：仅管理员可维护节点')
+            return
+          }
+          if (lines.value.some(l => l.ingress_node_id === id || l.egress_node_id === id)) {
+            showToast('该节点仍被隧道引用，请先删除或修改关联隧道')
+            return
+          }
+          nodes.value = nodes.value.filter(n => n.id !== id)
+        }
+
+        function openInstallCmd(node) {
+          if (!isAdmin.value) return
+          const tokenStr = `nx-hmac-sec-token-${node.id}`
+          const host = window.location.host || '109.71.253.151:8080'
+          const wsUrl = `ws://${host}/api/v1/agent/ws`
+          const scriptUrl = `http://${host}/deploy/install-agent.sh`
+          installMode.value = 'systemd'
+          installInfo.value = {
+            node_id: node.id,
+            node_name: node.name,
+            systemd_install: `curl -fsSL ${scriptUrl} | sudo bash -s -- --master "${wsUrl}" --id ${node.id} --token "${tokenStr}"`,
+            systemd_uninstall: `curl -fsSL ${scriptUrl} | sudo bash -s -- --uninstall`,
+            docker_install: `docker run -d --name nexus-agent --restart always --net=host --cap-add=NET_ADMIN ghcr.io/nexus-panel/agent:latest -master "${wsUrl}" -node-id ${node.id} -token "${tokenStr}" -report-interval 3s`,
+            docker_uninstall: `docker stop nexus-agent && docker rm -f nexus-agent`,
+          }
+          showInstallModal.value = true
+        }
+
+        function resyncNodeRules(node) {
+          if (!isAdmin.value) return
+          const count = rules.value.filter(r => {
+            const tun = getTunnelById(r.tunnel_line_id)
+            return r.enabled && (r.ingress_node_id === node.id || (tun && tun.egress_node_id === node.id))
+          }).length
+          showToast(`已重启并同步节点「${node.name}」上的 ${count} 条活跃转发规则`)
+        }
+
+        function resyncAllNodes() {
+          if (!isAdmin.value) return
+          showToast(`已向全部 ${nodes.value.length} 个在线节点下发全量规则重同步与重启指令`)
+        }
+
+        function handleRedeem() {
+          if (!redeemInput.value.trim()) return
+          user.value.quota_bytes += 200 * GB
+          showToast('兑换成功')
+        }
+
+        function handleBuyPlan(plan) {
+          if (user.value.balance_cents < plan.price_cents) {
+            showToast('余额不足')
+            return
+          }
+          user.value.balance_cents -= plan.price_cents
+          user.value.plan_id = plan.id
+          user.value.quota_bytes = plan.quota_bytes
+          user.value.max_rules = plan.max_rules
+          user.value.speed_mbps = plan.speed_mbps
+          const rg = getRoleById(plan.role_group_id)
+          if (plan.role_group_id) {
+            user.value.role_group_id = plan.role_group_id
+          }
+          if (user.value.role !== 'admin') {
+            user.value.allowed_tunnels = rg ? rg.allowed_tunnels : (plan.allowed_tunnels || '1')
+          }
+          const idx = usersList.value.findIndex(u => u.id === user.value.id)
+          if (idx !== -1) {
+            usersList.value[idx] = { ...usersList.value[idx], ...user.value }
+          }
+          showToast(`购买成功，已自动绑定「${roleNameById(plan.role_group_id)}」并解锁对应隧道`)
+        }
+
+        function isAnyModalOpen() {
+          return (
+            showRuleModal.value ||
+            showLineModal.value ||
+            showNodeModal.value ||
+            showInstallModal.value ||
+            showBatchModal.value ||
+            showRoleModal.value ||
+            showPlanModal.value ||
+            showUserModal.value
+          )
+        }
+
+        function runRealtimeTelemetryTick(manual = false) {
+          if (!manual) {
+            if (!autoRefresh.value || !token.value || document.hidden || isAnyModalOpen()) {
+              return
+            }
+          }
+
+          for (let i = 0; i < rules.value.length; i++) {
+            const r = rules.value[i]
+            if (!r.enabled) continue
+            const up = Math.floor(8 * 1024 * 1024 + Math.random() * 24 * 1024 * 1024)
+            const down = Math.floor(25 * 1024 * 1024 + Math.random() * 65 * 1024 * 1024)
+            const tun = getTunnelById(r.tunnel_line_id)
+            const mult = tun ? tun.rate_multiplier : 1.0
+            const base = tun && tun.billing_mode === 'one_way' ? Math.max(up, down) : (up + down)
+            const billed = Math.round(base * mult)
+            r.upload_bytes += up
+            r.down_bytes += down
+            r.billed_bytes += billed
+
+            const owner = usersList.value.find(u => u.id === r.user_id)
+            if (owner) {
+              owner.used_bytes += billed
+              if (user.value.id === owner.id) {
+                user.value.used_bytes = owner.used_bytes
+              }
+              if (owner.quota_bytes > 0 && owner.used_bytes >= owner.quota_bytes) {
+                r.enabled = false
+              }
+            }
+          }
+
+          for (let i = 0; i < nodes.value.length; i++) {
+            const n = nodes.value[i]
+            if (n.status !== 'online') continue
+            n.cpu_usage = Number(Math.max(3.2, Math.min(92.0, n.cpu_usage + (Math.random() * 4.4 - 2.2))).toFixed(1))
+            n.load_1 = Number(Math.max(0.08, Math.min(n.cpu_cores || 4, n.load_1 + (Math.random() * 0.12 - 0.06))).toFixed(2))
+            n.load_5 = Number(Math.max(0.08, (n.load_5 * 0.9 + n.load_1 * 0.1)).toFixed(2))
+            const memDelta = Math.floor((Math.random() * 40 - 20) * 1024 * 1024)
+            n.mem_used_bytes = Math.max(512 * 1024 * 1024, Math.min(n.mem_total_bytes - 256 * 1024 * 1024, n.mem_used_bytes + memDelta))
+            n.mem_usage = Number(((n.mem_used_bytes / n.mem_total_bytes) * 100).toFixed(1))
+            n.speed_up_bps = Math.floor((6 + Math.random() * 22) * 1024 * 1024)
+            n.speed_down_bps = Math.floor((18 + Math.random() * 42) * 1024 * 1024)
+            n.active_conns = Math.max(12, n.active_conns + Math.floor(Math.random() * 15 - 7))
+            n.used_bytes += (n.speed_up_bps + n.speed_down_bps) * 3
+            n.uptime_seconds += 3
+
+            if (n.quota_bytes > 0 && n.used_bytes >= n.quota_bytes) {
+              rules.value.forEach(r => {
+                if (r.ingress_node_id === n.id) r.enabled = false
+              })
+            }
+          }
+        }
+
+        let telemetryTimer = null
+        function handleVisibilityChange() {
+          if (!document.hidden && autoRefresh.value) {
+            runRealtimeTelemetryTick(false)
+          }
+        }
+
+        onMounted(() => {
+          telemetryTimer = setInterval(() => runRealtimeTelemetryTick(false), 3000)
+          document.addEventListener('visibilitychange', handleVisibilityChange)
+        })
+
+        onUnmounted(() => {
+          if (telemetryTimer) clearInterval(telemetryTimer)
+          document.removeEventListener('visibilitychange', handleVisibilityChange)
+        })
+
+        function getTunnelById(id) {
+          return lines.value.find(l => l.id === id)
+        }
+
+        function nodeNameById(id) {
+          return nodes.value.find(n => n.id === id)?.name || `#${id}`
+        }
+
+        function nodeConnectIPById(id) {
+          const n = nodes.value.find(n => n.id === id)
+          return n ? (n.connect_ip || n.public_host || n.server_ip) : '127.0.0.1'
+        }
+
+        function userEmailById(id) {
+          return usersList.value.find(u => u.id === id)?.email || `#${id}`
+        }
+
+        return {
+          isDark,
+          toggleTheme,
+          autoRefresh,
+          toggleAutoRefresh,
+          siteConfig,
+          settingsForm,
+          saveSystemSettings,
+          token,
+          isRegisterMode,
+          emailInput,
+          passwordInput,
+          activeTab,
+          switchTab,
+          currentTabTitle,
+          user,
+          isAdmin,
+          rolesList,
+          usersList,
+          nodes,
+          lines,
+          authorizedLines,
+          rules,
+          visibleRules,
+          plans,
+          toastMsg,
+          copyConnectAddr,
+          quickLoginAs,
+          switchAccountQuick,
+          parseTunnelIds,
+          getRoleById,
+          roleNameById,
+          planNameById,
+          hasTunnelPermission,
+          showRoleModal,
+          editingRoleId,
+          roleForm,
+          openCreateRoleModal,
+          openEditRoleModal,
+          submitRoleGroup,
+          deleteRoleGroup,
+          showPlanModal,
+          editingPlanId,
+          planForm,
+          openCreatePlanModal,
+          openEditPlanModal,
+          submitPlan,
+          deletePlan,
+          showRuleModal,
+          editingRuleId,
+          ruleForm,
+          openCreateRuleModal,
+          openEditRuleModal,
+          quickCreateRuleForTunnel,
+          showBatchModal,
+          batchForm,
+          openBatchModal,
+          submitBatchRules,
+          exportRulesToClipboard,
+          showUserModal,
+          userForm,
+          onUserPlanSelectChange,
+          openCreateUserModal,
+          openEditUserModal,
+          submitUserEdit,
+          resetUserTraffic,
+          toggleUserBan,
+          probeResults,
+          probingRuleId,
+          showNodeModal,
+          editingNodeId,
+          nodeForm,
+          openCreateNodeModal,
+          openEditNodeModal,
+          deleteNode,
+          showInstallModal,
+          installInfo,
+          installMode,
+          resyncNodeRules,
+          resyncAllNodes,
+          showLineModal,
+          editingLineId,
+          lineForm,
+          openCreateLineModal,
+          openEditLineModal,
+          redeemInput,
+          quotaPercent,
+          nodeTrafficPercent,
+          formatUptime,
+          formatBytes,
+          handleAuth,
+          logout,
+          submitRule,
+          handleToggleRule,
+          handleProbeRule,
+          handleDeleteRule,
+          deleteLine,
+          submitNode,
+          openInstallCmd,
+          submitLine,
+          handleRedeem,
+          handleBuyPlan,
+          getTunnelById,
+          nodeNameById,
+          nodeConnectIPById,
+          userEmailById,
+          parseTargets,
+        }
+      },
+    }).mount('#app')
+  </script>
+</body>
+</html>
