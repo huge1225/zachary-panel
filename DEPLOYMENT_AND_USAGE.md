@@ -1,6 +1,6 @@
-# Nexus Panel 分布式多引擎流量转发面板 —— 部署与使用完整手册
+# Zachary Panel 分布式多引擎流量转发面板 —— 部署与使用完整手册
 
-本文档涵盖 **Nexus Panel** 从 **主控端（Master）部署** $\rightarrow$ **节点端（Agent）对接** $\rightarrow$ **创建端口/加密隧道** $\rightarrow$ **角色 / 套餐 / 用户权限配置（类 Xboard 模式）** $\rightarrow$ **日常转发规则管理与运维排障** 的全流程操作指南。
+本文档涵盖 **Zachary Panel** 从 **主控端（Master）部署** $\rightarrow$ **节点端（Agent）对接** $\rightarrow$ **创建端口/加密隧道** $\rightarrow$ **角色 / 套餐 / 用户权限配置** $\rightarrow$ **日常转发规则管理与运维排障** 的全流程操作指南。
 
 ---
 
@@ -54,10 +54,10 @@ flowchart TB
 
 ### 2.2 方式一：Docker Compose 一键部署（生产推荐）
 
-在服务器任意目录（如 `/opt/nexus-panel`）拉取代码并启动：
+在服务器任意目录（如 `/opt/zachary-panel`）拉取代码并启动：
 
 ```bash
-cd /opt/nexus-panel/deploy
+cd /opt/zachary-panel/deploy
 docker compose up -d --build
 ```
 
@@ -95,11 +95,11 @@ services:
 
 ```bash
 # 1. 编译前端静态资源 (可选，若使用独立托管)
-cd /opt/nexus-panel/web
+cd /opt/zachary-panel/web
 npm install && npm run build
 
 # 2. 编译主控端与节点端二进制
-cd /opt/nexus-panel
+cd /opt/zachary-panel
 CGO_ENABLED=1 go build -o bin/nexus-master ./cmd/master
 CGO_ENABLED=0 go build -o bin/nexus-agent ./cmd/agent
 
@@ -205,7 +205,7 @@ server {
     -e NEXUS_MASTER_URL="ws://<主控IP或域名>:8080/api/v1/agent/ws" \
     -e NEXUS_NODE_ID=1 \
     -e NEXUS_NODE_TOKEN="<面板生成的节点专属Token>" \
-    ghcr.io/nexus-panel/agent:latest
+    ghcr.io/huge1225/zachary-panel-agent:latest
   ```
 - **一键卸载命令**：
   ```bash
@@ -229,7 +229,7 @@ server {
 ## 四、 创建隧道指南（端口转发 vs 隧道转发）
 
 > [!IMPORTANT]
-> **核心原则**：在 Nexus Panel 中，**转发方式（`realm` / `gost` / `nftables` / `native`）与出入节点拓扑在「创建隧道」时即已固化**。用户在创建转发规则时只需选择已授权的隧道，无需也无权篡改底层转发方式。
+> **核心原则**：在 Zachary Panel 中，**转发方式（`realm` / `gost` / `nftables` / `native`）与出入节点拓扑在「创建隧道」时即已固化**。用户在创建转发规则时只需选择已授权的隧道，无需也无权篡改底层转发方式。
 
 点击左侧菜单 **「基础设施」 $\rightarrow$ 「隧道管理」 $\rightarrow$ 「+ 新增隧道」**：
 
@@ -258,9 +258,9 @@ server {
 
 ---
 
-## 五、 角色 / 套餐 / 用户权限配置全流程（类 Xboard 模式）
+## 五、 角色 / 套餐 / 用户权限配置全流程
 
-Nexus Panel 采用与 **Xboard / V2Board** 一致的 **「角色决定可用隧道 $\rightarrow$ 套餐绑定角色 $\rightarrow$ 用户分配套餐与角色」** 三级权限架构，彻底杜绝普通用户越权使用未授权的高级专线。
+Zachary Panel 采用 **「角色决定可用隧道 $\rightarrow$ 套餐绑定角色 $\rightarrow$ 用户分配套餐与角色」** 三级权限架构，彻底杜绝普通用户越权使用未授权的高级专线。
 
 ```mermaid
 sequenceDiagram
@@ -315,7 +315,7 @@ sequenceDiagram
 
 ### 5.4 第四步：配置「系统设置」（全局品牌与新用户默认角色）
 进入左侧菜单 **「权限与系统」 $\rightarrow$ 「系统设置」**：
-- **面板名称 & Logo 标识**：自定义左上角与登录页展示的品牌名称（如 `Nexus Panel`）及 2~4 字符渐变徽标（如 `NX`）。
+- **面板名称 & Logo 标识**：自定义左上角与登录页展示的品牌名称（如 `Zachary Panel`）及 2~4 字符渐变徽标（如 `ZP`）。
 - **系统公告**：填写后会醒目展示在所有用户的「概览」页顶部；留空则自动隐藏。
 - **开放注册 & 新注册用户默认角色**：控制是否允许外部用户自助注册，并指定新注册用户默认分配的角色（如 `标准角色`）及初始赠送流量/规则数/限速。
 
