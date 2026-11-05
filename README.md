@@ -73,15 +73,45 @@
 
 ## 快速启动指南
 
-### 方式一：Docker Compose 一键部署（推荐）
+### 方式一：交互式一键部署向导（推荐，自动引导填写配置）
+克隆仓库后直接运行 `./install.sh`（或通过 `curl` 远程一键拉起），脚本会按 **`[进度 1/6]` $\rightarrow$ `[进度 6/6]`** 引导选择部署模式（`docker` 容器 / `systemd` 服务 / `local` 本地免 root）、监听端口、数据库类型、管理员邮箱与密码（直接回车可自动生成 16 位高强度随机密码），并自动完成编译/构建、启动与健康检查：
+
 ```bash
+# 远程一键拉取并启动交互式部署向导
+curl -fsSL https://raw.githubusercontent.com/huge1225/zachary-panel/main/deploy/install-panel.sh | sudo bash
+
+# 或在已克隆的代码目录中运行交互式向导
 git clone https://github.com/huge1225/zachary-panel.git
+cd zachary-panel
+./install.sh
+```
+
+也支持**非交互式一条命令直接部署**（适合自动化脚本）：
+```bash
+# Docker Compose 模式一键静默部署
+./install.sh -y --mode docker --port 8080 --bind 127.0.0.1 --public-url https://panel.example.com --admin-email admin@example.com
+
+# 本地免 root 模式一键静默部署
+./install.sh -y --mode local --port 8080 --bind 127.0.0.1 --admin-email admin@example.com
+```
+
+日常一键运维命令：
+```bash
+./install.sh --status     # 查看运行状态
+./install.sh --logs       # 查看实时日志
+./install.sh --restart    # 重启面板服务
+./install.sh --upgrade    # 拉取最新代码并重新构建升级
+./install.sh --uninstall  # 停止并卸载服务
+```
+
+### 方式二：手动 Docker Compose 启动
+```bash
 cd zachary-panel/deploy
-# 先编辑 docker-compose.yml：设置 NEXUS_PUBLIC_URL、NEXUS_ADMIN_EMAIL、NEXUS_ADMIN_PASSWORD
+cp .env.example .env   # 按需修改 .env 中的 NEXUS_PUBLIC_URL、NEXUS_ADMIN_EMAIL 等
 docker compose up -d --build
 ```
 
-### 方式二：源码启动
+### 方式三：手动源码编译启动
 
 #### 1. 启动主控后端 (Master)
 默认使用开箱即用的 SQLite (`nexus_panel.db`)，首次启动会自动初始化默认角色、套餐与管理员账号：
@@ -101,16 +131,9 @@ go run ./cmd/agent -master "ws://127.0.0.1:8080/api/v1/agent/ws" -id 1 -token "<
 ```
 > 本机回环地址可直接使用 `ws://`；连接远程主控时必须使用 `wss://`（或显式加 `-allow-insecure-ws`，不推荐）。
 
-#### 3. 启动前端控制台 (Web UI)
-```bash
-cd web
-npm install
-npm run dev
-```
-
 ---
 
 ## 详细文档
 
-关于 **HTTPS 反向代理、节点 Systemd/Docker 对接、双端加密隧道创建、角色权限组/套餐/用户分配及安全防护规范**，请直接阅读：
+关于 **交互式一键部署向导、HTTPS 反向代理、节点 Systemd/Docker 对接、双端加密隧道创建、角色权限组/套餐/用户分配及安全防护规范**，请直接阅读：
 👉 **[DEPLOYMENT_AND_USAGE.md](./DEPLOYMENT_AND_USAGE.md)**

@@ -15,11 +15,15 @@ web/node_modules/
 *.db-shm
 *.db-wal
 deploy/data/
+data/
 *.log
+*.pid
 
 # Local Env & IDE
 .env
 .env.local
+deploy/.env
+.panel.env
 .vscode/
 .idea/
 .DS_Store

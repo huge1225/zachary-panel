@@ -31,7 +31,10 @@ COPY --from=go-builder /out/nexus-agent-linux-arm64 /app/static/releases/nexus-a
 COPY --from=web-builder /build/web/dist /app/web/dist
 COPY deploy/install-agent.sh /app/static/install-agent.sh
 
-ENV NEXUS_STATIC_DIR=/app/static \
+ENV NEXUS_LISTEN=:8080 \
+    NEXUS_DB_DRIVER=sqlite \
+    NEXUS_DB_DSN=/data/nexus_panel.db \
+    NEXUS_STATIC_DIR=/app/static \
     NEXUS_WEB_DIR=/app/web/dist \
     NEXUS_DATA_DIR=/data
 
@@ -42,4 +45,3 @@ VOLUME ["/data"]
 EXPOSE 8080
 
 ENTRYPOINT ["/app/nexus-master"]
-CMD ["-listen", ":8080", "-db-dsn", "/data/nexus_panel.db"]

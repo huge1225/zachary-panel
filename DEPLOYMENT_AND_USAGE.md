@@ -52,20 +52,79 @@ flowchart TB
 
 ---
 
-### 2.2 方式一：Docker Compose 一键部署（生产推荐）
+### 2.2 方式一：交互式分步一键部署向导（最简推荐）
 
-在服务器任意目录（如 `/opt/zachary-panel`）拉取代码并启动：
+无需手动编辑任何配置文件或记忆繁琐编译命令，直接运行项目根目录的 [`./install.sh`](./install.sh)（底层调用 [`deploy/install-panel.sh`](./deploy/install-panel.sh)），即可在终端按 **`[进度 1/6]` $\rightarrow$ `[进度 6/6]`** 逐步填写选项完成部署：
+
+```bash
+# 方式 A：远程服务器一行命令拉取源码并启动交互式向导（默认克隆至 /opt/zachary-panel）
+curl -fsSL https://raw.githubusercontent.com/huge1225/zachary-panel/main/deploy/install-panel.sh | sudo bash
+
+# 方式 B：在已克隆的仓库目录中直接运行
+git clone https://github.com/huge1225/zachary-panel.git
+cd zachary-panel
+./install.sh
+```
+
+#### 交互式向导 6 步进度流程（每一步均可直接按回车使用默认值）：
+1. **`[进度 1/6]` 选择部署模式**：
+   - `1) docker`：Docker Compose 容器化一键部署（自动生成 `deploy/.env` 权限 `0600` 并构建启动容器，**生产推荐**）。
+   - `2) systemd`：Systemd 系统服务裸机部署（自动编译前端、主控及 `amd64`/`arm64` 双架构被控端安装包，创建独立系统用户与 `/etc/systemd/system/zachary-panel.service` 加固服务）。
+   - `3) local`：免 root 本地快速部署（自动编译并后台运行，日志输出至 `panel.log`，适合快速体验与开发测试）。
+2. **`[进度 2/6]` 配置网络监听与访问地址**：
+   - 设置 HTTP 监听端口（默认 `8080`）、监听范围（`127.0.0.1` 仅本机配合反代，或 `0.0.0.0` 允许公网 IP+端口直连）以及对外访问地址 `NEXUS_PUBLIC_URL`（如 `https://panel.example.com`，留空自动推断）。
+3. **`[进度 3/6]` 配置数据库存储**：
+   - 支持一键选择 `1) sqlite`（默认零配置）、`2) postgres` 或 `3) mysql`（选择 PostgreSQL / MySQL 时会逐步引导填写主机、端口、用户名、密码与数据库名并自动拼装连接串）。
+4. **`[进度 4/6]` 配置初始管理员账号**：
+   - 输入管理员邮箱（默认 `admin@example.com`）与初始密码（支持自定义输入 8–72 位密码，或**直接回车自动生成 16 位高强度随机密码**，并在部署结束时高亮显示）。
+5. **`[进度 5/6]` 配置安全与高级选项**：
+   - 设置受信任反向代理网段、是否允许转发内网目标地址、是否生成演示数据。
+6. **`[进度 6/6]` 配置汇总确认与自动部署**：
+   - 汇总核对所有参数后输入 `Y`，脚本会自动完成构建、配置落盘（权限严格锁定 `0600`）、启动服务与 HTTP 健康检查，并输出管理员初始登录凭证。
+
+#### 非交互式命令行一键部署（适合自动化运维）
+您也可以直接通过命令行参数一次性传入配置并加上 `-y`（或 `--non-interactive`）静默完成部署：
+```bash
+# 示例 1：Docker 模式全自动一键部署（未指定密码时自动生成16位随机强密码并打印）
+./install.sh -y --mode docker --port 8080 --bind 127.0.0.1 \
+  --public-url https://panel.example.com --admin-email admin@example.com
+
+# 示例 2：Systemd 裸机服务模式全自动一键部署
+sudo ./install.sh -y --mode systemd --port 8080 --bind 127.0.0.1 \
+  --public-url https://panel.example.com --admin-email admin@example.com
+
+# 示例 3：本地免 root 模式快速启动
+./install.sh -y --mode local --port 8080 --bind 127.0.0.1 --admin-email admin@example.com
+```
+
+#### 统一生命周期管理命令（自动识别当前部署模式）
+```bash
+./install.sh --status      # 查看面板运行状态
+./install.sh --logs        # 查看面板实时运行日志
+./install.sh --restart     # 重启面板服务
+./install.sh --stop        # 停止面板服务
+./install.sh --upgrade     # git pull 拉取最新代码并重新编译/构建重启
+./install.sh --uninstall   # 停止并卸载面板服务（自动保留数据库文件防止误删）
+```
+
+---
+
+### 2.3 方式二：手动 Docker Compose 或源码编译部署
+
+#### A. 手动 Docker Compose 部署
+如果您习惯手动维护配置文件，可在 `/opt/zachary-panel/deploy` 下复制 `.env.example` 为 `.env` 后直接启动：
 
 ```bash
 cd /opt/zachary-panel/deploy
+cp .env.example .env
+chmod 0600 .env
+# 按需编辑 .env 中的 NEXUS_PUBLIC_URL、NEXUS_ADMIN_EMAIL、NEXUS_ADMIN_PASSWORD 等变量
 docker compose up -d --build
 ```
 
-默认 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 配置如下（**启动前请修改 `NEXUS_PUBLIC_URL`、`NEXUS_ADMIN_EMAIL` 并设置 `NEXUS_ADMIN_PASSWORD`**）：
+默认 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 已支持通过 `.env` 环境变量自动注入全部参数（无需手动改动 YAML 文件）：
 
 ```yaml
-version: "3.9"
-
 services:
   nexus-master:
     build:
@@ -74,40 +133,31 @@ services:
     container_name: nexus-master
     restart: always
     ports:
-      # 建议只监听本机，由 Nginx/Caddy 等反向代理提供 HTTPS 后对外暴露
-      - "127.0.0.1:8080:8080"
+      - "${NEXUS_BIND_HOST:-127.0.0.1}:${NEXUS_PORT:-8080}:8080"
     environment:
       - NEXUS_LISTEN=:8080
-      - NEXUS_DB_DRIVER=sqlite
-      - NEXUS_DB_DSN=/data/nexus_panel.db
-      # 面板对外访问地址（必须是 https，用于生成 Agent 安装命令与 wss 控制通道）
-      - NEXUS_PUBLIC_URL=https://panel.example.com
-      # 反向代理地址（逗号分隔 IP/CIDR）。只有来自这些地址的 X-Forwarded-For 才会被信任
-      - NEXUS_TRUSTED_PROXIES=172.16.0.0/12
-      # 首次启动创建的管理员账号；不设置密码时会随机生成并仅在日志中打印一次
-      - NEXUS_ADMIN_EMAIL=admin@example.com
-      # - NEXUS_ADMIN_PASSWORD=请替换为至少8位的强密码
-      # JWT 签名密钥（≥32 字符）。不设置时自动生成并持久化到 /data/jwt_secret.key
-      # - NEXUS_JWT_SECRET=
+      - NEXUS_DB_DRIVER=${NEXUS_DB_DRIVER:-sqlite}
+      - NEXUS_DB_DSN=${NEXUS_DB_DSN:-/data/nexus_panel.db}
+      - NEXUS_PUBLIC_URL=${NEXUS_PUBLIC_URL:-}
+      - NEXUS_TRUSTED_PROXIES=${NEXUS_TRUSTED_PROXIES:-172.16.0.0/12,127.0.0.1/32}
+      - NEXUS_ADMIN_EMAIL=${NEXUS_ADMIN_EMAIL:-admin@nexus.local}
+      - NEXUS_ADMIN_PASSWORD=${NEXUS_ADMIN_PASSWORD:-}
+      - NEXUS_JWT_SECRET=${NEXUS_JWT_SECRET:-}
+      - NEXUS_ALLOW_PRIVATE_TARGETS=${NEXUS_ALLOW_PRIVATE_TARGETS:-false}
+      - NEXUS_SEED_DEMO=${NEXUS_SEED_DEMO:-false}
     volumes:
-      # 命名卷（容器以非 root 用户 10001 运行，命名卷会自动设置正确属主）
       - zachary-data:/data
 
 volumes:
   zachary-data:
 ```
 
-> [!IMPORTANT]
-> 端口默认只绑定 `127.0.0.1:8080`，请通过 Nginx/Caddy 提供 HTTPS 后对外暴露（见 2.4 节）。若未设置 `NEXUS_ADMIN_PASSWORD`，首次启动会随机生成管理员密码并**仅在日志中打印一次**：`docker logs nexus-master 2>&1 | grep -i administrator`。主控容器以非 root 用户（UID 10001）运行，数据保存在命名卷 `zachary-data` 中。
-
 > [!TIP]
-> **切换 PostgreSQL 或 MySQL 数据库**：
+> **切换 PostgreSQL 或 MySQL 数据库**（也可直接在 `./install.sh` 交互式向导第 3 步中选择并按提示填写）：
 > - **PostgreSQL**：设置 `NEXUS_DB_DRIVER=postgres`，`NEXUS_DB_DSN="host=127.0.0.1 user=nexus password=xxx dbname=nexus port=5432 sslmode=disable"`
 > - **MySQL**：设置 `NEXUS_DB_DRIVER=mysql`，`NEXUS_DB_DSN="nexus:password@tcp(127.0.0.1:3306)/nexus?charset=utf8mb4&parseTime=True&loc=Local"`
 
----
-
-### 2.3 方式二：源码编译与 Systemd 裸机部署
+#### B. 手动源码编译与裸机运行
 
 ```bash
 # 1. 编译前端静态资源 (可选，若使用独立托管)
