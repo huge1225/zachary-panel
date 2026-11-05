@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -90,7 +92,7 @@ func (s *Server) SetupRouter() *gin.Engine {
 			AllowOrigins:     list,
 			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-			ExposeHeaders:    []string{"Content-Length"},
+			ExposeHeaders:    []string{"Content-Length", "Subscription-Userinfo", "Profile-Update-Interval", "X-Renewed-Token"},
 			AllowCredentials: false,
 			MaxAge:           12 * time.Hour,
 		}))
@@ -117,6 +119,7 @@ func (s *Server) SetupRouter() *gin.Engine {
 		v1.GET("/site-config", s.handleGetSiteConfig)
 		v1.POST("/auth/login", s.handleLogin)
 		v1.POST("/auth/register", s.handleRegister)
+		v1.GET("/sub/:token", subRateLimit(), s.handleGetSubscription)
 
 		// Authenticated user endpoints
 		auth := v1.Group("")
@@ -124,6 +127,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 		{
 			auth.GET("/user/profile", s.handleProfile)
 			auth.POST("/user/password", userRateLimit(), s.handleChangePassword)
+			auth.POST("/user/reset-sub-token", userRateLimit(), s.handleUserResetSubToken)
+			auth.POST("/user/reset-subscription", userRateLimit(), s.handleUserResetSubscription)
 			auth.GET("/dashboard", s.handleDashboard)
 			auth.GET("/telemetry", s.handleTelemetry)
 
@@ -177,6 +182,9 @@ func (s *Server) SetupRouter() *gin.Engine {
 				admin.PUT("/users/:id", s.handleAdminUpdateUser)
 				admin.DELETE("/users/:id", s.handleAdminDeleteUser)
 				admin.POST("/users/:id/reset-traffic", s.handleAdminResetUserTraffic)
+				admin.POST("/users/:id/reset-subscription", s.handleAdminResetUserSubscription)
+				admin.POST("/users/:id/reset-password", s.handleAdminResetUserPassword)
+				admin.POST("/users/:id/reset-sub-token", s.handleAdminResetUserSubToken)
 				admin.POST("/redeem/generate", s.handleAdminGenerateRedeem)
 			}
 		}
@@ -379,15 +387,19 @@ func (s *Server) handleListNodes(c *gin.Context) {
 func (s *Server) handleTelemetry(c *gin.Context) {
 	uid := s.currentUserID(c)
 	var user struct {
-		ID             uint64 `json:"id"`
-		RoleGroupID    uint64 `json:"role_group_id"`
-		PlanID         uint64 `json:"plan_id"`
-		QuotaBytes     int64  `json:"quota_bytes"`
-		UsedBytes      int64  `json:"used_bytes"`
-		Status         string `json:"status"`
-		AllowedTunnels string `json:"allowed_tunnels"`
+		ID             uint64    `json:"id"`
+		RoleGroupID    uint64    `json:"role_group_id"`
+		PlanID         uint64    `json:"plan_id"`
+		BalanceCents   int64     `json:"balance_cents"`
+		QuotaBytes     int64     `json:"quota_bytes"`
+		UsedBytes      int64     `json:"used_bytes"`
+		MaxRules       int       `json:"max_rules"`
+		SpeedMbps      int       `json:"speed_mbps"`
+		ExpireAt       time.Time `json:"expire_at"`
+		Status         string    `json:"status"`
+		AllowedTunnels string    `json:"allowed_tunnels"`
 	}
-	s.db.Model(&model.User{}).Select("id, role_group_id, plan_id, quota_bytes, used_bytes, status, allowed_tunnels").Where("id = ?", uid).Scan(&user)
+	s.db.Model(&model.User{}).Select("id, role_group_id, plan_id, balance_cents, quota_bytes, used_bytes, max_rules, speed_mbps, expire_at, status, allowed_tunnels").Where("id = ?", uid).Scan(&user)
 
 	nodes := make([]model.Node, 0)
 	if s.isAdmin(c) {
@@ -1265,6 +1277,11 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 	}
 
 	uid := s.currentUserID(c)
+	isAdminUser := s.isAdmin(c)
+	durationDays := plan.DurationDays
+	if durationDays <= 0 {
+		durationDays = 30
+	}
 	var updatedUser model.User
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{
@@ -1273,7 +1290,7 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 			"quota_bytes":   plan.QuotaBytes,
 			"max_rules":     plan.MaxRules,
 			"speed_mbps":    plan.SpeedMbps,
-			"expire_at":     time.Now().AddDate(0, 0, plan.DurationDays),
+			"expire_at":     time.Now().AddDate(0, 0, durationDays),
 		}
 		// 付费套餐购买时重置已用流量；免费套餐 (price=0) 可被反复"购买"，绝不能借此清零用量
 		if plan.PriceCents > 0 {
@@ -1282,7 +1299,7 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 		if plan.RoleGroupID > 0 {
 			updates["role_group_id"] = plan.RoleGroupID
 		}
-		if allowedTunnels != "" {
+		if allowedTunnels != "" && !isAdminUser {
 			updates["allowed_tunnels"] = allowedTunnels
 		}
 		// Atomic balance deduction to prevent concurrent double-spending
@@ -1307,7 +1324,210 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 	}
 
 	s.enforceUserTunnelPermissions(&updatedUser)
+	s.resumeUserQuotaExceededRules(&updatedUser)
 	c.JSON(http.StatusOK, gin.H{"message": "套餐购买并激活成功，已自动同步对应角色与隧道权限", "user": updatedUser})
+}
+
+// handleUserResetSubscription lets a user pay their bound plan's price to reset used traffic to 0 and refresh the
+// subscription cycle early when they run out of monthly traffic.
+func (s *Server) handleUserResetSubscription(c *gin.Context) {
+	uid := s.currentUserID(c)
+	var u model.User
+	if err := s.db.First(&u, uid).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	if u.PlanID == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "当前账号未绑定套餐，请先在套餐管理中选购套餐"})
+		return
+	}
+	var plan model.Plan
+	if err := s.db.First(&plan, u.PlanID).Error; err != nil || !plan.Active {
+		c.JSON(http.StatusNotFound, gin.H{"error": "当前绑定的套餐不存在或已下架，请选购其他可用套餐"})
+		return
+	}
+	if plan.PriceCents <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "免费套餐不支持自助重置流量周期，请联系管理员或升级付费套餐"})
+		return
+	}
+
+	allowedTunnels := strings.TrimSpace(plan.AllowedTunnels)
+	if plan.RoleGroupID > 0 {
+		var rg model.RoleGroup
+		if err := s.db.First(&rg, plan.RoleGroupID).Error; err == nil {
+			allowedTunnels = strings.TrimSpace(rg.AllowedTunnels)
+		}
+	}
+	durationDays := plan.DurationDays
+	if durationDays <= 0 {
+		durationDays = 30
+	}
+
+	var updatedUser model.User
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		updates := map[string]any{
+			"balance_cents": gorm.Expr("balance_cents - ?", plan.PriceCents),
+			"used_bytes":    0,
+			"quota_bytes":   plan.QuotaBytes,
+			"max_rules":     plan.MaxRules,
+			"speed_mbps":    plan.SpeedMbps,
+			"expire_at":     time.Now().AddDate(0, 0, durationDays),
+		}
+		if plan.RoleGroupID > 0 {
+			updates["role_group_id"] = plan.RoleGroupID
+		}
+		if allowedTunnels != "" && u.Role != "admin" {
+			updates["allowed_tunnels"] = allowedTunnels
+		}
+		res := tx.Model(&model.User{}).
+			Where("id = ? AND balance_cents >= ?", uid, plan.PriceCents).
+			Updates(updates)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("insufficient_balance")
+		}
+		return tx.First(&updatedUser, uid).Error
+	})
+	if err != nil {
+		if err.Error() == "insufficient_balance" {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": "账户余额不足，无法重置当前套餐周期，请先充值或使用兑换码"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "重置订阅周期失败，请稍后重试"})
+		return
+	}
+
+	s.enforceUserTunnelPermissions(&updatedUser)
+	s.resumeUserQuotaExceededRules(&updatedUser)
+	c.JSON(http.StatusOK, gin.H{"message": "订阅周期与当月流量已重置，因超额暂停的转发规则已自动恢复", "user": updatedUser})
+}
+
+// handleUserResetSubToken rotates the current user's subscription token so any leaked subscription URL is revoked.
+func (s *Server) handleUserResetSubToken(c *gin.Context) {
+	uid := s.currentUserID(c)
+	newToken := utils.GenerateRandomToken(16)
+	if err := s.db.Model(&model.User{}).Where("id = ?", uid).Update("sub_token", newToken).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "重置订阅链接失败，请稍后重试"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "订阅链接已重置，旧订阅链接已立即失效",
+		"sub_token": newToken,
+	})
+}
+
+func isValidHexToken(tok string) bool {
+	if len(tok) < 16 || len(tok) > 64 || len(tok)%2 != 0 {
+		return false
+	}
+	_, err := hex.DecodeString(tok)
+	return err == nil
+}
+
+// handleGetSubscription serves the user's subscription info and active forwarding endpoints via their SubToken.
+// Supports standard `Subscription-Userinfo` header, Base64 text (default), plain text (`?raw=1`), and JSON (`?format=json`).
+func (s *Server) handleGetSubscription(c *gin.Context) {
+	token := strings.TrimSpace(c.Param("token"))
+	if !isValidHexToken(token) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "订阅链接无效或已失效"})
+		return
+	}
+	var u model.User
+	if err := s.db.Where("sub_token = ?", token).First(&u).Error; err != nil || u.SubToken == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "订阅链接无效或已失效"})
+		return
+	}
+	if u.Status != "active" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "账号已被封禁"})
+		return
+	}
+
+	var expUnix int64
+	if !u.ExpireAt.IsZero() {
+		expUnix = u.ExpireAt.Unix()
+	}
+	c.Header("Subscription-Userinfo", fmt.Sprintf("upload=0; download=%d; total=%d; expire=%d", u.UsedBytes, u.QuotaBytes, expUnix))
+	c.Header("Profile-Update-Interval", "6")
+	c.Header("Cache-Control", "no-store")
+
+	canForward := u.CanForward(time.Now())
+	var rules []model.ForwardRule
+	if canForward {
+		s.db.Where("user_id = ? AND enabled = ?", u.ID, true).Order("id asc").Find(&rules)
+	}
+
+	var nodes []model.Node
+	s.db.Select("id, name, connect_ip, public_host, server_ip").Find(&nodes)
+	nodeHost := make(map[uint64]string, len(nodes))
+	for _, n := range nodes {
+		host := strings.TrimSpace(n.ConnectIP)
+		if host == "" {
+			host = strings.TrimSpace(n.PublicHost)
+		}
+		if host == "" {
+			host = strings.TrimSpace(n.ServerIP)
+		}
+		nodeHost[n.ID] = host
+	}
+
+	type subRuleItem struct {
+		ID       uint64 `json:"id"`
+		Name     string `json:"name"`
+		Protocol string `json:"protocol"`
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		Entry    string `json:"entry"`
+		Mode     string `json:"mode"`
+		Status   string `json:"status"`
+	}
+	items := make([]subRuleItem, 0, len(rules))
+	var lines []string
+	for _, r := range rules {
+		if !u.HasTunnelPermission(r.TunnelLineID) && r.TunnelLineID > 0 {
+			continue
+		}
+		host := nodeHost[r.IngressNodeID]
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		entry := net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(r.ListenPort))
+		items = append(items, subRuleItem{
+			ID:       r.ID,
+			Name:     r.Name,
+			Protocol: r.Protocol,
+			Host:     host,
+			Port:     r.ListenPort,
+			Entry:    entry,
+			Mode:     r.Mode,
+			Status:   r.Status,
+		})
+		lines = append(lines, fmt.Sprintf("%s://%s#%s", r.Protocol, entry, url.PathEscape(r.Name)))
+	}
+
+	if strings.EqualFold(c.Query("format"), "json") {
+		cfg := s.getSystemConfig()
+		c.JSON(http.StatusOK, gin.H{
+			"site_name":   cfg.SiteName,
+			"email":       u.Email,
+			"status":      u.Status,
+			"used_bytes":  u.UsedBytes,
+			"quota_bytes": u.QuotaBytes,
+			"expire_at":   u.ExpireAt,
+			"can_forward": canForward,
+			"rules":       items,
+		})
+		return
+	}
+
+	plain := strings.Join(lines, "\n")
+	if c.Query("raw") == "1" {
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(plain))
+		return
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte(plain))
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(encoded))
 }
 
 func (s *Server) handleRedeemCode(c *gin.Context) {
@@ -1400,6 +1620,8 @@ func (s *Server) handleRedeemCode(c *gin.Context) {
 		return
 	}
 
+	s.enforceUserTunnelPermissions(&updatedUser)
+	s.resumeUserQuotaExceededRules(&updatedUser)
 	c.JSON(http.StatusOK, gin.H{"message": "兑换成功", "user": updatedUser})
 }
 
@@ -2307,6 +2529,54 @@ func (s *Server) handleAdminListUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, users)
 }
 
+// parseFlexibleExpireTime parses RFC3339, datetime-local ("2006-01-02T15:04"), "2006-01-02 15:04:05",
+// or date-only ("2006-01-02", treated as 23:59:59 UTC of that day).
+func parseFlexibleExpireTime(raw string) (time.Time, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty expire time")
+	}
+	for _, layout := range []string{
+		time.RFC3339,
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02 15:04",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	if d, err := time.Parse("2006-01-02", s); err == nil {
+		return time.Date(d.Year(), d.Month(), d.Day(), 23, 59, 59, 0, time.UTC), nil
+	}
+	return time.Time{}, fmt.Errorf("invalid expire time format")
+}
+
+// resumeUserQuotaExceededRules automatically resumes any `quota_exceeded` rules of the user when the user's account
+// is active, not expired, under quota, and permitted on the rule's tunnel and port range.
+func (s *Server) resumeUserQuotaExceededRules(u *model.User) {
+	if !u.CanForward(time.Now()) {
+		return
+	}
+	var rules []model.ForwardRule
+	s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
+	for i := range rules {
+		if !u.HasTunnelPermission(rules[i].TunnelLineID) || s.resumeBlockedByPort(&rules[i]) {
+			continue
+		}
+		rules[i].Enabled = true
+		rules[i].Status = "running"
+		if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").
+			Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
+			continue
+		}
+		s.db.First(&rules[i], rules[i].ID) // dispatch the current row, not a pre-lock snapshot
+		s.orch.DispatchRule(&rules[i])
+	}
+}
+
 func (s *Server) handleAdminCreateUser(c *gin.Context) {
 	var req struct {
 		Email          string `json:"email" binding:"required"`
@@ -2318,6 +2588,7 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 		QuotaBytes     int64  `json:"quota_bytes"`
 		MaxRules       int    `json:"max_rules"`
 		SpeedMbps      int    `json:"speed_mbps"`
+		ExpireAt       string `json:"expire_at"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -2348,6 +2619,7 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 	maxRules := req.MaxRules
 	speed := req.SpeedMbps
 	allowedTunnels := strings.TrimSpace(req.AllowedTunnels)
+	expireAt := time.Now().AddDate(1, 0, 0)
 
 	// 若指定了套餐，优先继承套餐的角色与配额默认值
 	if req.PlanID > 0 {
@@ -2365,7 +2637,18 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 			if speed <= 0 {
 				speed = plan.SpeedMbps
 			}
+			if plan.DurationDays > 0 {
+				expireAt = time.Now().AddDate(0, 0, plan.DurationDays)
+			}
 		}
+	}
+	if strings.TrimSpace(req.ExpireAt) != "" {
+		parsed, err := parseFlexibleExpireTime(req.ExpireAt)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的到期时间格式"})
+			return
+		}
+		expireAt = parsed
 	}
 	if roleGroupID == 0 {
 		roleGroupID = 1
@@ -2403,7 +2686,7 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 		QuotaBytes:     quota,
 		MaxRules:       maxRules,
 		SpeedMbps:      speed,
-		ExpireAt:       time.Now().AddDate(1, 0, 0),
+		ExpireAt:       expireAt,
 	}
 	if err := s.db.Create(&u).Error; err != nil {
 		log.Printf("[API] admin create user failed: %v", err)
@@ -2448,6 +2731,7 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 		MaxRules       int     `json:"max_rules"`
 		SpeedMbps      int     `json:"speed_mbps"`
 		BalanceCents   *int64  `json:"balance_cents"`
+		ExpireAt       *string `json:"expire_at"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -2464,6 +2748,15 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 	if id == s.currentUserID(c) && ((req.Role != "" && req.Role != "admin") || req.Status == "banned") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能降级或封禁当前登录的管理员账号"})
 		return
+	}
+	var parsedExpireAt *time.Time
+	if req.ExpireAt != nil && strings.TrimSpace(*req.ExpireAt) != "" {
+		t, err := parseFlexibleExpireTime(*req.ExpireAt)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的到期时间格式"})
+			return
+		}
+		parsedExpireAt = &t
 	}
 	revokeTokens := false
 	if req.Role != "" && req.Role != u.Role {
@@ -2512,16 +2805,20 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 	if req.SpeedMbps > 0 {
 		u.SpeedMbps = req.SpeedMbps
 	}
-	// used_bytes / balance_cents / token_version / quota_bytes / expire_at / password_hash change concurrently
-	// (traffic reports, purchases, redeems, password changes): save the profile without them and only write them
-	// explicitly when the admin actually set them.
-	s.db.Omit("used_bytes", "balance_cents", "token_version", "quota_bytes", "expire_at", "password_hash").Save(&u)
+	// used_bytes / balance_cents / token_version / quota_bytes / expire_at / password_hash / sub_token change concurrently
+	// (traffic reports, purchases, redeems, password changes, sub token resets): save the profile without them and only
+	// write them explicitly when the admin actually set them.
+	s.db.Omit("used_bytes", "balance_cents", "token_version", "quota_bytes", "expire_at", "password_hash", "sub_token").Save(&u)
 	explicit := map[string]any{}
 	if req.Password != "" {
 		explicit["password_hash"] = u.PasswordHash
+		accountGuard.reset(normalizeEmail(u.Email))
 	}
 	if req.QuotaBytes > 0 {
 		explicit["quota_bytes"] = req.QuotaBytes
+	}
+	if parsedExpireAt != nil {
+		explicit["expire_at"] = *parsedExpireAt
 	}
 	if revokeTokens {
 		explicit["token_version"] = gorm.Expr("token_version + 1")
@@ -2536,6 +2833,11 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 		s.db.Model(&model.User{}).Where("id = ?", u.ID).Updates(explicit)
 	}
 	_ = s.db.First(&u, u.ID).Error
+	if revokeTokens && u.ID == s.currentUserID(c) {
+		if tok, err := GenerateToken(&u); err == nil {
+			c.Header("X-Renewed-Token", tok)
+		}
+	}
 
 	// 若通过修改角色或隧道权限收回了某条隧道的权限，自动暂停该用户在无权限隧道下的规则并从节点卸载
 	s.enforceUserTunnelPermissions(&u)
@@ -2543,20 +2845,7 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 	if !u.CanForward(time.Now()) {
 		s.orch.EnforceUserQuotaCutoff(u.ID)
 	} else {
-		var rules []model.ForwardRule
-		s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
-		for i := range rules {
-			if u.HasTunnelPermission(rules[i].TunnelLineID) && !s.resumeBlockedByPort(&rules[i]) {
-				rules[i].Enabled = true
-				rules[i].Status = "running"
-				if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").
-					Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
-					continue
-				}
-				s.db.First(&rules[i], rules[i].ID) // dispatch the current row, not a pre-lock snapshot
-				s.orch.DispatchRule(&rules[i])
-			}
-		}
+		s.resumeUserQuotaExceededRules(&u)
 	}
 	c.JSON(http.StatusOK, u)
 }
@@ -2572,26 +2861,159 @@ func (s *Server) handleAdminResetUserTraffic(c *gin.Context) {
 	s.db.Model(&model.User{}).Where("id = ?", u.ID).Update("used_bytes", 0)
 
 	// 自动恢复该用户因流量超额暂停的转发规则（封禁 / 已过期账号以及无隧道权限的规则不恢复）
-	if !u.CanForward(time.Now()) {
-		c.JSON(http.StatusOK, u)
+	s.resumeUserQuotaExceededRules(&u)
+	c.JSON(http.StatusOK, u)
+}
+
+// handleAdminResetUserSubscription resets a user's subscription cycle: clears used traffic, refreshes quota/limits
+// from their bound plan (if any), sets ExpireAt to now + duration_days (defaulting to the bound plan's duration or 30 days),
+// optionally rotates SubToken, and automatically resumes any quota_exceeded rules.
+func (s *Server) handleAdminResetUserSubscription(c *gin.Context) {
+	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	var u model.User
+	if err := s.db.First(&u, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
-	var rules []model.ForwardRule
-	s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
-	for i := range rules {
-		if !u.HasTunnelPermission(rules[i].TunnelLineID) || s.resumeBlockedByPort(&rules[i]) {
-			continue
+	var req struct {
+		DurationDays  int  `json:"duration_days"`
+		ResetSubToken bool `json:"reset_sub_token"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if req.DurationDays < 0 || req.DurationDays > 36500 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "有效天数需在 1-36500 之间"})
+		return
+	}
+
+	durationDays := req.DurationDays
+	updates := map[string]any{
+		"used_bytes": 0,
+	}
+	if u.PlanID > 0 {
+		var plan model.Plan
+		if err := s.db.First(&plan, u.PlanID).Error; err == nil {
+			if durationDays <= 0 {
+				durationDays = plan.DurationDays
+			}
+			if plan.QuotaBytes > 0 {
+				updates["quota_bytes"] = plan.QuotaBytes
+			}
+			if plan.MaxRules > 0 {
+				updates["max_rules"] = plan.MaxRules
+			}
+			if plan.SpeedMbps > 0 {
+				updates["speed_mbps"] = plan.SpeedMbps
+			}
+			if plan.RoleGroupID > 0 {
+				updates["role_group_id"] = plan.RoleGroupID
+				if u.Role != "admin" {
+					var rg model.RoleGroup
+					if err := s.db.First(&rg, plan.RoleGroupID).Error; err == nil {
+						updates["allowed_tunnels"] = strings.TrimSpace(rg.AllowedTunnels)
+					} else if strings.TrimSpace(plan.AllowedTunnels) != "" {
+						updates["allowed_tunnels"] = strings.TrimSpace(plan.AllowedTunnels)
+					}
+				}
+			} else if strings.TrimSpace(plan.AllowedTunnels) != "" && u.Role != "admin" {
+				updates["allowed_tunnels"] = strings.TrimSpace(plan.AllowedTunnels)
+			}
 		}
-		rules[i].Enabled = true
-		rules[i].Status = "running"
-		if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").
-			Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
-			continue
-		}
-		s.db.First(&rules[i], rules[i].ID) // dispatch the current row, not a pre-lock snapshot
-		s.orch.DispatchRule(&rules[i])
+	}
+	if durationDays <= 0 {
+		durationDays = 30
+	}
+	updates["expire_at"] = time.Now().AddDate(0, 0, durationDays)
+	if req.ResetSubToken || strings.TrimSpace(u.SubToken) == "" {
+		updates["sub_token"] = utils.GenerateRandomToken(16)
+	}
+
+	if err := s.db.Model(&model.User{}).Where("id = ?", u.ID).Updates(updates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "重置用户订阅失败"})
+		return
+	}
+	_ = s.db.First(&u, u.ID).Error
+
+	s.enforceUserTunnelPermissions(&u)
+	if !u.CanForward(time.Now()) {
+		s.orch.EnforceUserQuotaCutoff(u.ID)
+	} else {
+		s.resumeUserQuotaExceededRules(&u)
 	}
 	c.JSON(http.StatusOK, u)
+}
+
+// handleAdminResetUserPassword resets a user's password (either to a custom password or an auto-generated random one),
+// increments token_version to revoke all existing sessions of that user, and clears any login lockout state.
+func (s *Server) handleAdminResetUserPassword(c *gin.Context) {
+	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	var u model.User
+	if err := s.db.First(&u, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	newPassword := strings.TrimSpace(req.Password)
+	generated := false
+	if newPassword == "" {
+		newPassword = utils.GenerateRandomToken(8) // 16 hex chars
+		generated = true
+	}
+	if !validPassword(newPassword) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "密码长度需为 8-72 位"})
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码重置失败"})
+		return
+	}
+	if err := s.db.Model(&model.User{}).Where("id = ?", u.ID).Updates(map[string]any{
+		"password_hash": string(hash),
+		"token_version": gorm.Expr("token_version + 1"),
+	}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "密码重置失败"})
+		return
+	}
+	accountGuard.reset(normalizeEmail(u.Email))
+	_ = s.db.First(&u, u.ID).Error
+
+	resp := gin.H{
+		"message":   "密码已重置，该用户原有的登录会话已全部失效",
+		"password":  newPassword,
+		"generated": generated,
+		"user":      u,
+	}
+	// 若管理员重置的是自己当前登录账号的密码，顺带签发新 JWT 以免当前管理会话掉线
+	if u.ID == s.currentUserID(c) {
+		if tok, err := GenerateToken(&u); err == nil {
+			resp["token"] = tok
+		}
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// handleAdminResetUserSubToken rotates a user's subscription token on behalf of an administrator.
+func (s *Server) handleAdminResetUserSubToken(c *gin.Context) {
+	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	var u model.User
+	if err := s.db.First(&u, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	newToken := utils.GenerateRandomToken(16)
+	if err := s.db.Model(&model.User{}).Where("id = ?", u.ID).Update("sub_token", newToken).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "重置订阅链接失败"})
+		return
+	}
+	u.SubToken = newToken
+	c.JSON(http.StatusOK, gin.H{
+		"message":   "用户订阅链接已重置，旧订阅链接已立即失效",
+		"sub_token": newToken,
+		"user":      u,
+	})
 }
 
 func (s *Server) handleAdminGenerateRedeem(c *gin.Context) {

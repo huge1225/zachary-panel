@@ -61,9 +61,18 @@ type User struct {
 	MaxRules       int       `gorm:"default:20" json:"max_rules"`             // 最大规则数
 	SpeedMbps      int       `gorm:"default:100" json:"speed_mbps"`           // 峰值带宽限制 Mbps
 	ExpireAt       time.Time `json:"expire_at"`
-	TokenVersion   int       `gorm:"default:0" json:"-"` // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
+	SubToken       string    `gorm:"size:64;index" json:"sub_token"` // 订阅链接专属 Token (可随时重置使旧链接失效)
+	TokenVersion   int       `gorm:"default:0" json:"-"`             // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// BeforeCreate ensures every newly created user receives a unique random subscription token.
+func (u *User) BeforeCreate(tx *gorm.DB) error {
+	if strings.TrimSpace(u.SubToken) == "" {
+		u.SubToken = utils.GenerateRandomToken(16)
+	}
+	return nil
 }
 
 // CanForward reports whether the account may currently have active forwarding rules
@@ -290,9 +299,38 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 	ensureRulePortUniqueIndex(db, driver)
 	backfillRelayNodeIDs(db)
 	ensureRelayPortUniqueIndex(db, driver)
+	backfillUserSubTokens(db)
+	ensureUserSubTokenUniqueIndex(db, driver)
 
 	seedInitialData(db)
 	return db, nil
+}
+
+// backfillUserSubTokens populates SubToken for any existing user rows created before the column existed.
+func backfillUserSubTokens(db *gorm.DB) {
+	var users []User
+	db.Select("id").Where("sub_token = '' OR sub_token IS NULL").Find(&users)
+	for _, u := range users {
+		db.Model(&User{}).Where("id = ?", u.ID).Update("sub_token", utils.GenerateRandomToken(16))
+	}
+}
+
+// ensureUserSubTokenUniqueIndex guarantees non-empty user subscription tokens are unique across accounts.
+func ensureUserSubTokenUniqueIndex(db *gorm.DB, driver string) {
+	const name = "idx_users_sub_token"
+	if db.Migrator().HasIndex(&User{}, name) {
+		return
+	}
+	var stmt string
+	switch driver {
+	case "mysql":
+		stmt = "CREATE UNIQUE INDEX " + name + " ON users ((CASE WHEN sub_token <> '' THEN sub_token END))"
+	default: // sqlite, postgres
+		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON users (sub_token) WHERE sub_token <> ''"
+	}
+	if err := db.Exec(stmt).Error; err != nil {
+		log.Printf("[DB] WARNING: could not create unique index %s: %v", name, err)
+	}
 }
 
 // ensureRulePortUniqueIndex adds a database-level guarantee that two rules never get the same listen port on one

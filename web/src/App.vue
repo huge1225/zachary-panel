@@ -707,9 +707,33 @@ const userForm = ref({
   role_group_id: 1,
   quota_gb: 100,
   used_gb: 0,
+  balance_yuan: 0,
   max_rules: 20,
   speed_mbps: 100,
+  expire_at: '',
 })
+
+function formatDateInput(iso?: string): string {
+  if (!iso || iso.startsWith('0001-')) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  const yyyy = d.getFullYear()
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}`
+}
+
+function formatDateDisplay(iso?: string): string {
+  const s = formatDateInput(iso)
+  return s || '-'
+}
+
+function isUserExpired(u?: User | null): boolean {
+  if (!u || u.role === 'admin' || !u.expire_at || u.expire_at.startsWith('0001-')) return false
+  const d = new Date(u.expire_at)
+  if (Number.isNaN(d.getTime())) return false
+  return d.getTime() < Date.now()
+}
 
 function onUserPlanChange() {
   const p = plans.value.find((x) => x.id === Number(userForm.value.plan_id))
@@ -725,6 +749,7 @@ function openCreateUserModal() {
   if (!isAdmin.value) return
   editingUserId.value = null
   const defPlan = plans.value[0]
+  const nextMonth = new Date(Date.now() + (defPlan?.duration_days || 30) * 86400000)
   userForm.value = {
     id: 0,
     email: '',
@@ -734,8 +759,10 @@ function openCreateUserModal() {
     role_group_id: defPlan?.role_group_id || siteConfig.value.default_role_group_id || rolesList.value[0]?.id || 1,
     quota_gb: defPlan ? Math.round(defPlan.quota_bytes / GB) : siteConfig.value.default_quota_gb || 20,
     used_gb: 0,
+    balance_yuan: 0,
     max_rules: defPlan ? defPlan.max_rules : siteConfig.value.default_max_rules || 5,
     speed_mbps: defPlan ? defPlan.speed_mbps : siteConfig.value.default_speed_mbps || 100,
+    expire_at: formatDateInput(nextMonth.toISOString()),
   }
   showUserModal.value = true
 }
@@ -752,8 +779,10 @@ function openEditUserModal(u: User) {
     role_group_id: u.role_group_id || rolesList.value[0]?.id || 1,
     quota_gb: Math.round(u.quota_bytes / GB),
     used_gb: Number(((u.used_bytes || 0) / GB).toFixed(1)),
+    balance_yuan: Number(((u.balance_cents || 0) / 100).toFixed(2)),
     max_rules: u.max_rules,
     speed_mbps: u.speed_mbps,
+    expire_at: formatDateInput(u.expire_at),
   }
   showUserModal.value = true
 }
@@ -769,13 +798,15 @@ async function submitUserEdit() {
         plan_id: Number(userForm.value.plan_id) || 0,
         role_group_id: Number(userForm.value.role_group_id) || 1,
         quota_bytes: Math.max(0, Number(userForm.value.quota_gb) || 0) * GB,
-        used_bytes: Math.max(0, Number(userForm.value.used_gb) || 0) * GB,
+        used_bytes: Math.round(Math.max(0, Number(userForm.value.used_gb) || 0) * GB),
+        balance_cents: Math.round(Math.max(0, Number(userForm.value.balance_yuan) || 0) * 100),
         max_rules: userForm.value.max_rules,
         speed_mbps: userForm.value.speed_mbps,
         allowed_tunnels: allowedStr,
+        expire_at: userForm.value.expire_at ? userForm.value.expire_at.trim() : undefined,
         password: userForm.value.password || undefined,
       })
-      showToast('用户的套餐、角色与配额已保存')
+      showToast('用户的套餐、角色、配额与到期时间已保存')
     } else {
       if (!userForm.value.email || !userForm.value.password) {
         showToast('请填写账号邮箱与登录密码')
@@ -791,6 +822,7 @@ async function submitUserEdit() {
         max_rules: userForm.value.max_rules,
         speed_mbps: userForm.value.speed_mbps,
         allowed_tunnels: allowedStr,
+        expire_at: userForm.value.expire_at ? userForm.value.expire_at.trim() : undefined,
       })
       showToast('新增用户成功')
     }
@@ -809,6 +841,84 @@ async function resetUserTraffic(u: User) {
     await refreshAll()
   } catch (e: any) {
     showToast(e.message)
+  }
+}
+
+async function resetUserSubscriptionAdmin(u: User) {
+  if (!isAdmin.value) return
+  if (
+    !window.confirm(
+      `确定重置用户 ${u.email} 的订阅吗？\n这将清零已用流量、按绑定套餐刷新到期时间与配额，并自动恢复因流量超额暂停的转发规则。`,
+    )
+  ) {
+    return
+  }
+  try {
+    await api.adminResetUserSubscription(u.id)
+    showToast(`已重置 ${u.email} 的订阅周期与已用流量`)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function resetUserSubTokenAdmin(u: User) {
+  if (!isAdmin.value) return
+  if (!window.confirm(`确定重置用户 ${u.email} 的订阅链接吗？重置后旧订阅链接将立即失效。`)) {
+    return
+  }
+  try {
+    const res = await api.adminResetUserSubToken(u.id)
+    u.sub_token = res.sub_token
+    if (user.value && user.value.id === u.id) {
+      user.value.sub_token = res.sub_token
+    }
+    showToast(`已重置 ${u.email} 的订阅链接`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+// 管理员重置用户密码弹窗
+const showAdminResetPwdModal = ref(false)
+const adminResetPwdTarget = ref<User | null>(null)
+const adminResetPwdInput = ref('')
+const adminResetPwdResult = ref('')
+const adminResetPwdError = ref('')
+
+function openAdminResetPwdModal(u: User) {
+  if (!isAdmin.value) return
+  adminResetPwdTarget.value = u
+  adminResetPwdInput.value = ''
+  adminResetPwdResult.value = ''
+  adminResetPwdError.value = ''
+  showAdminResetPwdModal.value = true
+}
+
+async function submitAdminResetPwd(randomGenerate = false) {
+  if (!isAdmin.value || !adminResetPwdTarget.value) return
+  adminResetPwdError.value = ''
+  const customPw = randomGenerate ? '' : adminResetPwdInput.value.trim()
+  if (!randomGenerate && (customPw.length < 8 || customPw.length > 72)) {
+    adminResetPwdError.value = '自定义新密码长度需为 8-72 位，或直接点击「随机生成并重置」'
+    return
+  }
+  try {
+    const res = await api.adminResetUserPassword(adminResetPwdTarget.value.id, customPw)
+    if (res.token && user.value?.id === adminResetPwdTarget.value.id) {
+      localStorage.setItem('nexus_token', res.token)
+      token.value = res.token
+    }
+    adminResetPwdResult.value = res.password
+    adminResetPwdInput.value = ''
+    try {
+      await navigator.clipboard.writeText(res.password)
+      showToast('密码已重置并复制到剪贴板，该用户旧登录会话已失效')
+    } catch {
+      showToast(res.message || '密码已重置')
+    }
+  } catch (e: any) {
+    adminResetPwdError.value = e.message || '重置密码失败'
   }
 }
 
@@ -1153,9 +1263,60 @@ async function openInstallCmd(nodeId: number) {
   }
 }
 
+const currentBoundPlan = computed<Plan | undefined>(() => {
+  if (!user.value || !user.value.plan_id) return undefined
+  return plans.value.find((p) => p.id === user.value?.plan_id)
+})
+
+function subscriptionUrlForToken(subToken?: string, query = ''): string {
+  if (!subToken) return ''
+  return `${window.location.origin}/api/v1/sub/${subToken}${query}`
+}
+
+const currentSubscriptionUrl = computed(() => subscriptionUrlForToken(user.value?.sub_token))
+
+async function handleResetSubToken() {
+  if (!window.confirm('确定重置您的订阅链接吗？重置后原有的订阅链接将立即失效。')) {
+    return
+  }
+  try {
+    const res = await api.resetSubToken()
+    if (user.value) {
+      user.value.sub_token = res.sub_token
+    }
+    showToast(res.message || '订阅链接已重置')
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function handleResetSubscription() {
+  const p = currentBoundPlan.value
+  if (!p) {
+    showToast('当前账号未绑定套餐，请先在下方选购套餐')
+    return
+  }
+  if (
+    !window.confirm(
+      `确定花费 ¥${(p.price_cents / 100).toFixed(2)} 重置当前套餐「${p.name}」的订阅周期吗？\n这将立即清零已用流量、顺延 ${p.duration_days} 天有效期，并自动恢复因超额暂停的转发规则。`,
+    )
+  ) {
+    return
+  }
+  try {
+    const res = await api.resetSubscription()
+    user.value = res.user
+    showToast(res.message)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
 async function handleRedeem() {
   try {
     const res = await api.redeemCode(redeemInput.value)
+    redeemInput.value = ''
     showToast(res.message)
     await refreshAll()
   } catch (e: any) {
@@ -1216,7 +1377,9 @@ function isAnyModalOpen(): boolean {
     showBatchModal.value ||
     showRoleModal.value ||
     showPlanModal.value ||
-    showUserModal.value
+    showUserModal.value ||
+    showPasswordModal.value ||
+    showAdminResetPwdModal.value
   )
 }
 
@@ -1232,6 +1395,13 @@ async function pollTelemetryRealtime() {
       user.value.used_bytes = t.user.used_bytes
       user.value.quota_bytes = t.user.quota_bytes
       user.value.status = t.user.status
+      if (t.user.balance_cents !== undefined) user.value.balance_cents = t.user.balance_cents
+      if (t.user.expire_at !== undefined) user.value.expire_at = t.user.expire_at
+      if (t.user.max_rules !== undefined) user.value.max_rules = t.user.max_rules
+      if (t.user.speed_mbps !== undefined) user.value.speed_mbps = t.user.speed_mbps
+      if (t.user.plan_id !== undefined) user.value.plan_id = t.user.plan_id
+      if (t.user.role_group_id !== undefined) user.value.role_group_id = t.user.role_group_id
+      if (t.user.allowed_tunnels !== undefined) user.value.allowed_tunnels = t.user.allowed_tunnels
     }
     if (Array.isArray(t.nodes)) {
       const nodeMap = new Map(nodes.value.map((n) => [n.id, n]))
@@ -1531,6 +1701,53 @@ onUnmounted(() => {
                   {{ nodes.filter((n) => n.status === 'online').length }} / {{ nodes.length }}
                 </div>
                 <div v-else class="metric-value">{{ user?.speed_mbps || 100 }} Mbps</div>
+              </div>
+            </div>
+
+            <!-- 个人订阅信息与快捷订阅链接 -->
+            <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                  <span style="font-weight: 600; font-size: 14px;">我的订阅与链接</span>
+                  <span class="badge badge-primary">{{ isAdmin ? '管理员账号' : planNameById(user?.plan_id) }}</span>
+                  <span v-if="!isAdmin" class="badge" :class="isUserExpired(user) ? 'badge-danger' : 'badge-neutral'">
+                    到期：{{ formatDateDisplay(user?.expire_at) }}{{ isUserExpired(user) ? '（已过期）' : '' }}
+                  </span>
+                  <span class="badge badge-neutral">
+                    余额：¥{{ ((user?.balance_cents || 0) / 100).toFixed(2) }}
+                  </span>
+                </div>
+                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                  <button
+                    v-if="currentBoundPlan && currentBoundPlan.price_cents > 0"
+                    @click="handleResetSubscription"
+                    class="btn btn-soft btn-sm"
+                  >
+                    付费重置流量周期 (¥{{ (currentBoundPlan.price_cents / 100).toFixed(2) }})
+                  </button>
+                  <button @click="handleResetSubToken" class="btn btn-outline btn-sm">重置订阅链接</button>
+                </div>
+              </div>
+              <div
+                v-if="currentSubscriptionUrl"
+                style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;"
+              >
+                <input
+                  :value="currentSubscriptionUrl"
+                  readonly
+                  class="input"
+                  style="flex: 1; min-width: 240px; font-family: monospace; font-size: 12px;"
+                  @focus="($event.target as HTMLInputElement)?.select()"
+                />
+                <button @click="copyConnectAddr(currentSubscriptionUrl)" class="btn btn-primary btn-sm">
+                  复制订阅链接
+                </button>
+                <button
+                  @click="copyConnectAddr(subscriptionUrlForToken(user?.sub_token, '?format=json'))"
+                  class="btn btn-outline btn-sm"
+                >
+                  复制 JSON 订阅
+                </button>
               </div>
             </div>
 
@@ -1971,6 +2188,7 @@ onUnmounted(() => {
                     <th>角色可用隧道</th>
                     <th>流量</th>
                     <th>规则 / 限速</th>
+                    <th>到期时间</th>
                     <th>状态</th>
                     <th style="text-align: right;">操作</th>
                   </tr>
@@ -2011,6 +2229,12 @@ onUnmounted(() => {
                     </td>
                     <td>{{ formatBytes(u.used_bytes) }} / {{ formatBytes(u.quota_bytes) }}</td>
                     <td>{{ u.max_rules }} 条 · {{ u.speed_mbps }} Mbps</td>
+                    <td style="white-space: nowrap;">
+                      <span v-if="u.role === 'admin'" style="color: var(--text-muted);">永久</span>
+                      <span v-else :style="{ color: isUserExpired(u) ? 'var(--danger-text)' : 'inherit' }">
+                        {{ formatDateDisplay(u.expire_at) }}{{ isUserExpired(u) ? ' (已过期)' : '' }}
+                      </span>
+                    </td>
                     <td>
                       <span class="badge" :class="u.status === 'active' ? 'badge-success' : 'badge-danger'">
                         <span class="dot"></span> {{ u.status === 'active' ? '正常' : '已封禁' }}
@@ -2020,8 +2244,31 @@ onUnmounted(() => {
                       <button @click="openEditUserModal(u)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
                         分配套餐/角色
                       </button>
+                      <button
+                        @click="resetUserSubscriptionAdmin(u)"
+                        class="btn btn-outline btn-sm"
+                        style="margin-right: 4px;"
+                        title="按绑定套餐刷新到期时间、清零已用流量并恢复超额暂停规则"
+                      >
+                        重置订阅
+                      </button>
                       <button @click="resetUserTraffic(u)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
                         重置流量
+                      </button>
+                      <button
+                        @click="openAdminResetPwdModal(u)"
+                        class="btn btn-outline btn-sm"
+                        style="margin-right: 4px;"
+                      >
+                        重置密码
+                      </button>
+                      <button
+                        @click="resetUserSubTokenAdmin(u)"
+                        class="btn btn-outline btn-sm"
+                        style="margin-right: 4px;"
+                        title="重新生成订阅 Token，使旧订阅链接失效"
+                      >
+                        重置订阅链接
                       </button>
                       <button
                         v-if="u.role !== 'admin'"
@@ -2048,6 +2295,36 @@ onUnmounted(() => {
 
           <!-- 套餐管理 (管理员可配置套餐并绑定角色；普通用户可购买升级套餐与角色) -->
           <div v-if="activeTab === 'store'" style="display: flex; flex-direction: column; gap: 16px;">
+            <div
+              class="card"
+              style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;"
+            >
+              <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 13px;">
+                <span>
+                  当前套餐：<strong>{{ isAdmin ? '管理员账号' : planNameById(user?.plan_id) }}</strong>
+                </span>
+                <span style="color: var(--text-secondary);">
+                  已用流量：{{ formatBytes(user?.used_bytes || 0) }} / {{ formatBytes(user?.quota_bytes || 0) }}
+                </span>
+                <span v-if="!isAdmin" style="color: var(--text-secondary);">
+                  到期时间：{{ formatDateDisplay(user?.expire_at) }}
+                </span>
+                <span style="color: var(--text-secondary);">
+                  账户余额：<strong>¥{{ ((user?.balance_cents || 0) / 100).toFixed(2) }}</strong>
+                </span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <button
+                  v-if="currentBoundPlan && currentBoundPlan.price_cents > 0"
+                  @click="handleResetSubscription"
+                  class="btn btn-soft btn-sm"
+                >
+                  提前重置当月流量 / 周期 (¥{{ (currentBoundPlan.price_cents / 100).toFixed(2) }})
+                </button>
+                <button @click="handleResetSubToken" class="btn btn-outline btn-sm">重置订阅链接</button>
+              </div>
+            </div>
+
             <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
               <div style="display: flex; align-items: center; gap: 8px;">
                 <input v-model="redeemInput" class="input" style="width: 240px;" placeholder="输入兑换码" />
@@ -2698,7 +2975,7 @@ onUnmounted(() => {
             </div>
             <div>
               <label class="form-label">{{ editingUserId ? '重置密码 (留空不改)' : '登录密码' }}</label>
-              <input v-model="userForm.password" type="password" class="input" placeholder="至少6位" />
+              <input v-model="userForm.password" type="password" class="input" placeholder="8-72 位字符" />
             </div>
           </div>
 
@@ -2759,9 +3036,66 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <div class="grid-3">
+            <div v-if="editingUserId">
+              <label class="form-label">已用流量 (GB)</label>
+              <input v-model.number="userForm.used_gb" type="number" step="0.1" class="input" />
+            </div>
+            <div v-if="editingUserId">
+              <label class="form-label">账户余额 (元)</label>
+              <input v-model.number="userForm.balance_yuan" type="number" step="0.01" class="input" />
+            </div>
+            <div>
+              <label class="form-label">到期时间</label>
+              <input v-model="userForm.expire_at" type="date" class="input" />
+            </div>
+          </div>
+
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showUserModal = false" class="btn btn-outline">取消</button>
             <button @click="submitUserEdit" class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 管理员重置用户密码弹窗 -->
+    <div v-if="showAdminResetPwdModal && isAdmin && adminResetPwdTarget" class="modal-backdrop" @click.self="showAdminResetPwdModal = false">
+      <div class="modal-box" style="max-width: 440px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">重置用户密码</span>
+          <button @click="showAdminResetPwdModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div style="font-size: 13px; color: var(--text-secondary);">
+            目标账号：<strong style="color: var(--text-main);">{{ adminResetPwdTarget.email }}</strong>
+          </div>
+          <div>
+            <label class="form-label">指定新密码（8-72 位，或直接点击下方随机生成）</label>
+            <input
+              v-model="adminResetPwdInput"
+              type="text"
+              class="input"
+              placeholder="输入自定义新密码，或留空使用随机生成"
+              @keyup.enter="submitAdminResetPwd(false)"
+            />
+          </div>
+          <p v-if="adminResetPwdError" style="font-size: 12px; color: var(--danger-text);">{{ adminResetPwdError }}</p>
+          <div
+            v-if="adminResetPwdResult"
+            style="padding: 10px 12px; border-radius: var(--radius-md); background: var(--bg-soft); border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; gap: 8px;"
+          >
+            <div style="font-size: 12.5px;">
+              新密码：<code style="font-weight: 700; font-size: 13.5px;">{{ adminResetPwdResult }}</code>
+            </div>
+            <button @click="copyConnectAddr(adminResetPwdResult)" class="btn btn-primary btn-sm">复制密码</button>
+          </div>
+          <p style="font-size: 12px; color: var(--text-muted);">
+            重置后该用户在所有设备上的已登录会话将立即失效。
+          </p>
+          <div style="display: flex; justify-content: flex-end; gap: 8px;">
+            <button @click="submitAdminResetPwd(true)" class="btn btn-soft">随机生成并重置</button>
+            <button @click="submitAdminResetPwd(false)" class="btn btn-primary">使用自定义密码重置</button>
           </div>
         </div>
       </div>

@@ -36,6 +36,7 @@ var (
 	dummyHash, _ = bcrypt.GenerateFromPassword([]byte("zachary-panel-dummy-password"), bcrypt.DefaultCost)
 
 	loginLimiter    = newKeyedLimiter(rate.Every(6*time.Second), 5)  // per client IP: ~10/min, burst 5
+	subLimiter      = newKeyedLimiter(rate.Every(2*time.Second), 15) // per client IP: subscription pulls
 	sensitiveLimits = newKeyedLimiter(rate.Every(3*time.Second), 10) // per user: redeem / probe / password
 	accountGuard    = newAccountLockout()
 )
@@ -322,6 +323,17 @@ func userRateLimit() gin.HandlerFunc {
 		key := c.FullPath() + "|" + toKey(uid)
 		if !sensitiveLimits.Allow(key) {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "操作过于频繁，请稍后再试"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// subRateLimit throttles public subscription pulls per client IP.
+func subRateLimit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !subLimiter.Allow("sub:" + c.ClientIP()) {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "订阅请求过于频繁，请稍后再试"})
 			return
 		}
 		c.Next()

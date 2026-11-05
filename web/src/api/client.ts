@@ -41,6 +41,7 @@ export interface User {
   max_rules: number
   speed_mbps: number
   expire_at: string
+  sub_token?: string
 }
 
 export interface NodeItem {
@@ -147,6 +148,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers,
   })
+  const renewedToken = res.headers.get('X-Renewed-Token')
+  if (renewedToken) {
+    localStorage.setItem('nexus_token', renewedToken)
+  }
   const data = await res.json().catch(() => ({}))
   if (res.status === 401 && token && !path.startsWith('/auth/')) {
     // Token expired or revoked (e.g. password changed elsewhere): drop it and return to the login page.
@@ -172,6 +177,16 @@ export const api = {
     request<{ message: string; token: string }>('/user/password', {
       method: 'POST',
       body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+    }),
+
+  resetSubToken: () =>
+    request<{ message: string; sub_token: string }>('/user/reset-sub-token', {
+      method: 'POST',
+    }),
+
+  resetSubscription: () =>
+    request<{ message: string; user: User }>('/user/reset-subscription', {
+      method: 'POST',
     }),
 
   register: (email: string, password: string) =>
@@ -202,7 +217,19 @@ export const api = {
   getTelemetry: () =>
     request<{
       timestamp: number
-      user: { id: number; quota_bytes: number; used_bytes: number; status: string }
+      user: {
+        id: number
+        role_group_id?: number
+        plan_id?: number
+        balance_cents?: number
+        quota_bytes: number
+        used_bytes: number
+        max_rules?: number
+        speed_mbps?: number
+        expire_at?: string
+        status: string
+        allowed_tunnels?: string
+      }
       nodes: Partial<NodeItem>[]
       rules: Array<{
         id: number
@@ -369,6 +396,30 @@ export const api = {
     request<{ deleted: boolean }>(`/admin/users/${id}`, { method: 'DELETE' }),
   adminResetUserTraffic: (id: number) =>
     request<User>(`/admin/users/${id}/reset-traffic`, { method: 'POST' }),
+  adminResetUserSubscription: (
+    id: number,
+    payload?: { duration_days?: number; reset_sub_token?: boolean },
+  ) =>
+    request<User>(`/admin/users/${id}/reset-subscription`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    }),
+  adminResetUserPassword: (id: number, password?: string) =>
+    request<{
+      message: string
+      password: string
+      generated: boolean
+      user: User
+      token?: string
+    }>(`/admin/users/${id}/reset-password`, {
+      method: 'POST',
+      body: JSON.stringify({ password: password || '' }),
+    }),
+  adminResetUserSubToken: (id: number) =>
+    request<{ message: string; sub_token: string; user: User }>(
+      `/admin/users/${id}/reset-sub-token`,
+      { method: 'POST' },
+    ),
   adminGetSettings: () => request<SystemConfig>('/admin/settings'),
   adminUpdateSettings: (payload: Partial<SystemConfig>) =>
     request<SystemConfig>('/admin/settings', {
