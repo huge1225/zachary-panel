@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 	"nexus-panel/pkg/protocol"
 	"nexus-panel/pkg/utils"
 )
@@ -19,10 +21,10 @@ import (
 // SystemConfig stores global panel settings managed by administrators.
 type SystemConfig struct {
 	ID                 uint64    `gorm:"primaryKey" json:"id"`
-	SiteName           string    `gorm:"size:128;default:'Nexus Panel'" json:"site_name"`
-	SiteLogo           string    `gorm:"size:32;default:'NX'" json:"site_logo"`
+	SiteName           string    `gorm:"size:128;default:'Zachary Panel'" json:"site_name"`
+	SiteLogo           string    `gorm:"size:32;default:'ZP'" json:"site_logo"`
 	Announcement       string    `gorm:"size:1024;default:''" json:"announcement"`
-	AllowRegister      bool      `gorm:"default:true" json:"allow_register"`
+	AllowRegister      bool      `gorm:"default:false" json:"allow_register"`
 	DefaultRoleGroupID uint64    `gorm:"default:1" json:"default_role_group_id"`
 	DefaultPlanID      uint64    `gorm:"default:0" json:"default_plan_id"`
 	DefaultQuotaGB     int64     `gorm:"default:10" json:"default_quota_gb"`
@@ -48,19 +50,33 @@ type User struct {
 	ID             uint64    `gorm:"primaryKey" json:"id"`
 	Email          string    `gorm:"uniqueIndex;size:191;not null" json:"email"`
 	PasswordHash   string    `gorm:"not null" json:"-"`
-	Role           string    `gorm:"size:32;default:'user'" json:"role"`             // "admin" | "user"
-	Status         string    `gorm:"size:32;default:'active'" json:"status"`         // "active" | "banned"
-	RoleGroupID    uint64    `gorm:"default:1" json:"role_group_id"`                 // 所属角色 ID (决定可用隧道)
-	PlanID         uint64    `gorm:"default:0" json:"plan_id"`                       // 绑定套餐 ID
-	AllowedTunnels string    `gorm:"size:512;default:''" json:"allowed_tunnels"`     // 逗号分隔的授权隧道 ID (随角色同步，admin 默认 "*")
+	Role           string    `gorm:"size:32;default:'user'" json:"role"`         // "admin" | "user"
+	Status         string    `gorm:"size:32;default:'active'" json:"status"`     // "active" | "banned"
+	RoleGroupID    uint64    `gorm:"default:1" json:"role_group_id"`             // 所属角色 ID (决定可用隧道)
+	PlanID         uint64    `gorm:"default:0" json:"plan_id"`                   // 绑定套餐 ID
+	AllowedTunnels string    `gorm:"size:512;default:''" json:"allowed_tunnels"` // 逗号分隔的授权隧道 ID (随角色同步，admin 默认 "*")
 	BalanceCents   int64     `gorm:"default:0" json:"balance_cents"`
 	QuotaBytes     int64     `gorm:"default:107374182400" json:"quota_bytes"` // 总配额字节 (默认 100GB)
 	UsedBytes      int64     `gorm:"default:0" json:"used_bytes"`             // 已用计费字节 (含倍率折算)
 	MaxRules       int       `gorm:"default:20" json:"max_rules"`             // 最大规则数
 	SpeedMbps      int       `gorm:"default:100" json:"speed_mbps"`           // 峰值带宽限制 Mbps
 	ExpireAt       time.Time `json:"expire_at"`
+	TokenVersion   int       `gorm:"default:0" json:"-"` // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// CanForward reports whether the account may currently have active forwarding rules
+// (not banned, not expired, quota not exhausted). Same criteria as the traffic-report cutoff.
+// Administrators never expire (consistent with rule creation, which skips the expiry check for admins).
+func (u *User) CanForward(now time.Time) bool {
+	if u.Status != "active" {
+		return false
+	}
+	if u.Role != "admin" && !u.ExpireAt.IsZero() && now.After(u.ExpireAt) {
+		return false
+	}
+	return u.UsedBytes < u.QuotaBytes
 }
 
 // HasTunnelPermission checks whether the user is permitted to use the given tunnel ID.
@@ -92,7 +108,7 @@ type Plan struct {
 	ID             uint64    `gorm:"primaryKey" json:"id"`
 	Name           string    `gorm:"size:128;not null" json:"name"`
 	Description    string    `gorm:"size:512" json:"description"`
-	RoleGroupID    uint64    `gorm:"default:1" json:"role_group_id"`              // 套餐绑定的角色 ID
+	RoleGroupID    uint64    `gorm:"default:1" json:"role_group_id"` // 套餐绑定的角色 ID
 	PriceCents     int64     `gorm:"not null" json:"price_cents"`
 	DurationDays   int       `gorm:"default:30" json:"duration_days"`
 	QuotaBytes     int64     `gorm:"not null" json:"quota_bytes"`
@@ -117,18 +133,19 @@ type Node struct {
 	ID               uint64              `gorm:"primaryKey" json:"id"`
 	Name             string              `gorm:"size:128;not null" json:"name"`
 	GroupID          uint64              `gorm:"default:1" json:"group_id"`
-	Role             string              `gorm:"size:32;default:'all'" json:"role"`        // "relay" | "ingress" | "egress" | "all"
-	ServerIP         string              `gorm:"size:191;not null" json:"server_ip"`       // 服务器通信 IP (用于节点间隧道底层对接)
-	ConnectIP        string              `gorm:"size:191;not null" json:"connect_ip"`      // 连接 IP / 入口显示地址 (用于添加转发后展示与一键复制)
-	PublicHost       string              `gorm:"size:191" json:"public_host"`              // 兼容字段 (等同于 ConnectIP)
-	InternalHost     string              `gorm:"size:191" json:"internal_host"`            // 专线内网通信 IP (选填，优先用于隧道通信)
+	Role             string              `gorm:"size:32;default:'all'" json:"role"`   // "relay" | "ingress" | "egress" | "all"
+	ServerIP         string              `gorm:"size:191;not null" json:"server_ip"`  // 服务器通信 IP (用于节点间隧道底层对接)
+	ConnectIP        string              `gorm:"size:191;not null" json:"connect_ip"` // 连接 IP / 入口显示地址 (用于添加转发后展示与一键复制)
+	PublicHost       string              `gorm:"size:191" json:"public_host"`         // 兼容字段 (等同于 ConnectIP)
+	InternalHost     string              `gorm:"size:191" json:"internal_host"`       // 专线内网通信 IP (选填，优先用于隧道通信)
 	PortRange        string              `gorm:"size:64;default:'10000-50000'" json:"port_range"`
-	TrafficRate      float64             `gorm:"default:1.0" json:"traffic_rate"`                    // 节点倍率
-	QuotaBytes       int64               `gorm:"default:10995116277760" json:"quota_bytes"`          // 节点月流量配额 (默认 10TB, 0表示不限)
-	UsedBytes        int64               `gorm:"default:0" json:"used_bytes"`                        // 节点当前已用流量 (可手动设置校准)
+	TrafficRate      float64             `gorm:"default:1.0" json:"traffic_rate"`           // 节点倍率
+	QuotaBytes       int64               `gorm:"default:10995116277760" json:"quota_bytes"` // 节点月流量配额 (默认 10TB, 0表示不限)
+	UsedBytes        int64               `gorm:"default:0" json:"used_bytes"`               // 节点当前已用流量 (可手动设置校准)
 	DefaultEngine    protocol.EngineType `gorm:"size:32;default:'native'" json:"default_engine"`
 	SupportedEngines string              `gorm:"size:255;default:'native'" json:"supported_engines"` // Agent上报的可用引擎列表
 	SecretToken      string              `gorm:"size:128;not null" json:"secret_token"`
+	TunnelCertPEM    string              `gorm:"type:text" json:"-"`                      // Agent 上报的隧道 TLS 证书 (入口节点据此做证书固定)
 	Status           string              `gorm:"size:32;default:'offline'" json:"status"` // "online" | "offline" | "maintenance"
 	CPUCores         int                 `gorm:"-" json:"cpu_cores"`
 	CPUUsage         float64             `gorm:"-" json:"cpu_usage"`
@@ -157,15 +174,15 @@ type Node struct {
 type TunnelLine struct {
 	ID             uint64              `gorm:"primaryKey" json:"id"`
 	Name           string              `gorm:"size:128;not null" json:"name"`
-	Type           string              `gorm:"size:32;default:'direct'" json:"type"`         // "direct" (直接转发隧道) | "encrypt" (加密对接隧道)
+	Type           string              `gorm:"size:32;default:'direct'" json:"type"` // "direct" (直接转发隧道) | "encrypt" (加密对接隧道)
 	Description    string              `gorm:"size:255" json:"description"`
-	IngressNodeID  uint64              `gorm:"not null" json:"ingress_node_id"`              // 入口节点 ID
-	EgressNodeID   uint64              `gorm:"default:0" json:"egress_node_id"`              // 出口节点 ID (仅 Type=="encrypt" 时需要)
-	Transport      string              `gorm:"size:32;default:'tls'" json:"transport"`       // "raw" | "tls" | "ws" | "wss" | "quic" | "custom"
-	Engine         protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"`       // 默认转发引擎: "native" | "gost" | "realm" | "nftables"
+	IngressNodeID  uint64              `gorm:"not null" json:"ingress_node_id"`               // 入口节点 ID
+	EgressNodeID   uint64              `gorm:"default:0" json:"egress_node_id"`               // 出口节点 ID (仅 Type=="encrypt" 时需要)
+	Transport      string              `gorm:"size:32;default:'tls'" json:"transport"`        // "raw" | "tls" | "ws" | "wss" | "quic" | "custom"
+	Engine         protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"`        // 默认转发引擎: "native" | "gost" | "realm" | "nftables"
 	BillingMode    string              `gorm:"size:32;default:'two_way'" json:"billing_mode"` // "one_way" (单向计费) | "two_way" (双向计费)
-	RateMultiplier float64             `gorm:"default:1.0" json:"rate_multiplier"`           // 隧道计费倍率
-	MaxPortCount   int                 `gorm:"default:50" json:"max_port_count"`             // 该隧道允许的最大端口转发数
+	RateMultiplier float64             `gorm:"default:1.0" json:"rate_multiplier"`            // 隧道计费倍率
+	MaxPortCount   int                 `gorm:"default:50" json:"max_port_count"`              // 该隧道允许的最大端口转发数
 	Enabled        bool                `gorm:"default:true" json:"enabled"`
 	CreatedAt      time.Time           `json:"created_at"`
 }
@@ -175,7 +192,7 @@ type ForwardRule struct {
 	ID            uint64              `gorm:"primaryKey" json:"id"`
 	UserID        uint64              `gorm:"index;not null" json:"user_id"`
 	Name          string              `gorm:"size:128;not null" json:"name"`
-	Mode          string              `gorm:"size:32;default:'direct'" json:"mode"`   // "direct" (单端直转) | "tunnel" (入口-出口专线联动)
+	Mode          string              `gorm:"size:32;default:'direct'" json:"mode"` // "direct" (单端直转) | "tunnel" (入口-出口专线联动)
 	IngressNodeID uint64              `gorm:"index;not null" json:"ingress_node_id"`
 	TunnelLineID  uint64              `gorm:"default:0" json:"tunnel_line_id"`        // Mode == "tunnel" 时关联的专线 ID
 	Engine        protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"` // 面板可选: "native" | "gost" | "realm" | "nftables"
@@ -237,7 +254,15 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 		dialector = sqlite.Open(dsn)
 	}
 
-	db, err := gorm.Open(dialector, &gorm.Config{})
+	db, err := gorm.Open(dialector, &gorm.Config{
+		// 仅记录警告/错误与慢查询；忽略 "record not found"，避免把登录邮箱等查询参数刷进日志
+		Logger: gormlogger.New(log.New(os.Stderr, "\r\n", log.LstdFlags), gormlogger.Config{
+			SlowThreshold:             time.Second,
+			LogLevel:                  gormlogger.Warn,
+			IgnoreRecordNotFoundError: true,
+			ParameterizedQueries:      true,
+		}),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect database (%s): %w", driver, err)
 	}
@@ -262,16 +287,31 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 	return db, nil
 }
 
+func envBool(key string) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	return v == "1" || v == "true" || v == "yes"
+}
+
+// seedPassword returns the password from env (when long enough) or a freshly generated random one.
+func seedPassword(envKey string) (pw string, generated bool) {
+	if v := os.Getenv(envKey); len(v) >= 8 && len(v) <= 72 {
+		return v, false
+	} else if v != "" {
+		log.Printf("[DB] %s ignored: password must be 8-72 characters", envKey)
+	}
+	return utils.GenerateRandomToken(12), true
+}
+
 func seedInitialData(db *gorm.DB) {
 	var cfgCount int64
 	db.Model(&SystemConfig{}).Count(&cfgCount)
 	if cfgCount == 0 {
 		db.Create(&SystemConfig{
 			ID:                 1,
-			SiteName:           "Nexus Panel",
-			SiteLogo:           "NX",
+			SiteName:           "Zachary Panel",
+			SiteLogo:           "ZP",
 			Announcement:       "",
-			AllowRegister:      true,
+			AllowRegister:      false, // 公开注册默认关闭，需管理员在系统设置中显式开启
 			DefaultRoleGroupID: 1,
 			DefaultPlanID:      1,
 			DefaultQuotaGB:     10,
@@ -279,6 +319,8 @@ func seedInitialData(db *gorm.DB) {
 			DefaultSpeedMbps:   50,
 			DefaultTunnels:     "1",
 		})
+		// GORM skips zero-value bools on create (column default would apply), so persist explicitly.
+		db.Model(&SystemConfig{}).Where("id = ?", 1).Update("allow_register", false)
 	}
 
 	var count int64
@@ -287,17 +329,18 @@ func seedInitialData(db *gorm.DB) {
 		return
 	}
 
-	log.Println("[DB] Seeding default roles, plans, admin & user accounts, nodes, and tunnel lines...")
+	seedDemo := envBool("NEXUS_SEED_DEMO")
+	log.Printf("[DB] Seeding default roles, plans and administrator account (demo data: %v)...", seedDemo)
 
 	// 1. Default Role Groups (角色决定可用隧道)
 	r1 := RoleGroup{
 		Name:           "标准角色",
-		Description:    "仅可使用标准直转隧道 (#1 深港专线直转)",
+		Description:    "仅可使用标准直转隧道 (#1)",
 		AllowedTunnels: "1",
 	}
 	r2 := RoleGroup{
 		Name:           "VIP 专线角色",
-		Description:    "解锁全部直转与双端加密隧道 (#1 深港直转 + #2 广港加密)",
+		Description:    "解锁直转与双端加密隧道 (#1 + #2)",
 		AllowedTunnels: "1,2",
 	}
 	db.Create(&r1)
@@ -332,25 +375,45 @@ func seedInitialData(db *gorm.DB) {
 	}
 	db.Create(&plans)
 
-	// 3. Default Users (用户分配套餐和角色)
-	hash, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+	// 3. Administrator account: credentials come from env, otherwise a random password is generated and
+	// printed exactly once. No well-known default password is ever created.
+	adminEmail := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUS_ADMIN_EMAIL")))
+	if adminEmail == "" {
+		adminEmail = "admin@nexus.local"
+	}
+	adminPass, generated := seedPassword("NEXUS_ADMIN_PASSWORD")
+	hash, _ := bcrypt.GenerateFromPassword([]byte(adminPass), bcrypt.DefaultCost)
 	admin := User{
-		Email:          "admin@nexus.local",
+		Email:          adminEmail,
 		PasswordHash:   string(hash),
 		Role:           "admin",
 		Status:         "active",
 		RoleGroupID:    r2.ID,
 		PlanID:         plans[1].ID,
 		AllowedTunnels: "*",
-		BalanceCents:   100000,
+		BalanceCents:   0,
 		QuotaBytes:     1024 * 1024 * 1024 * 1024, // 1 TB
 		MaxRules:       100,
 		SpeedMbps:      1000,
 		ExpireAt:       time.Now().AddDate(1, 0, 0),
 	}
 	db.Create(&admin)
+	if generated {
+		log.Printf("[DB] ==== Initial administrator created: %s / %s  (change it after first login; set NEXUS_ADMIN_PASSWORD to choose your own) ====", adminEmail, adminPass)
+	} else {
+		log.Printf("[DB] Initial administrator created: %s (password from NEXUS_ADMIN_PASSWORD)", adminEmail)
+	}
 
-	userHash, _ := bcrypt.GenerateFromPassword([]byte("user123"), bcrypt.DefaultCost)
+	if !seedDemo {
+		return
+	}
+	seedDemoData(db, r1, plans)
+}
+
+// seedDemoData creates sample users, nodes and tunnels for local evaluation. Only runs when NEXUS_SEED_DEMO=true.
+func seedDemoData(db *gorm.DB, r1 RoleGroup, plans []Plan) {
+	userPass, generated := seedPassword("NEXUS_DEMO_USER_PASSWORD")
+	userHash, _ := bcrypt.GenerateFromPassword([]byte(userPass), bcrypt.DefaultCost)
 	normalUser := User{
 		Email:          "user@nexus.local",
 		PasswordHash:   string(userHash),
@@ -366,6 +429,9 @@ func seedInitialData(db *gorm.DB) {
 		ExpireAt:       time.Now().AddDate(0, 1, 0),
 	}
 	db.Create(&normalUser)
+	if generated {
+		log.Printf("[DB] Demo user created: user@nexus.local / %s", userPass)
+	}
 
 	// Default Node Groups
 	g1 := NodeGroup{Name: "BGP 标准公网中转", Description: "国内三网优化 BGP 单端直转节点组"}
@@ -373,7 +439,7 @@ func seedInitialData(db *gorm.DB) {
 	db.Create(&g1)
 	db.Create(&g2)
 
-	// Default Nodes (Node 1 matches default Agent flags so running cmd/agent immediately connects!)
+	// Demo nodes: every node gets a strong random secret token (shown in the admin node list / install command).
 	n1 := Node{
 		Name:             "深港 IEPL 专线节点-01 (自带内网穿透)",
 		GroupID:          g2.ID,
@@ -386,7 +452,7 @@ func seedInitialData(db *gorm.DB) {
 		TrafficRate:      1.0,
 		DefaultEngine:    protocol.EngineRealm,
 		SupportedEngines: "native,gost,realm,nftables",
-		SecretToken:      "dev-node-secret",
+		SecretToken:      utils.GenerateRandomToken(32),
 		Status:           "offline",
 	}
 	n2 := Node{
@@ -401,7 +467,7 @@ func seedInitialData(db *gorm.DB) {
 		TrafficRate:      1.0,
 		DefaultEngine:    protocol.EngineGost,
 		SupportedEngines: "native,gost,realm,nftables",
-		SecretToken:      utils.GenerateRandomToken(16),
+		SecretToken:      utils.GenerateRandomToken(32),
 		Status:           "offline",
 	}
 	n3 := Node{
@@ -416,7 +482,7 @@ func seedInitialData(db *gorm.DB) {
 		TrafficRate:      1.0,
 		DefaultEngine:    protocol.EngineGost,
 		SupportedEngines: "native,gost,realm",
-		SecretToken:      utils.GenerateRandomToken(16),
+		SecretToken:      utils.GenerateRandomToken(32),
 		Status:           "offline",
 	}
 	db.Create(&n1)
@@ -453,12 +519,4 @@ func seedInitialData(db *gorm.DB) {
 	}
 	db.Create(&directTunnel)
 	db.Create(&encryptTunnel)
-
-	// Sample Redeem Code
-	db.Create(&RedeemCode{
-		Code:       "NEXUS-VIP-2026",
-		PlanID:     plans[1].ID,
-		QuotaBytes: plans[1].QuotaBytes,
-		Duration:   30,
-	})
 }

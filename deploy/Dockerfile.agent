@@ -1,0 +1,18 @@
+# Zachary Panel 节点 Agent 镜像（在仓库根目录构建）：
+#   docker build -f deploy/Dockerfile.agent -t zachary-panel-agent:latest .
+FROM golang:1.23-alpine AS builder
+WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY pkg/ ./pkg/
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nexus-agent ./cmd/agent
+
+FROM alpine:3.20
+# nftables 引擎需要 nft；需配合 --net=host --cap-add=NET_ADMIN 运行
+RUN apk add --no-cache ca-certificates tzdata nftables
+COPY --from=builder /out/nexus-agent /usr/local/bin/nexus-agent
+ENV NEXUS_STATE_DIR=/var/lib/nexus-agent
+VOLUME ["/var/lib/nexus-agent"]
+ENTRYPOINT ["/usr/local/bin/nexus-agent"]

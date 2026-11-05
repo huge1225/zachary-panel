@@ -28,7 +28,7 @@ type Config struct {
 	MasterURL        string
 	NodeID           uint64
 	SecretToken      string
-	MasterPinSHA256  string        // Optional SHA-256 hex fingerprint of Master TLS certificate
+	MasterPinSHA256  string // Optional SHA-256 hex fingerprint of Master TLS certificate
 	AllowPrivateSSRF bool
 	ReportInterval   time.Duration // Probe & traffic delta sync frequency (default 3s)
 }
@@ -119,14 +119,18 @@ func (c *AgentClient) connectAndServe(ctx context.Context) error {
 	log.Printf("[AgentClient] Authenticated with Master %s (NodeID=%d, HMAC+AntiReplay=ON, Engines=%v)",
 		c.cfg.MasterURL, c.cfg.NodeID, c.engMgr.SupportedEngines())
 
-	// 1. Send signed registration payload
-	_ = c.sendEnvelope(protocol.MsgAgentRegister, protocol.AgentRegisterPayload{
+	// 1. Send signed registration payload (Master requires this as the very first frame). It also carries this
+	// node's tunnel certificate so Master can pin it on Ingress nodes that connect to us.
+	if err := c.sendEnvelope(protocol.MsgAgentRegister, protocol.AgentRegisterPayload{
 		NodeID:           c.cfg.NodeID,
 		AgentVersion:     AgentVersion,
 		OS:               runtime.GOOS,
 		Arch:             runtime.GOARCH,
 		SupportedEngines: c.engMgr.SupportedEngines(),
-	})
+		TunnelCertPEM:    c.engMgr.TunnelCertPEM(),
+	}); err != nil {
+		return err
+	}
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -224,10 +228,14 @@ func (c *AgentClient) handleMessage(ctx context.Context, raw []byte) {
 		var spec protocol.RuleSpec
 		if err := json.Unmarshal(payloadBytes, &spec); err == nil {
 			err := c.engMgr.ApplyRule(ctx, spec)
+			eng := c.engMgr.BoundEngine(spec.RuleID, spec.Role)
+			if eng == "" {
+				eng = spec.Engine
+			}
 			ack := protocol.RuleStatusAckPayload{
 				RuleID:  spec.RuleID,
 				Role:    spec.Role,
-				Engine:  spec.Engine,
+				Engine:  eng,
 				Success: err == nil,
 			}
 			if err != nil {

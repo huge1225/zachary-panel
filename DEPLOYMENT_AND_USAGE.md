@@ -21,8 +21,8 @@ flowchart TB
   end
 
   subgraph Egress["出口节点 (Egress Agent - 可选)"]
-    M2["实时硬件探针 + 40B HMAC 隧道防扫鉴权"]
-    E2["解密落地转发 (TLS / WSS / WS / QUIC)"]
+    M2["实时硬件探针 + TLS 证书固定 + HMAC 防重放鉴权"]
+    E2["解密落地转发 (TLS 加密隧道，TCP/UDP)"]
   end
 
   UI --> API --> RBAC --> Orch
@@ -36,10 +36,10 @@ flowchart TB
 
 | 转发方式 | 核心特点 | 适用场景 |
 | :--- | :--- | :--- |
-| **`realm`** | Rust 编写，极低内存占用、高并发 TCP/UDP 零配置直转 | 入口单机中转、BGP / IEPL 专线直连转发（**推荐直转首选**） |
+| **`realm`** | Rust 编写，极低内存占用、高并发 TCP/UDP 零配置直转 | 入口单机中转、BGP / IEPL 专线直连转发（**推荐直转首选**；用于加密隧道时自动改用 `native` 加密） |
 | **`gost`** | 支持 `TLS` / `WSS` / `WS` / `QUIC` 多协议双端加密隧道 | 跨公网入口 $\rightarrow$ 出口双节点加密隧道转发（**推荐加密隧道首选**） |
-| **`nftables`** | Linux 内核态 `DNAT/SNAT` 零拷贝转发，几乎 0 CPU 占用 | 超大带宽（10Gbps+）Linux 专线入口节点纯内核态端口转发 |
-| **`native`** | 纯 Go 内置转发底座，支持令牌桶精准限速与双端 `40-Byte HMAC` 首包防探测鉴权 | 无外部二进制依赖的通用转发、精准单规则限速、主备故障自动切换 |
+| **`nftables`** | Linux 内核态 `DNAT/SNAT` 零拷贝转发，几乎 0 CPU 占用 | 超大带宽（10Gbps+）Linux 专线入口节点纯内核态端口转发（仅直转；加密隧道自动改用 `native`） |
+| **`native`** | 纯 Go 内置转发底座，支持令牌桶精准限速；双端隧道统一走 TLS（证书固定）+ HMAC 首包鉴权（含随机数防重放），UDP 封装在加密隧道内 | 无外部二进制依赖的通用转发、精准单规则限速、主备故障自动切换 |
 
 ---
 
@@ -61,7 +61,7 @@ cd /opt/zachary-panel/deploy
 docker compose up -d --build
 ```
 
-默认 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 配置如下：
+默认 [`deploy/docker-compose.yml`](./deploy/docker-compose.yml) 配置如下（**启动前请修改 `NEXUS_PUBLIC_URL`、`NEXUS_ADMIN_EMAIL` 并设置 `NEXUS_ADMIN_PASSWORD`**）：
 
 ```yaml
 version: "3.9"
@@ -74,15 +74,31 @@ services:
     container_name: nexus-master
     restart: always
     ports:
-      - "8080:8080"
+      # 建议只监听本机，由 Nginx/Caddy 等反向代理提供 HTTPS 后对外暴露
+      - "127.0.0.1:8080:8080"
     environment:
       - NEXUS_LISTEN=:8080
       - NEXUS_DB_DRIVER=sqlite
       - NEXUS_DB_DSN=/data/nexus_panel.db
-      - NEXUS_JWT_SECRET=please-change-to-your-production-secret-key
+      # 面板对外访问地址（必须是 https，用于生成 Agent 安装命令与 wss 控制通道）
+      - NEXUS_PUBLIC_URL=https://panel.example.com
+      # 反向代理地址（逗号分隔 IP/CIDR）。只有来自这些地址的 X-Forwarded-For 才会被信任
+      - NEXUS_TRUSTED_PROXIES=172.16.0.0/12
+      # 首次启动创建的管理员账号；不设置密码时会随机生成并仅在日志中打印一次
+      - NEXUS_ADMIN_EMAIL=admin@example.com
+      # - NEXUS_ADMIN_PASSWORD=请替换为至少8位的强密码
+      # JWT 签名密钥（≥32 字符）。不设置时自动生成并持久化到 /data/jwt_secret.key
+      # - NEXUS_JWT_SECRET=
     volumes:
-      - ./data:/data
+      # 命名卷（容器以非 root 用户 10001 运行，命名卷会自动设置正确属主）
+      - zachary-data:/data
+
+volumes:
+  zachary-data:
 ```
+
+> [!IMPORTANT]
+> 端口默认只绑定 `127.0.0.1:8080`，请通过 Nginx/Caddy 提供 HTTPS 后对外暴露（见 2.4 节）。若未设置 `NEXUS_ADMIN_PASSWORD`，首次启动会随机生成管理员密码并**仅在日志中打印一次**：`docker logs nexus-master 2>&1 | grep -i administrator`。主控容器以非 root 用户（UID 10001）运行，数据保存在命名卷 `zachary-data` 中。
 
 > [!TIP]
 > **切换 PostgreSQL 或 MySQL 数据库**：
@@ -103,9 +119,17 @@ cd /opt/zachary-panel
 CGO_ENABLED=1 go build -o bin/nexus-master ./cmd/master
 CGO_ENABLED=0 go build -o bin/nexus-agent ./cmd/agent
 
-# 3. 启动主控端
-export NEXUS_JWT_SECRET="your-strong-random-jwt-secret"
-./bin/nexus-master -listen :8080 -db-driver sqlite -db-dsn ./nexus_panel.db
+# 3. 放置 Agent 二进制，供节点一键安装脚本下载（面板会自动计算 SHA-256 写入安装命令）
+mkdir -p deploy/releases
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o deploy/releases/nexus-agent-linux-amd64 ./cmd/agent
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o deploy/releases/nexus-agent-linux-arm64 ./cmd/agent
+
+# 4. 启动主控端
+export NEXUS_ADMIN_EMAIL="admin@example.com"
+export NEXUS_ADMIN_PASSWORD="请替换为至少8位的强密码"
+export NEXUS_PUBLIC_URL="https://panel.example.com"
+./bin/nexus-master -listen 127.0.0.1:8080 -db-driver sqlite -db-dsn ./data/nexus_panel.db \
+  -static-dir ./deploy -web-dir ./web/dist
 ```
 
 ---
@@ -140,14 +164,38 @@ server {
 
 ---
 
-### 2.5 默认初始化账号与登录
+### 2.5 初始管理员账号与登录
 
-面板首次启动会自动迁移数据库并预置两套演示账号（生产环境登录后请立即在「用户管理」中修改密码）：
+面板首次启动会自动迁移数据库，并创建默认角色、套餐与**一个管理员账号**（不再内置任何固定的演示账号、密码或兑换码）：
 
-| 账号角色 | 登录邮箱 | 默认密码 | 默认所属角色 / 权限说明 |
-| :--- | :--- | :--- | :--- |
-| **管理员 (`admin`)** | `admin@nexus.local` | `admin123` | **全权限管理员**：可维护节点、隧道、角色、套餐、用户与系统设置，拥有全部隧道 (`*`) 权限 |
-| **普通用户 (`user`)** | `user@nexus.local` | `user123` | **普通用户**：初始绑定 `轻量标准版 (BGP)` 与 `标准角色`，仅可使用已授权的隧道创建转发规则 |
+- 管理员邮箱取自 `NEXUS_ADMIN_EMAIL`（默认 `admin@nexus.local`），密码取自 `NEXUS_ADMIN_PASSWORD`（8–72 位）。
+- 未设置 `NEXUS_ADMIN_PASSWORD` 时会生成随机强密码，并**仅在首次启动日志中打印一次**，请登录后立即通过右上角「修改密码」更换。
+- 修改密码、调整角色或封禁用户后，该用户此前签发的所有登录令牌会立即失效。
+- 公开注册默认**关闭**，如需开放请在「系统设置」中手动开启。
+- 本地体验可设置 `NEXUS_SEED_DEMO=true` 生成演示节点/隧道/普通用户（普通用户密码取自 `NEXUS_DEMO_USER_PASSWORD`，未设置则随机生成并打印），**生产环境请勿开启**。
+
+---
+
+### 2.6 主控端环境变量与安全配置
+
+| 变量 / 参数 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `NEXUS_LISTEN` / `-listen` | HTTP 监听地址 | `:8080` |
+| `NEXUS_DB_DRIVER` / `-db-driver` | `sqlite` / `postgres` / `mysql` | `sqlite` |
+| `NEXUS_DB_DSN` / `-db-dsn` | 数据库连接串 | `nexus_panel.db` |
+| `NEXUS_DATA_DIR` / `-data-dir` | 持久化密钥目录（JWT 密钥文件 `jwt_secret.key`） | SQLite 数据库所在目录 |
+| `NEXUS_JWT_SECRET` | JWT 签名密钥（≥32 字符）；不设置时自动生成并持久化，重启后登录不失效 | 自动生成 |
+| `NEXUS_PUBLIC_URL` / `-public-url` | 面板对外 HTTPS 地址，用于生成节点安装命令（`wss://` 控制通道） | 按请求 Host 推断 |
+| `NEXUS_STATIC_DIR` / `-static-dir` | 存放 `install-agent.sh` 与 `releases/` 二进制的目录 | `./deploy` |
+| `NEXUS_WEB_DIR` / `-web-dir` | 前端构建产物目录 | `./web/dist` |
+| `NEXUS_TRUSTED_PROXIES` | 受信任的反向代理 IP/CIDR（逗号分隔），仅信任这些来源的 `X-Forwarded-For` | 不信任任何代理 |
+| `NEXUS_CORS_ORIGINS` | 允许跨域访问的前端源（逗号分隔）；同域部署无需设置 | 关闭跨域 |
+| `NEXUS_ADMIN_EMAIL` / `NEXUS_ADMIN_PASSWORD` | 首次启动创建的管理员账号 | 见 2.5 节 |
+| `NEXUS_ALLOW_PRIVATE_TARGETS` | 允许规则目标为内网地址（需同时在节点开启，见 Q2） | `false` |
+| `NEXUS_SEED_DEMO` / `NEXUS_DEMO_USER_PASSWORD` | 生成演示数据（仅测试用） | `false` |
+
+> [!WARNING]
+> 生产环境务必使用 **HTTPS**：节点控制通道（`wss://`）与安装脚本下载都依赖它防止中间人篡改。面板通过 HTTP 访问时，生成的安装命令会附带 `--allow-insecure-ws` 并在界面中给出风险提示。
 
 ---
 
@@ -171,20 +219,23 @@ server {
 
 ### 3.2 第二步：获取对接命令并部署 Agent
 
-节点创建后，在「节点管理」列表中点击该节点右侧的 **「对接」** 按钮，面板会自动生成带专属 `Node ID` 与 `HMAC Secret Token` 的一键安装与卸载命令。支持 **Systemd 服务（推荐）** 和 **Docker 容器** 两种部署方式：
+节点创建后，在「节点管理」列表中点击该节点右侧的 **「对接」** 按钮，面板会自动生成带专属 `Node ID`、`HMAC Secret Token`（32 字节随机）与 Agent 二进制 `SHA-256` 校验值的一键安装与卸载命令（**请直接复制面板生成的命令**，以下仅为格式示例）。支持 **Systemd 服务（推荐）** 和 **Docker 容器** 两种部署方式：
 
 #### 方式 A：Systemd 系统服务部署（推荐，支持 `nftables` 内核转发与进程级端口统计）
 
 - **一键安装命令**（在目标节点服务器上以 `root` 执行）：
   ```bash
-  curl -fsSL http://<主控IP或域名>:8080/deploy/install-agent.sh | sudo bash -s -- \
-    --master "ws://<主控IP或域名>:8080/api/v1/agent/ws" \
+  curl -fsSL 'https://panel.example.com/deploy/install-agent.sh' | sudo bash -s -- \
+    --panel 'https://panel.example.com' \
+    --master 'wss://panel.example.com/api/v1/agent/ws' \
     --id 1 \
-    --token "<面板生成的节点专属Token>"
+    --token '<面板生成的节点专属Token>' \
+    --sha256-amd64 <面板计算的校验值> --sha256-arm64 <面板计算的校验值>
   ```
-- **一键卸载命令**（自动停止服务、清理 `/etc/nexus-agent` 快照与 `nftables` 内核规则表）：
+  > 安装脚本会校验下载的 Agent 二进制 SHA-256，校验失败即中止；配置写入 `/etc/nexus-agent/agent.env`（权限 `0600`），运行状态保存在 `/var/lib/nexus-agent`（权限 `0700`）。
+- **一键卸载命令**（自动停止服务、清理 `/etc/nexus-agent`、`/var/lib/nexus-agent` 与 `nftables` 内核规则表）：
   ```bash
-  curl -fsSL http://<主控IP或域名>:8080/deploy/install-agent.sh | sudo bash -s -- --uninstall
+  curl -fsSL 'https://panel.example.com/deploy/install-agent.sh' | sudo bash -s -- --uninstall
   ```
 - **常用服务管理命令**：
   ```bash
@@ -198,19 +249,41 @@ server {
 
 #### 方式 B：Docker Host 网络容器部署
 
+- **先在节点上构建本地镜像**（项目不依赖任何第三方镜像仓库，避免镜像被冒名替换）：
+  ```bash
+  git clone https://github.com/huge1225/zachary-panel.git && cd zachary-panel
+  docker build -f deploy/Dockerfile.agent -t zachary-panel-agent:latest .
+  ```
 - **一键安装命令**（必须使用 `--net=host` 与 `--cap-add=NET_ADMIN`）：
   ```bash
   docker run -d --name nexus-agent-1 --restart always \
     --net=host --cap-add=NET_ADMIN \
-    -e NEXUS_MASTER_URL="ws://<主控IP或域名>:8080/api/v1/agent/ws" \
+    -v nexus-agent-1:/var/lib/nexus-agent -e NEXUS_STATE_DIR=/var/lib/nexus-agent \
+    -e NEXUS_MASTER_URL='wss://panel.example.com/api/v1/agent/ws' \
     -e NEXUS_NODE_ID=1 \
     -e NEXUS_NODE_TOKEN="<面板生成的节点专属Token>" \
-    ghcr.io/huge1225/zachary-panel-agent:latest
+    zachary-panel-agent:latest
   ```
 - **一键卸载命令**：
   ```bash
   docker stop nexus-agent-1 && docker rm -v nexus-agent-1
   ```
+
+#### Agent 启动参数
+
+| 参数 / 环境变量 | 说明 |
+| :--- | :--- |
+| `-master` / `NEXUS_MASTER_URL` | **必填**，主控 WebSocket 地址，生产环境必须为 `wss://` |
+| `-id` / `NEXUS_NODE_ID` | **必填**，节点 ID |
+| `-token` / `NEXUS_NODE_TOKEN` | **必填**，节点密钥（至少 16 位） |
+| `-state-dir` / `NEXUS_STATE_DIR` | 私有状态目录（规则快照、隧道 TLS 证书、引擎配置），默认 `/var/lib/nexus-agent` |
+| `-allow-insecure-ws` / `NEXUS_ALLOW_INSECURE_WS` | 允许连接非本机的 `ws://` 主控（明文，不推荐） |
+| `-allow-private-targets` / `NEXUS_ALLOW_PRIVATE_TARGETS` | 允许转发到内网地址（默认禁止，防 SSRF） |
+| `-master-pin-sha256` / `NEXUS_MASTER_PIN_SHA256` | 可选，固定主控 TLS 证书指纹 |
+| `-min-port` / `-max-conns-per-ip` / `-report-interval` | 最小监听端口（默认 1024）/ 单 IP 并发上限 / 上报间隔 |
+
+> [!NOTE]
+> 引擎能力差异：规则限速与单 IP 并发上限在 `native` 引擎下完整生效；`nftables` 支持按规则限速（内核 `limit`），不支持单 IP 并发上限；`gost` / `realm` 为外部进程，面板的限速与单 IP 并发上限对其**不生效**。需要严格执行套餐带宽的线路请选择 `native` 或 `nftables`。
 
 ---
 
@@ -221,7 +294,7 @@ server {
    - **规则变更推送（`0 延迟实时下发`）**：新增、编辑、暂停、删除规则或调整角色权限时，主控通过 WebSocket 实时推送经 `HMAC-SHA256` 签名的指令帧到对应节点。
    - **全量状态对账（`60 秒/次`）**：主控后台每 60 秒执行一次配额巡检与在线节点全量规则哈希对账（`ReconcileAllOnlineNodes`）。
 2. **服务重启规则自愈（双重保障）**：
-   - **本地持久化快照秒级恢复**：Agent 每次接收规则变更都会原子写入本地快照（`/etc/nexus-agent/rules-snapshot.json` 或 `/tmp/nexus-agent-state/rules-snapshot.json`）。当服务器重启或 `nexus-agent` 进程重启时，Agent 启动第一件事即调用 `RestoreSnapshot` 立即拉起所有转发规则，**即使此时主控端短暂离线也不影响转发业务恢复**。
+   - **本地持久化快照秒级恢复**：Agent 每次接收规则变更都会原子写入本地快照（`<state-dir>/rules-snapshot.json`，默认 `/var/lib/nexus-agent/rules-snapshot.json`，权限 `0600`）。当服务器重启或 `nexus-agent` 进程重启时，Agent 启动第一件事即调用 `RestoreSnapshot` 立即拉起所有转发规则，**即使此时主控端短暂离线也不影响转发业务恢复**。
    - **主控重连全量重同步 + 手动一键同步**：Agent 重连上主控 WebSocket 的瞬间，主控会自动下发最新全量启用规则；管理员也可随时在「节点管理」点击 **「同步」** 按钮强制重启并同步该节点的所有规则。
 
 ---
@@ -251,10 +324,10 @@ server {
 3. **转发方式**：推荐选择 `gost` 或 `native`。
 4. **入口节点**：选择国内入口节点（如 `广州入口 #1`）。
 5. **出口节点**：选择境外/落地出口节点（如 `香港出口 #2`）。
-6. **传输协议**：支持选择 `TLS`、`WSS`、`WS`、`QUIC`。
+6. **传输协议**：支持选择 `TLS`、`WSS`、`WS`、`QUIC`（`native` 引擎下统一使用经证书校验的 TLS 加密；`realm` / `nftables` 不具备隧道加密能力，加密隧道会自动改用 `native`）。
    - **自动化双端编排说明**：当用户在该加密隧道下创建一条转发规则时，主控 `Orchestrator` 会自动完成两步下发：
-     1. 在 **出口节点** 自动分配中继监听端口并生成 `32字节随机隧道密钥`（启用 `40-Byte HMAC` 首包防探测校验，任何未授权扫描器连接出口端口将被静默丢弃）；
-     2. 在 **入口节点** 自动配置加密客户端对接出口节点的 `server_ip:中继端口`，实现零手工干预的双端加密链路闭合。
+     1. 在 **出口节点** 自动分配中继监听端口并生成 `32 字节随机隧道密钥`；出口节点使用自身持久化的 TLS 证书提供服务，并对首包做 HMAC 鉴权（含时间戳与随机数防重放），未授权连接将被静默丢弃；
+     2. 在 **入口节点** 自动配置加密客户端对接出口节点的 `server_ip:中继端口`，并**固定校验出口节点上报的证书**（出口节点尚未上线上报证书前，入口侧会拒绝建立隧道），实现零手工干预的双端加密链路闭合。
 
 ---
 
@@ -354,13 +427,16 @@ sequenceDiagram
 ## 七、 常见运维排障 (FAQ)
 
 ### Q1：节点执行安装命令后，面板上状态仍显示「离线」？
-1. 检查主控端防火墙/安全组是否放行了 `8080/tcp` 端口。
+1. 检查主控端防火墙/安全组是否放行了 HTTPS（`443/tcp`，或您直接暴露的面板端口）。
 2. 若主控配置了 Nginx 反代，请确认已配置 `proxy_set_header Upgrade $http_upgrade;` 与 `Connection "upgrade";`（详见 [2.4 节](#24-配置-nginx-反向代理启用-https-与-wss)）。
 3. 检查节点与主控的系统时间误差是否在 **$\pm 60$ 秒以内**（Agent 与 Master 采用 `HMAC-SHA256` + 时间戳防重放校验，建议在服务器开启 `chrony` 或 `systemd-timesyncd` 自动同步 NTP 时间）。
 
 ### Q2：用户在「转发管理」保存规则时提示「目标地址被安全策略拦截 (SSRF)」？
 - 为防止恶意用户利用转发节点扫描内网或读取云厂商元数据（`169.254.169.254`），Agent 默认开启了严格的 `SafeDialTCP` 内网段拦截。
-- 若您处于纯内网专线环境、确实需要转发至 `10.x.x.x` / `192.168.x.x` 等私有地址，可在节点 `/etc/nexus-agent/agent.env` 中将 `NEXUS_ALLOW_PRIVATE_TARGETS=true` 开启后执行 `systemctl restart nexus-agent`。
+- 若您处于纯内网专线环境、确实需要转发至 `10.x.x.x` / `192.168.x.x` 等私有地址，需**同时**：
+  1. 在主控端设置环境变量 `NEXUS_ALLOW_PRIVATE_TARGETS=true` 并重启面板；
+  2. 在节点 `/etc/nexus-agent/agent.env` 中设置 `NEXUS_ALLOW_PRIVATE_TARGETS=true` 后执行 `systemctl restart nexus-agent`。
+- 无论是否开启，域名目标都会先解析并固定为通过安全校验的 IP，防止 DNS 重绑定绕过。
 
 ### Q3：修改了某个角色的可用隧道后，需要手动去暂停用户的旧规则吗？
 - **不需要**。当管理员在「角色管理」中取消勾选某条隧道并保存时，系统会自动遍历所有绑定该角色的套餐与用户，收回对应隧道权限，并将这些用户在被移除隧道上的存量运行中规则**自动切换为暂停状态、同步从 Agent 节点卸载**。

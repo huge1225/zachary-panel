@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"nexus-panel/internal/agent/security"
 	"nexus-panel/pkg/protocol"
 )
 
@@ -25,11 +25,10 @@ type RealmEngine struct {
 	cancel     context.CancelFunc
 }
 
-func NewRealmEngine() *RealmEngine {
+// NewRealmEngine creates the realm driver. workDir must be a private (0700) directory owned by the agent.
+func NewRealmEngine(workDir string) *RealmEngine {
 	bin, _ := exec.LookPath("realm")
-	cfgDir := filepath.Join(os.TempDir(), "nexus-agent-realm")
-	_ = os.MkdirAll(cfgDir, 0700)
-	_ = os.Chmod(cfgDir, 0700)
+	cfgDir := workDir
 	return &RealmEngine{
 		binPath:    bin,
 		configPath: filepath.Join(cfgDir, "realm-config.json"),
@@ -142,7 +141,7 @@ func (r *RealmEngine) reloadLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(r.configPath, data, 0600); err != nil {
+	if err := security.WriteFileAtomic(r.configPath, data, 0600); err != nil {
 		return err
 	}
 

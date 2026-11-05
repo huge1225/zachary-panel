@@ -25,16 +25,16 @@ const (
 type MessageType string
 
 const (
-	MsgAgentRegister  MessageType = "agent.register"   // Agent -> Master: 握手注册与上报支持的引擎
-	MsgAgentHeartbeat MessageType = "agent.heartbeat"  // Agent -> Master: 系统状态与监控心跳
-	MsgTrafficReport  MessageType = "agent.traffic"    // Agent -> Master: 规则增量流量上报
-	MsgProbeResult    MessageType = "agent.probe_res"  // Agent -> Master: 延迟/连通性探测结果
-	MsgRuleStatusAck  MessageType = "agent.rule_ack"   // Agent -> Master: 规则下发执行结果回执
+	MsgAgentRegister  MessageType = "agent.register"  // Agent -> Master: 握手注册与上报支持的引擎
+	MsgAgentHeartbeat MessageType = "agent.heartbeat" // Agent -> Master: 系统状态与监控心跳
+	MsgTrafficReport  MessageType = "agent.traffic"   // Agent -> Master: 规则增量流量上报
+	MsgProbeResult    MessageType = "agent.probe_res" // Agent -> Master: 延迟/连通性探测结果
+	MsgRuleStatusAck  MessageType = "agent.rule_ack"  // Agent -> Master: 规则下发执行结果回执
 
-	MsgSyncAllRules   MessageType = "master.sync_all"  // Master -> Agent: 全量同步转发规则
-	MsgApplyRule      MessageType = "master.apply"     // Master -> Agent: 新增或热更新单条规则
-	MsgRemoveRule     MessageType = "master.remove"    // Master -> Agent: 停止并移除单条规则
-	MsgProbeTask      MessageType = "master.probe"     // Master -> Agent: 触发目标/出口端到端探测
+	MsgSyncAllRules MessageType = "master.sync_all" // Master -> Agent: 全量同步转发规则
+	MsgApplyRule    MessageType = "master.apply"    // Master -> Agent: 新增或热更新单条规则
+	MsgRemoveRule   MessageType = "master.remove"   // Master -> Agent: 停止并移除单条规则
+	MsgProbeTask    MessageType = "master.probe"    // Master -> Agent: 触发目标/出口端到端探测
 )
 
 // Envelope wraps all Master <-> Agent messages with anti-replay Nonce and HMAC-SHA256 Signature.
@@ -47,6 +47,10 @@ type Envelope struct {
 	Payload   any         `json:"payload"`
 }
 
+// TunnelServerName is the fixed TLS server name (SAN) of every egress tunnel certificate.
+// Ingress nodes verify the egress certificate against the pinned PEM distributed by Master using this name.
+const TunnelServerName = "nexus-tunnel.internal"
+
 // AgentRegisterPayload is sent upon WebSocket connection initialization.
 type AgentRegisterPayload struct {
 	NodeID           uint64       `json:"node_id"`
@@ -54,6 +58,7 @@ type AgentRegisterPayload struct {
 	OS               string       `json:"os"`
 	Arch             string       `json:"arch"`
 	SupportedEngines []EngineType `json:"supported_engines"`
+	TunnelCertPEM    string       `json:"tunnel_cert_pem,omitempty"` // 本节点作为出口时使用的隧道 TLS 证书 (公钥部分)
 }
 
 // AgentHeartbeatPayload reports live node probe metrics (CPU, Memory, Disk, Load, Network, Connections) to the Master.
@@ -80,19 +85,20 @@ type AgentHeartbeatPayload struct {
 
 // TargetEndpoint represents an upstream destination and its weight/priority.
 type TargetEndpoint struct {
-	Address  string `json:"address"`            // IP:Port or Domain:Port
-	Weight   int    `json:"weight,omitempty"`   // 权重
-	Backup   bool   `json:"backup,omitempty"`   // 是否为主备模式下的备用节点
+	Address string `json:"address"`          // IP:Port or Domain:Port
+	Weight  int    `json:"weight,omitempty"` // 权重
+	Backup  bool   `json:"backup,omitempty"` // 是否为主备模式下的备用节点
 }
 
 // TunnelConfig holds parameters for encrypted/dedicated tunnel transport between Ingress and Egress.
 type TunnelConfig struct {
-	Transport   string `json:"transport"`              // "raw" | "tls" | "ws" | "wss" | "quic" | "custom"
-	SecretKey   string `json:"secret_key,omitempty"`   // 隧道握手机密令牌或预共享密钥
-	SNI         string `json:"sni,omitempty"`          // TLS 伪装域名
-	WSPath      string `json:"ws_path,omitempty"`      // WebSocket 路径
-	EnableMux   bool   `json:"enable_mux,omitempty"`   // 多路复用减少握手延迟
-	ProxyProto  int    `json:"proxy_proto,omitempty"`  // 0: 关闭, 1: v1, 2: v2
+	Transport  string `json:"transport"`             // "raw" | "tls" | "ws" | "wss" | "quic" | "custom" (底层统一走经校验的 TLS 加密)
+	SecretKey  string `json:"secret_key,omitempty"`  // 隧道握手机密令牌或预共享密钥
+	SNI        string `json:"sni,omitempty"`         // TLS 伪装域名
+	WSPath     string `json:"ws_path,omitempty"`     // WebSocket 路径
+	EnableMux  bool   `json:"enable_mux,omitempty"`  // 多路复用减少握手延迟
+	ProxyProto int    `json:"proxy_proto,omitempty"` // 0: 关闭, 1: v1, 2: v2
+	CertPEM    string `json:"cert_pem,omitempty"`    // 出口节点隧道证书 (入口节点据此做证书固定校验)
 }
 
 // RuleSpec describes a single runtime rule dispatched to an Agent (either Relay, Ingress, or Egress).

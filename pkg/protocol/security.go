@@ -119,9 +119,9 @@ func computeHMAC(msgType MessageType, ts int64, nonce string, rawPayload []byte,
 
 // ReplayGuard maintains a sliding window of seen nonces to reject replayed frames.
 type ReplayGuard struct {
-	mu      sync.Mutex
-	seen    map[string]int64
-	lastGC  int64
+	mu     sync.Mutex
+	seen   map[string]int64
+	lastGC int64
 }
 
 func NewReplayGuard() *ReplayGuard {

@@ -8,10 +8,24 @@ services:
     container_name: nexus-master
     restart: always
     ports:
-      - "8080:8080"
+      # 建议只监听本机，由 Nginx/Caddy 等反向代理提供 HTTPS 后对外暴露
+      - "127.0.0.1:8080:8080"
     environment:
       - NEXUS_LISTEN=:8080
       - NEXUS_DB_DRIVER=sqlite
       - NEXUS_DB_DSN=/data/nexus_panel.db
+      # 面板对外访问地址（必须是 https，用于生成 Agent 安装命令与 wss 控制通道）
+      - NEXUS_PUBLIC_URL=https://panel.example.com
+      # 反向代理地址（逗号分隔 IP/CIDR）。只有来自这些地址的 X-Forwarded-For 才会被信任
+      - NEXUS_TRUSTED_PROXIES=172.16.0.0/12
+      # 首次启动创建的管理员账号；不设置密码时会随机生成并仅在日志中打印一次
+      - NEXUS_ADMIN_EMAIL=admin@example.com
+      # - NEXUS_ADMIN_PASSWORD=请替换为至少8位的强密码
+      # JWT 签名密钥（≥32 字符）。不设置时自动生成并持久化到 /data/jwt_secret.key
+      # - NEXUS_JWT_SECRET=
     volumes:
-      - ./data:/data
+      # 命名卷（容器以非 root 用户 10001 运行，命名卷会自动设置正确属主）
+      - zachary-data:/data
+
+volumes:
+  zachary-data:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -15,11 +16,15 @@ import (
 // It never alters packet routing (accept policy only), so Realm and GOST run at full native speed
 // while the Agent still harvests exact per-port Upload / Download byte deltas.
 type PortTrafficCounter struct {
-	mu        sync.Mutex
-	nftBin    string
-	ports     map[string]int   // ruleKey -> listenPort
-	lastUp    map[string]int64 // ruleKey -> cumulative upload bytes
-	lastDown  map[string]int64 // ruleKey -> cumulative download bytes
+	mu       sync.Mutex
+	nftBin   string
+	ports    map[string]int   // ruleKey -> listenPort
+	lastUp   map[string]int64 // ruleKey -> cumulative upload bytes
+	lastDown map[string]int64 // ruleKey -> cumulative download bytes
+	// carryReady is set once this process has built the table. The accounting table survives agent restarts, and
+	// counters left by a previous process must not be carried (lastUp/lastDown start empty, so they would be
+	// reported and billed again).
+	carryReady bool
 }
 
 var sharedPortCounter = newPortTrafficCounter()
@@ -63,21 +68,34 @@ func (c *PortTrafficCounter) syncNftTableLocked() {
 	if c.nftBin == "" {
 		return
 	}
+	// Carry over the current cumulative counters: the table is rebuilt on every rule change and must never reset
+	// billing for other rules on this node. The carried total is placed on the tcp rule (tcp+udp are summed on read).
+	state := nftCounterState{}
+	if c.carryReady {
+		state = nftCounterState(readNftCounters(c.nftBin, "nexus_acct"))
+	}
+	keys := make([]string, 0, len(c.ports))
+	for k := range c.ports {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	var sb strings.Builder
 	sb.WriteString("table inet nexus_acct {}\n")
 	sb.WriteString("flush table inet nexus_acct\n")
 	sb.WriteString("table inet nexus_acct {\n")
 	sb.WriteString("  chain input {\n")
 	sb.WriteString("    type filter hook input priority -150; policy accept;\n")
-	for key, port := range c.ports {
-		sb.WriteString(fmt.Sprintf("    tcp dport %d counter comment \"acct_up:%s\"\n", port, key))
+	for _, key := range keys {
+		port := c.ports[key]
+		sb.WriteString(fmt.Sprintf("    tcp dport %d %s comment \"acct_up:%s\"\n", port, counterExpr(state, "acct_up:"+key), key))
 		sb.WriteString(fmt.Sprintf("    udp dport %d counter comment \"acct_up:%s\"\n", port, key))
 	}
 	sb.WriteString("  }\n")
 	sb.WriteString("  chain output {\n")
 	sb.WriteString("    type filter hook output priority -150; policy accept;\n")
-	for key, port := range c.ports {
-		sb.WriteString(fmt.Sprintf("    tcp sport %d counter comment \"acct_down:%s\"\n", port, key))
+	for _, key := range keys {
+		port := c.ports[key]
+		sb.WriteString(fmt.Sprintf("    tcp sport %d %s comment \"acct_down:%s\"\n", port, counterExpr(state, "acct_down:"+key), key))
 		sb.WriteString(fmt.Sprintf("    udp sport %d counter comment \"acct_down:%s\"\n", port, key))
 	}
 	sb.WriteString("  }\n")
@@ -87,7 +105,9 @@ func (c *PortTrafficCounter) syncNftTableLocked() {
 	cmd.Stdin = strings.NewReader(sb.String())
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	_ = cmd.Run()
+	if cmd.Run() == nil {
+		c.carryReady = true
+	}
 }
 
 // HarvestDeltas queries the kernel accounting table and returns incremental (uploadDelta, downloadDelta) per ruleKey.

@@ -11,33 +11,37 @@ import (
 	"sync"
 	"time"
 
+	"nexus-panel/internal/agent/security"
 	"nexus-panel/pkg/protocol"
 )
 
 type gostRuleProcess struct {
 	spec       protocol.RuleSpec
 	configPath string
+	caPath     string
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
 }
 
 // GostEngine drives external `gost` (GOST v3) binary processes for rules configured with EngineGost.
-// It supports rich multi-hop encrypted tunnels (ws, wss, tls, quic, kcp, relay).
+// Tunnel transports are always TLS-based (tls / wss / quic) with certificate verification against the
+// Egress certificate pinned by Master.
 type GostEngine struct {
 	mu      sync.RWMutex
 	binPath string
 	workDir string
+	cert    *security.TunnelCert
 	procs   map[string]*gostRuleProcess
 }
 
-func NewGostEngine() *GostEngine {
+// NewGostEngine creates the gost driver. workDir must be a private (0700) directory; cert is the node's tunnel
+// identity used when acting as an Egress (may be nil, in which case Egress tunnel rules are rejected).
+func NewGostEngine(workDir string, cert *security.TunnelCert) *GostEngine {
 	bin, _ := exec.LookPath("gost")
-	workDir := filepath.Join(os.TempDir(), "nexus-agent-gost")
-	_ = os.MkdirAll(workDir, 0700)
-	_ = os.Chmod(workDir, 0700)
 	return &GostEngine{
 		binPath: bin,
 		workDir: workDir,
+		cert:    cert,
 		procs:   make(map[string]*gostRuleProcess),
 	}
 }
@@ -62,16 +66,33 @@ func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) erro
 	if !g.Available() {
 		return fmt.Errorf("gost binary not found in PATH")
 	}
+	if g.workDir == "" {
+		return fmt.Errorf("gost work directory not configured")
+	}
 	key := RuleKey(spec.RuleID, spec.Role)
 	_ = g.RemoveRule(key, spec.RuleID, spec.Role)
 
-	cfgData, err := g.buildGostConfig(spec)
+	caPath := ""
+	if spec.Role == protocol.RoleIngress && spec.Tunnel != nil {
+		if err := security.ValidateTunnelCertPEM(spec.Tunnel.CertPEM); err != nil {
+			return fmt.Errorf("rule %s: egress tunnel certificate unavailable: %w", key, err)
+		}
+		caPath = filepath.Join(g.workDir, fmt.Sprintf("gost-rule-%d-%s-ca.pem", spec.RuleID, spec.Role))
+		if err := security.WriteFileAtomic(caPath, []byte(spec.Tunnel.CertPEM), 0600); err != nil {
+			return err
+		}
+	}
+
+	cfgData, err := g.buildGostConfig(spec, caPath)
 	if err != nil {
+		if caPath != "" {
+			_ = os.Remove(caPath)
+		}
 		return err
 	}
 
 	cfgFile := filepath.Join(g.workDir, fmt.Sprintf("gost-rule-%d-%s.json", spec.RuleID, spec.Role))
-	if err := os.WriteFile(cfgFile, cfgData, 0600); err != nil {
+	if err := security.WriteFileAtomic(cfgFile, cfgData, 0600); err != nil {
 		return err
 	}
 
@@ -85,6 +106,7 @@ func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) erro
 	proc := &gostRuleProcess{
 		spec:       spec,
 		configPath: cfgFile,
+		caPath:     caPath,
 		cmd:        cmd,
 		cancel:     cancel,
 	}
@@ -130,8 +152,21 @@ func (g *GostEngine) superviseProcess(ctx context.Context, key string, proc *gos
 	}
 }
 
-// buildGostConfig generates a GOST v3 JSON configuration for Relay, Ingress (chain -> relay+tls/ws/quic), or Egress.
-func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec) ([]byte, error) {
+// gostTunnelTransport maps the panel transport to an encrypted gost listener/dialer type.
+// Plaintext options ("raw", "ws", "kcp", "custom", ...) are upgraded to their TLS counterparts.
+func gostTunnelTransport(t string) string {
+	switch t {
+	case "ws", "wss":
+		return "wss"
+	case "quic":
+		return "quic"
+	default:
+		return "tls"
+	}
+}
+
+// buildGostConfig generates a GOST v3 JSON configuration for Relay, Ingress (chain -> relay+tls/wss/quic), or Egress.
+func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec, caPath string) ([]byte, error) {
 	listenAddr := fmt.Sprintf("%s:%d", spec.ListenHost, spec.ListenPort)
 	if spec.ListenHost == "" {
 		listenAddr = fmt.Sprintf(":%d", spec.ListenPort)
@@ -146,14 +181,18 @@ func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec) ([]byte, error) {
 	}
 
 	handlerType := "tcp"
-	listenerType := "tcp"
+	listenerMap := map[string]any{"type": "tcp"}
 	if spec.Role == protocol.RoleEgress && spec.Tunnel != nil {
+		if g.cert == nil {
+			return nil, fmt.Errorf("local tunnel certificate unavailable, refusing to start egress")
+		}
 		handlerType = "relay"
-		switch spec.Tunnel.Transport {
-		case "ws", "wss", "tls", "quic", "kcp":
-			listenerType = spec.Tunnel.Transport
-		default:
-			listenerType = "tls"
+		listenerMap = map[string]any{
+			"type": gostTunnelTransport(spec.Tunnel.Transport),
+			"tls": map[string]any{
+				"certFile": g.cert.CertFile,
+				"keyFile":  g.cert.KeyFile,
+			},
 		}
 	}
 
@@ -169,15 +208,15 @@ func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec) ([]byte, error) {
 		"name":     fmt.Sprintf("rule-%d-%s", spec.RuleID, spec.Role),
 		"addr":     listenAddr,
 		"handler":  handlerMap,
-		"listener": map[string]any{"type": listenerType},
+		"listener": listenerMap,
 	}
 
 	var chains []map[string]any
 	if spec.Role == protocol.RoleIngress && spec.Tunnel != nil {
-		dialerType := spec.Tunnel.Transport
-		if dialerType == "" || dialerType == "raw" {
-			dialerType = "tls"
+		if caPath == "" {
+			return nil, fmt.Errorf("egress tunnel certificate unavailable")
 		}
+		dialerType := gostTunnelTransport(spec.Tunnel.Transport)
 		chainName := fmt.Sprintf("chain-%d", spec.RuleID)
 		service["handler"] = map[string]any{
 			"type":  "tcp",
@@ -203,7 +242,14 @@ func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec) ([]byte, error) {
 							"name":      "egress-node",
 							"addr":      spec.Targets[0].Address,
 							"connector": connectorMap,
-							"dialer":    map[string]any{"type": dialerType},
+							"dialer": map[string]any{
+								"type": dialerType,
+								"tls": map[string]any{
+									"secure":     true,
+									"serverName": protocol.TunnelServerName,
+									"caFile":     caPath,
+								},
+							},
 						},
 					},
 				},
@@ -241,6 +287,9 @@ func (g *GostEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol.Rul
 		_ = proc.cmd.Process.Kill()
 	}
 	_ = os.Remove(proc.configPath)
+	if proc.caPath != "" {
+		_ = os.Remove(proc.caPath)
+	}
 	return nil
 }
 

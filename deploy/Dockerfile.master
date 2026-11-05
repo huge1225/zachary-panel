@@ -1,27 +1,29 @@
 # Stage 1: Build Frontend
 FROM node:20-alpine AS web-builder
 WORKDIR /build/web
-COPY web/package.json ./
+COPY web/package*.json ./
 RUN npm install
 COPY web/ ./
 RUN npm run build
 
 # Stage 2: Build Go Master & Agent Binaries
-FROM golang:1.22-alpine AS go-builder
+FROM golang:1.23-alpine AS go-builder
 RUN apk add --no-cache gcc musl-dev sqlite-dev
 WORKDIR /build
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY pkg/ ./pkg/
-RUN go mod tidy && \
-    CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o /out/nexus-master ./cmd/master && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /out/nexus-agent-linux-amd64 ./cmd/agent && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /out/nexus-agent-linux-arm64 ./cmd/agent
+RUN CGO_ENABLED=1 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/nexus-master ./cmd/master && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/nexus-agent-linux-amd64 ./cmd/agent && \
+    CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o /out/nexus-agent-linux-arm64 ./cmd/agent
 
 # Stage 3: Final Runtime Image
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata sqlite-libs
+RUN apk add --no-cache ca-certificates tzdata sqlite-libs && \
+    addgroup -S -g 10001 zachary && adduser -S -D -H -u 10001 -G zachary zachary && \
+    mkdir -p /data && chown zachary:zachary /data && chmod 0700 /data
 WORKDIR /app
 COPY --from=go-builder /out/nexus-master /app/nexus-master
 COPY --from=go-builder /out/nexus-agent-linux-amd64 /app/static/releases/nexus-agent-linux-amd64
@@ -29,8 +31,15 @@ COPY --from=go-builder /out/nexus-agent-linux-arm64 /app/static/releases/nexus-a
 COPY --from=web-builder /build/web/dist /app/web/dist
 COPY deploy/install-agent.sh /app/static/install-agent.sh
 
+ENV NEXUS_STATIC_DIR=/app/static \
+    NEXUS_WEB_DIR=/app/web/dist \
+    NEXUS_DATA_DIR=/data
+
+# 以非 root 用户运行；/data 使用命名卷时会自动继承上面的属主。
+# 若改用宿主机目录挂载，请先执行: mkdir -p ./data && sudo chown 10001:10001 ./data
+USER 10001:10001
 VOLUME ["/data"]
 EXPOSE 8080
 
 ENTRYPOINT ["/app/nexus-master"]
-CMD ["-listen", ":8080", "-db", "/data/nexus_panel.db"]
+CMD ["-listen", ":8080", "-db-dsn", "/data/nexus_panel.db"]

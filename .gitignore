@@ -24,3 +24,8 @@ deploy/data/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Agent release binaries & master secrets
+deploy/releases/
+jwt_secret.key
+web/*.tsbuildinfo

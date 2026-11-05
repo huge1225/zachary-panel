@@ -146,6 +146,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers,
   })
   const data = await res.json().catch(() => ({}))
+  if (res.status === 401 && token && !path.startsWith('/auth/')) {
+    // Token expired or revoked (e.g. password changed elsewhere): drop it and return to the login page.
+    localStorage.removeItem('nexus_token')
+    window.dispatchEvent(new CustomEvent('nexus-unauthorized'))
+  }
   if (!res.ok) {
     throw new Error(data.error || `HTTP ${res.status}`)
   }
@@ -159,6 +164,12 @@ export const api = {
     request<{ token: string; user: User }>('/auth/login', {
       method: 'POST',
       body: JSON.stringify({ email, password }),
+    }),
+
+  changePassword: (oldPassword: string, newPassword: string) =>
+    request<{ message: string; token: string }>('/user/password', {
+      method: 'POST',
+      body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
     }),
 
   register: (email: string, password: string) =>
@@ -308,7 +319,8 @@ export const api = {
       systemd_uninstall: string
       docker_install: string
       docker_uninstall: string
-      direct_run: string
+      direct_run?: string
+      warnings?: string[]
       sync_policy: {
         heartbeat_traffic_sec: number
         rule_dispatch: string

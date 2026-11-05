@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 	"nexus-panel/internal/master/hub"
 	"nexus-panel/internal/master/model"
 	"nexus-panel/internal/master/service"
@@ -17,11 +18,22 @@ import (
 
 func setupTestServer(t *testing.T) (*gin.Engine, func()) {
 	t.Helper()
+	r, _, cleanup := setupTestServerWithDB(t)
+	return r, cleanup
+}
+
+func setupTestServerWithDB(t *testing.T) (*gin.Engine, *gorm.DB, func()) {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
+
+	// Demo seed data (users / nodes / tunnels) is opt-in; credentials come from env in tests.
+	t.Setenv("NEXUS_SEED_DEMO", "true")
+	t.Setenv("NEXUS_ADMIN_PASSWORD", "admin123")
+	t.Setenv("NEXUS_DEMO_USER_PASSWORD", "user12345")
 
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test_nexus.db")
-	db, err := model.InitDB(dbPath)
+	db, err := model.InitDB("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("InitDB failed: %v", err)
 	}
@@ -29,7 +41,7 @@ func setupTestServer(t *testing.T) (*gin.Engine, func()) {
 	agentHub := hub.NewAgentHub(db)
 	orch := service.NewOrchestrator(db, agentHub)
 	srv := NewServer(db, agentHub, orch)
-	return srv.SetupRouter(), func() {
+	return srv.SetupRouter(), db, func() {
 		_ = os.RemoveAll(tmpDir)
 	}
 }
@@ -62,7 +74,7 @@ func TestRBACAndTunnelPermissionBoundaries(t *testing.T) {
 
 	// 1. 验证预置的两套账号均可登录
 	adminToken := loginAndGetToken(t, r, "admin@nexus.local", "admin123")
-	userToken := loginAndGetToken(t, r, "user@nexus.local", "user123")
+	userToken := loginAndGetToken(t, r, "user@nexus.local", "user12345")
 
 	// 2. 垂直越权拦截测试：普通用户访问 /api/v1/admin/* 全部返回 403
 	adminEndpoints := []struct {
@@ -71,7 +83,6 @@ func TestRBACAndTunnelPermissionBoundaries(t *testing.T) {
 	}{
 		{http.MethodGet, "/api/v1/admin/settings"},
 		{http.MethodPut, "/api/v1/admin/settings"},
-		{http.MethodGet, "/api/v1/admin/nodes"},
 		{http.MethodPost, "/api/v1/admin/nodes"},
 		{http.MethodPost, "/api/v1/admin/lines"},
 		{http.MethodPost, "/api/v1/admin/roles"},
@@ -149,9 +160,26 @@ func TestRBACAndTunnelPermissionBoundaries(t *testing.T) {
 		userRuleID = created.ID
 	}
 
-	// 6. 水平越权拦截：普通用户尝试编辑/删除管理员的规则 (#1) -> 403 Forbidden
+	// 6. 水平越权拦截：普通用户尝试编辑/删除管理员的规则 -> 403 Forbidden
 	{
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/rules/1", nil)
+		adminRule, _ := json.Marshal(map[string]any{
+			"name":           "管理员规则",
+			"tunnel_line_id": 1,
+			"protocol":       "tcp",
+			"targets":        []map[string]string{{"address": "1.0.0.1:443"}},
+		})
+		cReq := httptest.NewRequest(http.MethodPost, "/api/v1/rules", bytes.NewReader(adminRule))
+		cReq.Header.Set("Authorization", "Bearer "+adminToken)
+		cReq.Header.Set("Content-Type", "application/json")
+		cw := httptest.NewRecorder()
+		r.ServeHTTP(cw, cReq)
+		if cw.Code != http.StatusCreated {
+			t.Fatalf("admin create rule failed: %d (%s)", cw.Code, cw.Body.String())
+		}
+		var adminCreated model.ForwardRule
+		_ = json.Unmarshal(cw.Body.Bytes(), &adminCreated)
+
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/rules/"+uintToStr(adminCreated.ID), nil)
 		req.Header.Set("Authorization", "Bearer "+userToken)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)

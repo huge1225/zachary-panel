@@ -22,7 +22,10 @@
    - 实时采集节点 CPU、内存、磁盘容量与负载，支持设置节点月度流量封顶并在超额时自动熔断。
    - **断线重连与规则持久化自愈**：节点或主控重启后自动下发全量活跃规则快照，毫秒级无感恢复转发进程。
 3. **双端加密专线编排（Relay Line）**
-   - 创建一条专线规则即可由主控自动生成随机预共享密钥（`TunnelPSK`），向出口节点下发 `tunnel_server` 监听任务、向入口节点下发 `tunnel_client` 封装任务，并按隧道倍率自动折算计费流量。
+   - 创建一条专线规则即可由主控自动生成 32 字节随机隧道密钥，向出口节点下发 TLS 隧道监听任务、向入口节点下发加密客户端任务（固定校验出口节点证书 + HMAC 防重放鉴权，UDP 同样走加密隧道），并按隧道倍率自动折算计费流量。
+4. **安全默认值**
+   - 不内置任何固定账号密码/兑换码；首次启动的管理员密码来自环境变量或随机生成；公开注册默认关闭。
+   - JWT 密钥持久化、改密/封禁即时吊销令牌、登录限流与账号锁定、目标地址防 SSRF / DNS 重绑定、节点控制通道签名防重放。
 
 ---
 
@@ -63,25 +66,29 @@
 ```bash
 git clone https://github.com/huge1225/zachary-panel.git
 cd zachary-panel/deploy
+# 先编辑 docker-compose.yml：设置 NEXUS_PUBLIC_URL、NEXUS_ADMIN_EMAIL、NEXUS_ADMIN_PASSWORD
 docker compose up -d --build
 ```
 
 ### 方式二：源码启动
 
 #### 1. 启动主控后端 (Master)
-默认使用开箱即用的 SQLite (`nexus_panel.db`)，首次启动会自动初始化默认管理员、演示普通用户、角色权限组、订阅套餐、演示节点及双端专线：
+默认使用开箱即用的 SQLite (`nexus_panel.db`)，首次启动会自动初始化默认角色、套餐与管理员账号：
 ```bash
-go mod tidy
-go run ./cmd/master -listen :8080
+go mod download
+NEXUS_ADMIN_EMAIL=admin@example.com NEXUS_ADMIN_PASSWORD='至少8位的强密码' \
+  go run ./cmd/master -listen 127.0.0.1:8080
 ```
-- **默认管理员账号**：`admin@nexus.local` / 密码：`admin123`
-- **默认普通用户账号**：`user@nexus.local` / 密码：`user123`
-- **内置演示兑换码**：`NEXUS-VIP-2026`
+- 未设置 `NEXUS_ADMIN_PASSWORD` 时会随机生成管理员密码，并仅在首次启动日志中打印一次。
+- 本地体验可额外设置 `NEXUS_SEED_DEMO=true` 生成演示节点、隧道与普通用户（生产环境请勿开启）。
+- 全部环境变量说明见 [DEPLOYMENT_AND_USAGE.md 2.6 节](./DEPLOYMENT_AND_USAGE.md#26-主控端环境变量与安全配置)。
 
 #### 2. 启动被控节点 (Agent)
+在面板「节点管理」中新增节点，点击「对接」获取节点 ID 与 Token，然后：
 ```bash
-go run ./cmd/agent -master "ws://127.0.0.1:8080/api/v1/agent/ws" -id 1 -token "dev-node-secret"
+go run ./cmd/agent -master "ws://127.0.0.1:8080/api/v1/agent/ws" -id 1 -token "<面板生成的节点Token>"
 ```
+> 本机回环地址可直接使用 `ws://`；连接远程主控时必须使用 `wss://`（或显式加 `-allow-insecure-ws`，不推荐）。
 
 #### 3. 启动前端控制台 (Web UI)
 ```bash

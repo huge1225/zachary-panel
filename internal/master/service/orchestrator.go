@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -20,15 +21,80 @@ import (
 type Orchestrator struct {
 	db  *gorm.DB
 	hub *hub.AgentHub
+
+	// allocMu serializes quota checks, port allocation and rule persistence so that concurrent requests cannot
+	// exceed rule / port quotas or allocate the same port twice (TOCTOU).
+	allocMu sync.Mutex
 }
+
+// maxDeltaBytes caps a single reported traffic delta (per rule, per report window) to bound the impact of a
+// misbehaving Agent.
+const maxDeltaBytes int64 = 64 << 30 // 64 GiB
 
 func NewOrchestrator(db *gorm.DB, agentHub *hub.AgentHub) *Orchestrator {
 	o := &Orchestrator{
 		db:  db,
 		hub: agentHub,
 	}
-	agentHub.SetCallbacks(o.HandleTrafficReport, o.SyncNodeRules)
+	agentHub.SetCallbacks(o.HandleTrafficReport, func(nodeID uint64) { o.SyncNodeRules(nodeID) })
+	agentHub.SetCertChangedCallback(o.OnEgressCertChanged)
+	agentHub.SetAckScope(o.NodeOwnsRuleRole)
 	return o
+}
+
+// WithAllocLock runs fn while holding the allocation lock. Handlers must perform quota counting, port allocation
+// and the DB insert/update of rules inside fn, and dispatch to agents only after it returns.
+func (o *Orchestrator) WithAllocLock(fn func() error) error {
+	o.allocMu.Lock()
+	defer o.allocMu.Unlock()
+	return fn()
+}
+
+// NodeOwnsRuleRole reports whether nodeID legitimately hosts ruleID in the given role:
+//   - relay / ingress: the rule's ingress node
+//   - egress: the egress node of the rule's encrypted tunnel line
+func (o *Orchestrator) NodeOwnsRuleRole(nodeID, ruleID uint64, role protocol.RuleRole) bool {
+	var rule model.ForwardRule
+	if err := o.db.Select("id, mode, ingress_node_id, tunnel_line_id").First(&rule, ruleID).Error; err != nil {
+		return false
+	}
+	return o.ruleOwnedBy(&rule, nodeID, role)
+}
+
+func (o *Orchestrator) ruleOwnedBy(rule *model.ForwardRule, nodeID uint64, role protocol.RuleRole) bool {
+	switch role {
+	case protocol.RoleEgress:
+		if rule.Mode != "tunnel" || rule.TunnelLineID == 0 {
+			return false
+		}
+		var line model.TunnelLine
+		if err := o.db.Select("id, egress_node_id").First(&line, rule.TunnelLineID).Error; err != nil {
+			return false
+		}
+		return line.EgressNodeID == nodeID
+	case protocol.RoleIngress, protocol.RoleRelay, "":
+		return rule.IngressNodeID == nodeID
+	default:
+		return false
+	}
+}
+
+// OnEgressCertChanged re-dispatches every enabled rule on tunnel lines that use nodeID as egress so ingress nodes
+// pin the new certificate.
+func (o *Orchestrator) OnEgressCertChanged(nodeID uint64) {
+	var lineIDs []uint64
+	o.db.Model(&model.TunnelLine{}).Where("egress_node_id = ?", nodeID).Pluck("id", &lineIDs)
+	if len(lineIDs) == 0 {
+		return
+	}
+	var rules []model.ForwardRule
+	o.db.Where("tunnel_line_id IN ? AND enabled = ?", lineIDs, true).Find(&rules)
+	for i := range rules {
+		o.DispatchRule(&rules[i])
+	}
+	if len(rules) > 0 {
+		log.Printf("[Orchestrator] Egress node #%d rotated its tunnel certificate; re-dispatched %d rules", nodeID, len(rules))
+	}
 }
 
 // AllocatePortForNode finds an unused port in the node's PortRange.
@@ -139,16 +205,33 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 
 	// Ensure RelayPort and TunnelSecret are allocated
 	if rule.RelayPort <= 0 {
-		rp, err := o.AllocatePortForNode(egressNode.ID, 0)
+		err := o.WithAllocLock(func() error {
+			// Re-read under the lock in case a concurrent dispatch already allocated it.
+			var cur model.ForwardRule
+			if err := o.db.Select("id, relay_port").First(&cur, rule.ID).Error; err == nil && cur.RelayPort > 0 {
+				rule.RelayPort = cur.RelayPort
+				return nil
+			}
+			rp, err := o.AllocatePortForNode(egressNode.ID, 0)
+			if err != nil {
+				return err
+			}
+			rule.RelayPort = rp
+			return o.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("relay_port", rp).Error
+		})
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("failed to allocate egress port: %w", err)
 		}
-		rule.RelayPort = rp
-		o.db.Model(rule).Update("relay_port", rp)
 	}
 	if rule.TunnelSecret == "" {
-		rule.TunnelSecret = utils.GenerateRandomToken(16)
-		o.db.Model(rule).Update("tunnel_secret", rule.TunnelSecret)
+		rule.TunnelSecret = utils.GenerateRandomToken(32)
+		o.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("tunnel_secret", rule.TunnelSecret)
+	}
+
+	// Only native and gost implement the authenticated, certificate-pinned encrypted tunnel. Other engines would
+	// send the inter-node leg in clear text, so tunnel legs fall back to the native engine.
+	if eng != protocol.EngineNative && eng != protocol.EngineGost {
+		eng = protocol.EngineNative
 	}
 
 	egressConnectHost := egressNode.ServerIP
@@ -166,6 +249,7 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 		Transport: line.Transport,
 		SecretKey: rule.TunnelSecret,
 		SNI:       egressNode.PublicHost,
+		CertPEM:   egressNode.TunnelCertPEM,
 	}
 
 	// Egress spec: listens on RelayPort (with tunnel transport) and forwards to user's actual targets
@@ -209,6 +293,12 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 
 // DispatchRule pushes a rule's runtime specs (or removal if paused/disabled) to its Ingress and Egress Agents.
 func (o *Orchestrator) DispatchRule(rule *model.ForwardRule) {
+	// Defense in depth: never push a rule whose owner is banned / expired / over quota or lost the tunnel
+	// permission, whichever code path asked for it.
+	if rule.Enabled && !o.ownerMayRun(rule) {
+		rule = &model.ForwardRule{ID: rule.ID, UserID: rule.UserID, Mode: rule.Mode, IngressNodeID: rule.IngressNodeID,
+			TunnelLineID: rule.TunnelLineID, Engine: rule.Engine, Enabled: false}
+	}
 	if !rule.Enabled {
 		_ = o.hub.SendToNode(rule.IngressNodeID, protocol.MsgRemoveRule, protocol.RemoveRulePayload{
 			RuleID: rule.ID,
@@ -244,6 +334,15 @@ func (o *Orchestrator) DispatchRule(rule *model.ForwardRule) {
 	}
 }
 
+// ownerMayRun reports whether the rule's owner may currently have this rule deployed.
+func (o *Orchestrator) ownerMayRun(rule *model.ForwardRule) bool {
+	var u model.User
+	if err := o.db.First(&u, rule.UserID).Error; err != nil {
+		return false
+	}
+	return u.CanForward(time.Now()) && u.HasTunnelPermission(rule.TunnelLineID)
+}
+
 // RemoveRuleFromAgents tears down a deleted rule from all involved Agents.
 func (o *Orchestrator) RemoveRuleFromAgents(rule *model.ForwardRule) {
 	_ = o.hub.SendToNode(rule.IngressNodeID, protocol.MsgRemoveRule, protocol.RemoveRulePayload{
@@ -274,10 +373,26 @@ func (o *Orchestrator) SyncNodeRules(nodeID uint64, forceRestart ...bool) {
 	force := len(forceRestart) > 0 && forceRestart[0]
 	var specs []protocol.RuleSpec
 
+	// Never (re)deploy rules of banned / expired / over-quota accounts, whatever their rule status says.
+	now := time.Now()
+	canForward := map[uint64]bool{}
+	ownerOK := func(uid uint64) bool {
+		ok, seen := canForward[uid]
+		if !seen {
+			var u model.User
+			ok = o.db.First(&u, uid).Error == nil && u.CanForward(now)
+			canForward[uid] = ok
+		}
+		return ok
+	}
+
 	// 1. Rules where this node is the Ingress / Relay node
 	var ingressRules []model.ForwardRule
 	o.db.Where("ingress_node_id = ? AND enabled = ?", nodeID, true).Find(&ingressRules)
 	for i := range ingressRules {
+		if !ownerOK(ingressRules[i].UserID) {
+			continue
+		}
 		inSpec, _, _, err := o.CompileRuleSpecs(&ingressRules[i])
 		if err == nil && inSpec != nil {
 			specs = append(specs, *inSpec)
@@ -295,6 +410,9 @@ func (o *Orchestrator) SyncNodeRules(nodeID uint64, forceRestart ...bool) {
 		var tunnelRules []model.ForwardRule
 		o.db.Where("mode = 'tunnel' AND tunnel_line_id IN ? AND enabled = ?", lineIDs, true).Find(&tunnelRules)
 		for i := range tunnelRules {
+			if !ownerOK(tunnelRules[i].UserID) {
+				continue
+			}
 			_, _, egSpec, err := o.CompileRuleSpecs(&tunnelRules[i])
 			if err == nil && egSpec != nil {
 				specs = append(specs, *egSpec)
@@ -316,25 +434,38 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 	if err := o.db.First(&node, nodeID).Error; err != nil {
 		return
 	}
+	if len(report.Deltas) > 10000 {
+		log.Printf("[Orchestrator] Dropped oversized traffic report from Node #%d (%d deltas)", nodeID, len(report.Deltas))
+		return
+	}
 
 	hourBucket := time.Now().Format("2006-01-02 15:00")
 	var nodeWindowBytes int64
 
 	for _, d := range report.Deltas {
-		rawTotal := d.UploadBytes + d.DownBytes
-		if rawTotal > 0 {
-			nodeWindowBytes += rawTotal
-		}
-		// Avoid double-billing dual-end tunnel rules for user quota: only bill user on Relay or Ingress role
-		if d.Role == protocol.RoleEgress {
+		// Reject negative / absurd values outright.
+		if d.UploadBytes < 0 || d.DownBytes < 0 || d.UploadBytes > maxDeltaBytes || d.DownBytes > maxDeltaBytes {
+			log.Printf("[Orchestrator] Dropped invalid traffic delta from Node #%d for rule #%d", nodeID, d.RuleID)
 			continue
 		}
+		rawTotal := d.UploadBytes + d.DownBytes
 		if rawTotal <= 0 {
 			continue
 		}
 
 		var rule model.ForwardRule
 		if err := o.db.First(&rule, d.RuleID).Error; err != nil {
+			continue
+		}
+		// Trust boundary: a node may only report traffic for rules it actually hosts in the reported role.
+		if !o.ruleOwnedBy(&rule, nodeID, d.Role) {
+			log.Printf("[Orchestrator] Dropped out-of-scope traffic delta from Node #%d (rule #%d, role %q)", nodeID, d.RuleID, d.Role)
+			continue
+		}
+		nodeWindowBytes += rawTotal
+
+		// Avoid double-billing dual-end tunnel rules for user quota: only bill user on Relay or Ingress role
+		if d.Role == protocol.RoleEgress {
 			continue
 		}
 
@@ -355,7 +486,7 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 			}
 		}
 
-		// flux-panel style billing: one_way (单向计费: 仅统计出站流量) vs two_way (双向计费: 上行+下行)
+		// one_way (单向计费: 仅统计单方向较大值) vs two_way (双向计费: 上行+下行)
 		baseBytes := rawTotal
 		if billingMode == "one_way" {
 			baseBytes = d.DownBytes
@@ -364,6 +495,9 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 			}
 		}
 		billed := int64(math.Round(float64(baseBytes) * multiplier))
+		if billed < 0 {
+			billed = 0
+		}
 
 		// Update ForwardRule counters
 		o.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Updates(map[string]any{
@@ -401,7 +535,7 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 		// Check if user quota is now exhausted
 		var user model.User
 		if err := o.db.First(&user, rule.UserID).Error; err == nil {
-			if user.UsedBytes >= user.QuotaBytes || (!user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt)) {
+			if !user.CanForward(time.Now()) {
 				o.EnforceUserQuotaCutoff(user.ID)
 			}
 		}
@@ -428,7 +562,8 @@ func (o *Orchestrator) EnforceNodeQuotaCutoff(nodeID uint64) {
 		r := &rules[i]
 		r.Enabled = false
 		r.Status = "node_quota_exceeded"
-		o.db.Save(r)
+		// Only touch enabled/status: traffic counters are incremented concurrently by traffic reports.
+		o.db.Model(&model.ForwardRule{}).Where("id = ?", r.ID).Updates(map[string]any{"enabled": false, "status": r.Status})
 		o.DispatchRule(r)
 	}
 	if len(rules) > 0 {
@@ -451,7 +586,8 @@ func (o *Orchestrator) EnforceUserQuotaCutoff(userID uint64) {
 		r := &activeRules[i]
 		r.Enabled = false
 		r.Status = "quota_exceeded"
-		o.db.Save(r)
+		// Only touch enabled/status: traffic counters are incremented concurrently by traffic reports.
+		o.db.Model(&model.ForwardRule{}).Where("id = ?", r.ID).Updates(map[string]any{"enabled": false, "status": r.Status})
 		o.DispatchRule(r)
 	}
 	if len(activeRules) > 0 {

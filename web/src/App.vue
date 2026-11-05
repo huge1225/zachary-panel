@@ -23,8 +23,8 @@ function toggleTheme() {
 const autoRefresh = ref(true)
 
 const token = ref<string | null>(localStorage.getItem('nexus_token'))
-const emailInput = ref('admin@nexus.local')
-const passwordInput = ref('admin123')
+const emailInput = ref('')
+const passwordInput = ref('')
 const authError = ref('')
 
 const activeTab = ref<'dashboard' | 'rules' | 'lines' | 'nodes' | 'roles' | 'users' | 'store' | 'settings'>('dashboard')
@@ -42,10 +42,10 @@ const currentTabTitle = computed(() => tabTitleMap[activeTab.value] || '')
 
 const siteConfig = ref<SystemConfig>({
   id: 1,
-  site_name: 'Nexus Panel',
-  site_logo: 'NX',
+  site_name: 'Zachary Panel',
+  site_logo: 'ZP',
   announcement: '深港 IEPL 专线状态稳定，角色决定可用隧道，套餐绑定角色，用户分配套餐与角色。',
-  allow_register: true,
+  allow_register: false,
   default_quota_gb: 20,
   default_max_rules: 5,
   default_speed_mbps: 100,
@@ -302,9 +302,10 @@ const installInfo = ref<{
   systemd_uninstall: string
   docker_install: string
   docker_uninstall: string
-  direct_run: string
+  direct_run?: string
+  warnings?: string[]
 } | null>(null)
-const redeemInput = ref('NEXUS-VIP-2026')
+const redeemInput = ref('')
 
 function nodeTrafficPercent(node: NodeItem): number {
   if (!node.quota_bytes || node.quota_bytes <= 0) return 0
@@ -694,10 +695,10 @@ async function deleteUserAccount(u: User) {
 
 // --- 系统设置 (管理员) ---
 const settingsForm = ref({
-  site_name: 'Nexus Panel',
-  site_logo: 'NX',
+  site_name: 'Zachary Panel',
+  site_logo: 'ZP',
   announcement: '',
-  allow_register: true,
+  allow_register: false,
   default_quota_gb: 20,
   default_max_rules: 5,
   default_speed_mbps: 100,
@@ -710,9 +711,9 @@ function syncSettingsForm() {
     site_logo: siteConfig.value.site_logo,
     announcement: siteConfig.value.announcement,
     allow_register: siteConfig.value.allow_register,
-    default_quota_gb: siteConfig.value.default_quota_gb,
-    default_max_rules: siteConfig.value.default_max_rules,
-    default_speed_mbps: siteConfig.value.default_speed_mbps,
+    default_quota_gb: siteConfig.value.default_quota_gb ?? 20,
+    default_max_rules: siteConfig.value.default_max_rules ?? 5,
+    default_speed_mbps: siteConfig.value.default_speed_mbps ?? 100,
     default_role_group_id: siteConfig.value.default_role_group_id || rolesList.value[0]?.id || 1,
   }
 }
@@ -722,8 +723,8 @@ async function saveSystemSettings() {
   const defRole = getRoleById(settingsForm.value.default_role_group_id)
   try {
     const updated = await api.adminUpdateSettings({
-      site_name: settingsForm.value.site_name.trim() || 'Nexus Panel',
-      site_logo: settingsForm.value.site_logo.trim() || 'NX',
+      site_name: settingsForm.value.site_name.trim() || 'Zachary Panel',
+      site_logo: settingsForm.value.site_logo.trim() || 'ZP',
       announcement: settingsForm.value.announcement.trim(),
       allow_register: settingsForm.value.allow_register,
       default_quota_gb: Number(settingsForm.value.default_quota_gb) || 20,
@@ -745,29 +746,43 @@ const quotaPercent = computed(() => {
   return Math.min(100, Number(((user.value.used_bytes / user.value.quota_bytes) * 100).toFixed(1)))
 })
 
-function quickFillAccount(roleType: 'admin' | 'user') {
-  if (roleType === 'admin') {
-    emailInput.value = 'admin@nexus.local'
-    passwordInput.value = 'admin123'
-  } else {
-    emailInput.value = 'user@nexus.local'
-    passwordInput.value = 'user123'
-  }
-  handleAuth()
+// 修改密码
+const showPasswordModal = ref(false)
+const pwdForm = ref({ old: '', next: '', confirm: '' })
+const pwdError = ref('')
+
+function openPasswordModal() {
+  pwdForm.value = { old: '', next: '', confirm: '' }
+  pwdError.value = ''
+  showPasswordModal.value = true
 }
 
-function switchDemoRole() {
-  if (isAdmin.value) {
-    quickFillAccount('user')
-  } else {
-    quickFillAccount('admin')
+async function submitChangePassword() {
+  pwdError.value = ''
+  if (pwdForm.value.next.length < 8 || pwdForm.value.next.length > 72) {
+    pwdError.value = '新密码长度需为 8-72 位'
+    return
+  }
+  if (pwdForm.value.next !== pwdForm.value.confirm) {
+    pwdError.value = '两次输入的新密码不一致'
+    return
+  }
+  try {
+    const res = await api.changePassword(pwdForm.value.old, pwdForm.value.next)
+    localStorage.setItem('nexus_token', res.token)
+    token.value = res.token
+    showPasswordModal.value = false
+    showToast(res.message || '密码已修改')
+  } catch (e: any) {
+    pwdError.value = e.message || '修改失败'
   }
 }
 
 async function handleAuth() {
   authError.value = ''
   try {
-    const res = await api.login(emailInput.value, passwordInput.value)
+    const res = await api.login(emailInput.value.trim(), passwordInput.value)
+    passwordInput.value = ''
     localStorage.setItem('nexus_token', res.token)
     token.value = res.token
     user.value = res.user
@@ -791,7 +806,7 @@ async function refreshAll() {
     const cfg = await api.getSiteConfig().catch(() => null)
     if (cfg) {
       siteConfig.value = cfg
-      document.title = cfg.site_name || 'Nexus Panel'
+      document.title = cfg.site_name || 'Zachary Panel'
     }
   } catch {
     // ignore
@@ -1107,13 +1122,20 @@ function handleVisibilityChange() {
   }
 }
 
+function handleUnauthorized() {
+  logout()
+  showToast('登录已失效，请重新登录')
+}
+
 onMounted(() => {
+  window.addEventListener('nexus-unauthorized', handleUnauthorized)
   refreshAll()
   telemetryTimer = setInterval(pollTelemetryRealtime, 3000)
   document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 onUnmounted(() => {
+  window.removeEventListener('nexus-unauthorized', handleUnauthorized)
   if (telemetryTimer) clearInterval(telemetryTimer)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
@@ -1123,44 +1145,25 @@ onUnmounted(() => {
   <div>
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
 
-    <!-- 登录页：预设管理员与普通用户两套账号一键登录 -->
+    <!-- 登录页 -->
     <div
       v-if="!token"
       style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;"
     >
       <div class="card" style="width: 100%; max-width: 390px; padding: 28px;">
         <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
-          <div class="brand-logo">{{ siteConfig.site_logo || 'NX' }}</div>
-          <span style="font-size: 16px; font-weight: 600;">{{ siteConfig.site_name || 'Nexus Panel' }}</span>
-        </div>
-
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px;">
-          <button
-            @click="quickFillAccount('admin')"
-            class="btn btn-soft"
-            style="display: flex; flex-direction: column; align-items: flex-start; padding: 8px 10px; gap: 2px;"
-          >
-            <span style="font-weight: 600; font-size: 12.5px;">管理员账号</span>
-            <span style="font-size: 11px; color: var(--text-secondary);">admin@nexus.local</span>
-          </button>
-          <button
-            @click="quickFillAccount('user')"
-            class="btn btn-outline"
-            style="display: flex; flex-direction: column; align-items: flex-start; padding: 8px 10px; gap: 2px;"
-          >
-            <span style="font-weight: 600; font-size: 12.5px;">普通用户账号</span>
-            <span style="font-size: 11px; color: var(--text-secondary);">user@nexus.local</span>
-          </button>
+          <div class="brand-logo">{{ siteConfig.site_logo || 'ZP' }}</div>
+          <span style="font-size: 16px; font-weight: 600;">{{ siteConfig.site_name || 'Zachary Panel' }}</span>
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 14px;">
           <div>
             <label class="form-label">邮箱</label>
-            <input v-model="emailInput" type="email" class="input" />
+            <input v-model="emailInput" type="email" class="input" autocomplete="username" />
           </div>
           <div>
             <label class="form-label">密码</label>
-            <input v-model="passwordInput" type="password" class="input" @keyup.enter="handleAuth" />
+            <input v-model="passwordInput" type="password" class="input" autocomplete="current-password" @keyup.enter="handleAuth" />
           </div>
           <p v-if="authError" style="font-size: 12px; color: var(--danger-text);">{{ authError }}</p>
           <button @click="handleAuth" class="btn btn-primary" style="width: 100%; padding: 8px;">登录</button>
@@ -1171,9 +1174,9 @@ onUnmounted(() => {
     <div v-else class="app-shell">
       <aside class="sidebar">
         <div class="sidebar-brand">
-          <div class="brand-logo">{{ siteConfig.site_logo || 'NX' }}</div>
+          <div class="brand-logo">{{ siteConfig.site_logo || 'ZP' }}</div>
           <div class="brand-title-wrap">
-            <span class="brand-title">{{ siteConfig.site_name || 'Nexus Panel' }}</span>
+            <span class="brand-title">{{ siteConfig.site_name || 'Zachary Panel' }}</span>
             <span class="brand-subtitle">Cloud Relay OS</span>
           </div>
         </div>
@@ -1326,9 +1329,7 @@ onUnmounted(() => {
             </span>
           </div>
           <div style="display: flex; align-items: center; gap: 10px;">
-            <button @click="switchDemoRole" class="btn btn-soft btn-sm">
-              {{ isAdmin ? '切换至普通用户' : '切换至管理员' }}
-            </button>
+            <button @click="openPasswordModal" class="btn btn-soft btn-sm">修改密码</button>
             <button @click="toggleTheme" class="btn btn-outline btn-sm">{{ isDark ? '浅色' : '深色' }}</button>
             <div class="user-chip">
               <span class="user-avatar">{{ (user?.email || 'U').charAt(0) }}</span>
@@ -1968,7 +1969,7 @@ onUnmounted(() => {
               <div class="grid-2">
                 <div>
                   <label class="form-label">面板名称</label>
-                  <input v-model="settingsForm.site_name" class="input" placeholder="Nexus Panel" />
+                  <input v-model="settingsForm.site_name" class="input" placeholder="Zachary Panel" />
                 </div>
                 <div>
                   <label class="form-label">Logo 标识</label>
@@ -2226,6 +2227,33 @@ onUnmounted(() => {
       </div>
     </div>
 
+    <!-- 修改密码弹窗 -->
+    <div v-if="showPasswordModal" class="modal-backdrop" @click.self="showPasswordModal = false">
+      <div class="modal-box" style="max-width: 420px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">修改密码</span>
+          <button @click="showPasswordModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label class="form-label">原密码</label>
+            <input v-model="pwdForm.old" type="password" class="input" autocomplete="current-password" />
+          </div>
+          <div>
+            <label class="form-label">新密码（8-72 位）</label>
+            <input v-model="pwdForm.next" type="password" class="input" autocomplete="new-password" />
+          </div>
+          <div>
+            <label class="form-label">确认新密码</label>
+            <input v-model="pwdForm.confirm" type="password" class="input" autocomplete="new-password" @keyup.enter="submitChangePassword" />
+          </div>
+          <p v-if="pwdError" style="font-size: 12px; color: var(--danger-text);">{{ pwdError }}</p>
+          <p style="font-size: 12px; color: var(--text-secondary);">修改后其他设备上的登录会立即失效。</p>
+          <button @click="submitChangePassword" class="btn btn-primary" style="width: 100%;">确认修改</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 节点对接弹窗 -->
     <div v-if="showInstallModal && installInfo && isAdmin" class="modal-backdrop" @click.self="showInstallModal = false">
       <div class="modal-box" style="max-width: 600px;">
@@ -2234,6 +2262,13 @@ onUnmounted(() => {
           <button @click="showInstallModal = false" class="btn btn-outline btn-sm">✕</button>
         </div>
         <div style="display: flex; flex-direction: column; gap: 12px; font-size: 12.5px;">
+          <div
+            v-for="(w, wi) in (installInfo.warnings || [])"
+            :key="wi"
+            style="padding: 8px 10px; border-radius: var(--radius-md); background: var(--danger-bg, rgba(248,113,113,0.12)); color: var(--danger-text);"
+          >
+            {{ w }}
+          </div>
           <div class="grid-2">
             <div
               class="mode-card"

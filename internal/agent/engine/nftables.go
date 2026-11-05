@@ -9,6 +9,8 @@ import (
 	"net"
 	"os/exec"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -17,13 +19,26 @@ import (
 )
 
 // NftablesEngine implements kernel-level DNAT/SNAT port forwarding using Linux `nftables`.
-// It attaches named / commented counters to each rule so traffic bytes are accurately harvested from the kernel.
+//
+// Design (security & billing):
+//   - DNAT only matches packets addressed to this host (`fib daddr type local`), so routed / container traffic that
+//     happens to use the same destination port is never hijacked;
+//   - before applying, the agent probes the port and refuses rules whose port is already used by a local service
+//     (nft DNAT would otherwise silently take over e.g. an SSH daemon on a high port);
+//   - traffic is counted in a filter `forward` chain on every packet of the DNAT-ed connection (nat chains only see
+//     the first packet), split into upload (original direction) and download (reply direction);
+//   - an optional per-rule byte-rate limit is enforced with `limit rate over … drop`;
+//   - counters are carried over when the table is rebuilt so rule changes never reset billing.
 type NftablesEngine struct {
 	mu        sync.RWMutex
 	policy    security.Policy
 	binPath   string
 	rules     map[string]protocol.RuleSpec
-	lastBytes map[string]int64 // ruleKey -> last total bytes read from kernel counter
+	lastUp    map[string]int64 // ruleKey -> last cumulative upload bytes read from kernel counter
+	lastDown  map[string]int64 // ruleKey -> last cumulative download bytes read from kernel counter
+	portProbe func(proto string, port int) error
+	// carryReady is set once this process has built the table; only then are kernel counters carried over.
+	carryReady bool
 }
 
 func NewNftablesEngine(policies ...security.Policy) *NftablesEngine {
@@ -39,7 +54,9 @@ func NewNftablesEngine(policies ...security.Policy) *NftablesEngine {
 		policy:    pol,
 		binPath:   bin,
 		rules:     make(map[string]protocol.RuleSpec),
-		lastBytes: make(map[string]int64),
+		lastUp:    make(map[string]int64),
+		lastDown:  make(map[string]int64),
+		portProbe: probeLocalPortFree,
 	}
 }
 
@@ -62,6 +79,64 @@ func (n *NftablesEngine) Available() bool {
 	return false
 }
 
+// probeLocalPortFree verifies no local service is bound to the port (nft DNAT never reports EADDRINUSE itself).
+func probeLocalPortFree(proto string, port int) error {
+	addr := net.JoinHostPort("", strconv.Itoa(port))
+	switch proto {
+	case "udp":
+		c, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			return fmt.Errorf("udp port %d is already in use by a local service", port)
+		}
+		return c.Close()
+	default:
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("tcp port %d is already in use by a local service", port)
+		}
+		return l.Close()
+	}
+}
+
+// cleanupStaleKernelTables removes the agent's nftables tables left behind by a previous process.
+func cleanupStaleKernelTables() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	bin, err := exec.LookPath("nft")
+	if err != nil {
+		return
+	}
+	for _, table := range []string{"nexus_forward", "nexus_acct"} {
+		_ = exec.Command(bin, "delete", "table", "inet", table).Run()
+	}
+}
+
+// nftLimitName derives a valid nft object name from a rule key and direction.
+func nftLimitName(dir, key string) string {
+	var b strings.Builder
+	b.WriteString("lim_" + dir + "_")
+	for _, r := range key {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+func nftProtos(spec protocol.RuleSpec) []string {
+	switch spec.Protocol {
+	case "udp":
+		return []string{"udp"}
+	case "both":
+		return []string{"tcp", "udp"}
+	default:
+		return []string{"tcp"}
+	}
+}
+
 func (n *NftablesEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) error {
 	if !n.Available() {
 		return fmt.Errorf("nftables is only available on Linux with 'nft' binary installed")
@@ -69,10 +144,25 @@ func (n *NftablesEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) 
 	key := RuleKey(spec.RuleID, spec.Role)
 
 	n.mu.Lock()
+	defer n.mu.Unlock()
+	if old, exists := n.rules[key]; !exists || old.ListenPort != spec.ListenPort || old.Protocol != spec.Protocol {
+		for _, proto := range nftProtos(spec) {
+			if err := n.portProbe(proto, spec.ListenPort); err != nil {
+				return fmt.Errorf("rule %s: %w", key, err)
+			}
+		}
+	}
+	prev, had := n.rules[key]
 	n.rules[key] = spec
-	err := n.syncTableLocked()
-	n.mu.Unlock()
-	return err
+	if err := n.syncTableLocked(); err != nil {
+		if had {
+			n.rules[key] = prev
+		} else {
+			delete(n.rules, key)
+		}
+		return err
+	}
+	return nil
 }
 
 func (n *NftablesEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol.RuleRole) error {
@@ -83,105 +173,207 @@ func (n *NftablesEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol
 		return nil
 	}
 	delete(n.rules, ruleKey)
-	delete(n.lastBytes, ruleKey)
+	delete(n.lastUp, ruleKey)
+	delete(n.lastDown, ruleKey)
 	return n.syncTableLocked()
 }
 
-func (n *NftablesEngine) syncTableLocked() error {
-	var script strings.Builder
-	script.WriteString("table inet nexus_forward {}\n")
-	script.WriteString("flush table inet nexus_forward\n")
-	script.WriteString("table inet nexus_forward {\n")
-	script.WriteString("  chain prerouting {\n")
-	script.WriteString("    type nat hook prerouting priority dstnat; policy accept;\n")
+// nftRuleTarget picks the first resolved IPv4 target that passes the sandbox (DNAT in this table is IPv4 only).
+func (n *NftablesEngine) nftRuleTarget(key string, spec protocol.RuleSpec) (string, int, bool) {
+	if len(spec.Targets) == 0 {
+		return "", 0, false
+	}
+	host, portStr, err := net.SplitHostPort(spec.Targets[0].Address)
+	if err != nil {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return "", 0, false
+	}
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else if ips, err = net.LookupIP(host); err != nil {
+		return "", 0, false
+	}
+	allowPrivate := n.policy.AllowPrivateTargets || (spec.Role == protocol.RoleIngress)
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			continue
+		}
+		if err := security.ValidateResolvedIP(ip, allowPrivate); err != nil {
+			log.Printf("[NftablesEngine] Security blocked resolved IP %s for rule %s: %v", ip.String(), key, err)
+			continue
+		}
+		return ip.To4().String(), port, true
+	}
+	return "", 0, false
+}
 
-	for key, spec := range n.rules {
-		if len(spec.Targets) == 0 {
-			continue
-		}
-		targetAddr := spec.Targets[0].Address
-		host, port, err := net.SplitHostPort(targetAddr)
-		if err != nil {
-			continue
-		}
-		ips, err := net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			continue
-		}
-		allowPrivate := n.policy.AllowPrivateTargets || (spec.Role == protocol.RoleIngress)
-		if err := security.ValidateResolvedIP(ips[0], allowPrivate); err != nil {
-			log.Printf("[NftablesEngine] Security blocked resolved IP %s for rule %s: %v", ips[0].String(), key, err)
-			continue
-		}
-		dstIP := ips[0].String()
+// nftCounterState holds carried-over kernel counter values keyed by rule comment.
+type nftCounterState map[string]int64
 
-		protos := []string{"tcp"}
-		if spec.Protocol == "udp" {
-			protos = []string{"udp"}
-		} else if spec.Protocol == "both" {
-			protos = []string{"tcp", "udp"}
-		}
+func counterExpr(state nftCounterState, comment string) string {
+	if b := state[comment]; b > 0 {
+		return fmt.Sprintf("counter packets 0 bytes %d", b)
+	}
+	return "counter"
+}
 
-		for _, proto := range protos {
-			script.WriteString(fmt.Sprintf(
-				"    %s dport %d counter dnat ip to %s:%s comment \"nexus:%s\"\n",
-				proto, spec.ListenPort, dstIP, port, key,
-			))
+type nftResolvedRule struct {
+	key     string
+	spec    protocol.RuleSpec
+	dstIP   string
+	dstPort int
+}
+
+// buildNftForwardScript renders the complete nexus_forward table. It is a pure function for testability.
+func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) string {
+	var s strings.Builder
+	// The table is deleted and re-created atomically (one nft transaction) so stateful limit objects are rebuilt
+	// with the current rates; counters are carried explicitly via state.
+	s.WriteString("table inet nexus_forward {}\n")
+	s.WriteString("delete table inet nexus_forward\n")
+	s.WriteString("table inet nexus_forward {\n")
+
+	// One named limit per rule and direction, shared by the tcp and udp rules so protocol "both" cannot use
+	// twice the configured bandwidth.
+	for _, r := range rules {
+		if r.spec.SpeedLimitMbps <= 0 {
+			continue
+		}
+		kb := r.spec.SpeedLimitMbps * 125 // Mbps -> kbytes/second
+		for _, dir := range []string{"up", "down"} {
+			fmt.Fprintf(&s, "  limit %s {\n    rate over %d kbytes/second burst %d kbytes\n  }\n", nftLimitName(dir, r.key), kb, kb*2)
 		}
 	}
 
-	script.WriteString("  }\n")
-	script.WriteString("  chain postrouting {\n")
-	script.WriteString("    type nat hook postrouting priority srcnat; policy accept;\n")
-	script.WriteString("    masquerade\n")
-	script.WriteString("  }\n")
-	script.WriteString("}\n")
+	s.WriteString("  chain prerouting {\n")
+	s.WriteString("    type nat hook prerouting priority dstnat; policy accept;\n")
+	for _, r := range rules {
+		for _, proto := range nftProtos(r.spec) {
+			fmt.Fprintf(&s, "    fib daddr type local %s dport %d dnat ip to %s:%d comment \"nexus:%s\"\n",
+				proto, r.spec.ListenPort, r.dstIP, r.dstPort, r.key)
+		}
+	}
+	s.WriteString("  }\n")
+
+	// Per-packet accounting & rate limiting for DNAT-ed flows. Matching both the original destination port and the
+	// reply source (the pinned target) ensures only this rule's connections are counted.
+	s.WriteString("  chain forward {\n")
+	s.WriteString("    type filter hook forward priority filter; policy accept;\n")
+	for _, r := range rules {
+		for i, proto := range nftProtos(r.spec) {
+			match := fmt.Sprintf("meta l4proto %s ct status dnat ct original proto-dst %d ct reply ip saddr %s ct reply proto-src %d",
+				proto, r.spec.ListenPort, r.dstIP, r.dstPort)
+			for _, dir := range []string{"original", "reply"} {
+				if r.spec.SpeedLimitMbps > 0 {
+					limDir := "up"
+					if dir == "reply" {
+						limDir = "down"
+					}
+					fmt.Fprintf(&s, "    %s ct direction %s limit name \"%s\" drop\n", match, dir, nftLimitName(limDir, r.key))
+				}
+				label := "nexus_up:"
+				if dir == "reply" {
+					label = "nexus_down:"
+				}
+				comment := label + r.key
+				// tcp and udp rules share a comment and are summed on read; the carried total goes onto the first
+				// protocol's rule only, otherwise every rebuild would multiply it.
+				ctr := "counter"
+				if i == 0 {
+					ctr = counterExpr(state, comment)
+				}
+				fmt.Fprintf(&s, "    %s ct direction %s %s comment \"%s\"\n", match, dir, ctr, comment)
+			}
+		}
+	}
+	s.WriteString("  }\n")
+
+	s.WriteString("  chain postrouting {\n")
+	s.WriteString("    type nat hook postrouting priority srcnat; policy accept;\n")
+	// Only masquerade connections DNAT-ed by one of our rules; never rewrite unrelated host traffic.
+	for _, r := range rules {
+		for _, proto := range nftProtos(r.spec) {
+			fmt.Fprintf(&s, "    meta l4proto %s ct status dnat ct original proto-dst %d ip daddr %s %s dport %d masquerade\n",
+				proto, r.spec.ListenPort, r.dstIP, proto, r.dstPort)
+		}
+	}
+	s.WriteString("  }\n")
+	s.WriteString("}\n")
+	return s.String()
+}
+
+func (n *NftablesEngine) syncTableLocked() error {
+	keys := make([]string, 0, len(n.rules))
+	for k := range n.rules {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	resolved := make([]nftResolvedRule, 0, len(keys))
+	for _, key := range keys {
+		spec := n.rules[key]
+		ip, port, ok := n.nftRuleTarget(key, spec)
+		if !ok {
+			continue
+		}
+		resolved = append(resolved, nftResolvedRule{key: key, spec: spec, dstIP: ip, dstPort: port})
+	}
+
+	// Carry over current kernel counters so rebuilding the table never resets billing. Counters left behind by a
+	// previous agent process (crash / restart without Close) are NOT carried: lastUp/lastDown start empty, so they
+	// would be reported (and billed) a second time.
+	state := nftCounterState{}
+	if n.carryReady {
+		state = nftCounterState(readNftCounters(n.binPath, "nexus_forward"))
+	}
+	script := buildNftForwardScript(resolved, state)
 
 	cmd := exec.Command(n.binPath, "-f", "-")
-	cmd.Stdin = strings.NewReader(script.String())
+	cmd.Stdin = strings.NewReader(script)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("nft apply failed: %v (%s)", err, stderr.String())
 	}
+	n.carryReady = true
 
-	log.Printf("[NftablesEngine] Applied %d kernel forwarding rules to table inet nexus_forward", len(n.rules))
+	log.Printf("[NftablesEngine] Applied %d kernel forwarding rules to table inet nexus_forward", len(resolved))
 	return nil
 }
 
-// CollectDeltas reads kernel counters via `nft -j list table inet nexus_forward` and calculates byte deltas.
-func (n *NftablesEngine) CollectDeltas() []protocol.RuleTrafficDelta {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if len(n.rules) == 0 || !n.Available() {
-		return nil
+// readNftCounters returns cumulative counter bytes keyed by rule comment for the given inet table.
+func readNftCounters(bin, table string) map[string]int64 {
+	res := make(map[string]int64)
+	if bin == "" {
+		return res
 	}
-
-	cmd := exec.Command(n.binPath, "-j", "list", "table", "inet", "nexus_forward")
-	out, err := cmd.Output()
+	out, err := exec.Command(bin, "-j", "list", "table", "inet", table).Output()
 	if err != nil {
-		return nil
+		return res
 	}
+	return parseNftCounters(out)
+}
 
+func parseNftCounters(out []byte) map[string]int64 {
+	res := make(map[string]int64)
 	var parsed struct {
 		Nftables []map[string]any `json:"nftables"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil {
-		return nil
+		return res
 	}
-
-	currentTotals := make(map[string]int64)
 	for _, item := range parsed.Nftables {
 		ruleObj, ok := item["rule"].(map[string]any)
 		if !ok {
 			continue
 		}
 		comment, _ := ruleObj["comment"].(string)
-		if !strings.HasPrefix(comment, "nexus:") {
+		if comment == "" {
 			continue
 		}
-		key := strings.TrimPrefix(comment, "nexus:")
 		exprs, _ := ruleObj["expr"].([]any)
 		for _, ex := range exprs {
 			exMap, ok := ex.(map[string]any)
@@ -190,28 +382,42 @@ func (n *NftablesEngine) CollectDeltas() []protocol.RuleTrafficDelta {
 			}
 			if ctr, ok := exMap["counter"].(map[string]any); ok {
 				if bFloat, ok := ctr["bytes"].(float64); ok {
-					currentTotals[key] += int64(bFloat)
+					res[comment] += int64(bFloat)
 				}
 			}
 		}
 	}
+	return res
+}
+
+// CollectDeltas reads the per-direction kernel counters and calculates byte deltas.
+func (n *NftablesEngine) CollectDeltas() []protocol.RuleTrafficDelta {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if len(n.rules) == 0 || !n.Available() {
+		return nil
+	}
+	totals := readNftCounters(n.binPath, "nexus_forward")
 
 	var deltas []protocol.RuleTrafficDelta
 	for key, spec := range n.rules {
-		cur := currentTotals[key]
-		prev := n.lastBytes[key]
-		delta := cur - prev
-		if delta < 0 {
-			delta = cur
+		curUp, curDown := totals["nexus_up:"+key], totals["nexus_down:"+key]
+		up, down := curUp-n.lastUp[key], curDown-n.lastDown[key]
+		if up < 0 {
+			up = curUp
 		}
-		n.lastBytes[key] = cur
-		if delta > 0 {
+		if down < 0 {
+			down = curDown
+		}
+		n.lastUp[key], n.lastDown[key] = curUp, curDown
+		if up > 0 || down > 0 {
 			deltas = append(deltas, protocol.RuleTrafficDelta{
 				RuleID:      spec.RuleID,
 				Role:        spec.Role,
 				Engine:      protocol.EngineNftables,
-				UploadBytes: delta / 2,
-				DownBytes:   delta - (delta / 2),
+				UploadBytes: up,
+				DownBytes:   down,
 			})
 		}
 	}
