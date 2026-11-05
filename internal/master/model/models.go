@@ -183,6 +183,7 @@ type TunnelLine struct {
 	BillingMode    string              `gorm:"size:32;default:'two_way'" json:"billing_mode"` // "one_way" (单向计费) | "two_way" (双向计费)
 	RateMultiplier float64             `gorm:"default:1.0" json:"rate_multiplier"`            // 隧道计费倍率
 	MaxPortCount   int                 `gorm:"default:50" json:"max_port_count"`              // 该隧道允许的最大端口转发数
+	PortRange      string              `gorm:"size:64;default:''" json:"port_range"`          // 该隧道在入口节点上可分配的端口范围 (如 "20000-20999")，留空则使用节点端口范围
 	Enabled        bool                `gorm:"default:true" json:"enabled"`
 	CreatedAt      time.Time           `json:"created_at"`
 }
@@ -282,9 +283,31 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("schema migration failed: %w", err)
 	}
+	ensureRulePortUniqueIndex(db, driver)
 
 	seedInitialData(db)
 	return db, nil
+}
+
+// ensureRulePortUniqueIndex adds a database-level guarantee that two rules never get the same listen port on one
+// node (the in-process allocation lock only covers a single master instance). Port 0 is used transiently while a
+// rule is moved between nodes and is excluded. Existing duplicate data only produces a warning.
+func ensureRulePortUniqueIndex(db *gorm.DB, driver string) {
+	const name = "idx_rule_node_port"
+	if db.Migrator().HasIndex(&ForwardRule{}, name) {
+		return
+	}
+	var stmt string
+	switch driver {
+	case "mysql":
+		// MySQL has no partial indexes: functional key parts that are NULL for port 0 (NULLs never collide). 8.0.13+.
+		stmt = "CREATE UNIQUE INDEX " + name + " ON forward_rules ((CASE WHEN listen_port > 0 THEN ingress_node_id END), (CASE WHEN listen_port > 0 THEN listen_port END))"
+	default: // sqlite, postgres
+		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON forward_rules (ingress_node_id, listen_port) WHERE listen_port > 0"
+	}
+	if err := db.Exec(stmt).Error; err != nil {
+		log.Printf("[DB] WARNING: could not create unique index %s (duplicate ports in existing data or unsupported database version): %v", name, err)
+	}
 }
 
 func envBool(key string) bool {

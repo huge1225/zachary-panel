@@ -90,6 +90,7 @@ export interface TunnelLine {
   billing_mode: 'one_way' | 'two_way'
   rate_multiplier: number
   max_port_count: number
+  port_range: string
   enabled: boolean
 }
 

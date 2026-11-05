@@ -31,7 +31,17 @@ func main() {
 		maxConnsPerIP   = flag.Int("max-conns-per-ip", 256, "Maximum concurrent connections per client IP")
 		reportInterval  = flag.Duration("report-interval", 3*time.Second, "Heartbeat probe & traffic sync interval (default 3s)")
 	)
+	nftSelfCheck := flag.Bool("nft-selfcheck", false, "Validate the generated nftables rules with 'nft -c' (dry run) and exit")
 	flag.Parse()
+
+	if *nftSelfCheck {
+		if err := engine.NftSelfCheck(); err != nil {
+			fmt.Fprintf(os.Stderr, "nftables self-check FAILED: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("nftables self-check OK: generated forwarding and accounting rules are accepted by this kernel / nft version")
+		os.Exit(0)
+	}
 
 	if *masterURL == "" || *nodeID == 0 || *token == "" {
 		log.Fatal("[Agent] -master, -id and -token (or NEXUS_MASTER_URL / NEXUS_NODE_ID / NEXUS_NODE_TOKEN) are required")

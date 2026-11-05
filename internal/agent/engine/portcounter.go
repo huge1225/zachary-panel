@@ -74,35 +74,10 @@ func (c *PortTrafficCounter) syncNftTableLocked() {
 	if c.carryReady {
 		state = nftCounterState(readNftCounters(c.nftBin, "nexus_acct"))
 	}
-	keys := make([]string, 0, len(c.ports))
-	for k := range c.ports {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var sb strings.Builder
-	sb.WriteString("table inet nexus_acct {}\n")
-	sb.WriteString("flush table inet nexus_acct\n")
-	sb.WriteString("table inet nexus_acct {\n")
-	sb.WriteString("  chain input {\n")
-	sb.WriteString("    type filter hook input priority -150; policy accept;\n")
-	for _, key := range keys {
-		port := c.ports[key]
-		sb.WriteString(fmt.Sprintf("    tcp dport %d %s comment \"acct_up:%s\"\n", port, counterExpr(state, "acct_up:"+key), key))
-		sb.WriteString(fmt.Sprintf("    udp dport %d counter comment \"acct_up:%s\"\n", port, key))
-	}
-	sb.WriteString("  }\n")
-	sb.WriteString("  chain output {\n")
-	sb.WriteString("    type filter hook output priority -150; policy accept;\n")
-	for _, key := range keys {
-		port := c.ports[key]
-		sb.WriteString(fmt.Sprintf("    tcp sport %d %s comment \"acct_down:%s\"\n", port, counterExpr(state, "acct_down:"+key), key))
-		sb.WriteString(fmt.Sprintf("    udp sport %d counter comment \"acct_down:%s\"\n", port, key))
-	}
-	sb.WriteString("  }\n")
-	sb.WriteString("}\n")
+	script := buildNftAcctScript(c.ports, state)
 
 	cmd := exec.Command(c.nftBin, "-f", "-")
-	cmd.Stdin = strings.NewReader(sb.String())
+	cmd.Stdin = strings.NewReader(script)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if cmd.Run() == nil {
@@ -178,4 +153,35 @@ func (c *PortTrafficCounter) HarvestDeltas(keys []string) map[string][2]int64 {
 		res[k] = [2]int64{u, d}
 	}
 	return res
+}
+
+// buildNftAcctScript renders the read-only accounting table for external engines. Pure function for testability.
+func buildNftAcctScript(ports map[string]int, state nftCounterState) string {
+	keys := make([]string, 0, len(ports))
+	for k := range ports {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString("table inet nexus_acct {}\n")
+	sb.WriteString("flush table inet nexus_acct\n")
+	sb.WriteString("table inet nexus_acct {\n")
+	sb.WriteString("  chain input {\n")
+	sb.WriteString("    type filter hook input priority -150; policy accept;\n")
+	for _, key := range keys {
+		port := ports[key]
+		sb.WriteString(fmt.Sprintf("    tcp dport %d %s comment \"acct_up:%s\"\n", port, counterExpr(state, "acct_up:"+key), key))
+		sb.WriteString(fmt.Sprintf("    udp dport %d counter comment \"acct_up:%s\"\n", port, key))
+	}
+	sb.WriteString("  }\n")
+	sb.WriteString("  chain output {\n")
+	sb.WriteString("    type filter hook output priority -150; policy accept;\n")
+	for _, key := range keys {
+		port := ports[key]
+		sb.WriteString(fmt.Sprintf("    tcp sport %d %s comment \"acct_down:%s\"\n", port, counterExpr(state, "acct_down:"+key), key))
+		sb.WriteString(fmt.Sprintf("    udp sport %d counter comment \"acct_down:%s\"\n", port, key))
+	}
+	sb.WriteString("  }\n")
+	sb.WriteString("}\n")
+	return sb.String()
 }

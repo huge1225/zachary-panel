@@ -108,3 +108,16 @@ func TestNftFirstBuildDoesNotCarry(t *testing.T) {
 		t.Fatal("a fresh port counter must not carry over kernel counters")
 	}
 }
+
+func TestBuildNftAcctScript(t *testing.T) {
+	script := buildNftAcctScript(map[string]int{"3:relay": 40003}, nftCounterState{"acct_up:3:relay": 99})
+	for _, m := range []string{
+		"tcp dport 40003 counter packets 0 bytes 99 comment \"acct_up:3:relay\"",
+		"udp dport 40003 counter comment \"acct_up:3:relay\"",
+		"tcp sport 40003 counter comment \"acct_down:3:relay\"",
+	} {
+		if !strings.Contains(script, m) {
+			t.Errorf("acct script missing %q\n%s", m, script)
+		}
+	}
+}

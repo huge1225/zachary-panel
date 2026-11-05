@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -97,11 +98,55 @@ func (o *Orchestrator) OnEgressCertChanged(nodeID uint64) {
 	}
 }
 
-// AllocatePortForNode finds an unused port in the node's PortRange.
-func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int) (int, error) {
+// EffectivePortRange returns the port window used for allocations on a node: the node's PortRange, narrowed to the
+// tunnel's own PortRange when one is configured (lineRange).
+func (o *Orchestrator) EffectivePortRange(node *model.Node, lineRange string) (int, int, error) {
+	minP, maxP, err := utils.ParsePortRange(node.PortRange)
+	if err != nil {
+		minP, maxP = 10000, 50000
+	}
+	if strings.TrimSpace(lineRange) != "" {
+		lmin, lmax, lerr := utils.ParsePortRange(lineRange)
+		if lerr != nil {
+			return 0, 0, fmt.Errorf("invalid tunnel port range %q", lineRange)
+		}
+		if lmin > minP {
+			minP = lmin
+		}
+		if lmax < maxP {
+			maxP = lmax
+		}
+		if minP > maxP {
+			return 0, 0, fmt.Errorf("tunnel port range %s does not overlap node %s range %s", lineRange, node.Name, node.PortRange)
+		}
+	}
+	return minP, maxP, nil
+}
+
+// PortInRange reports whether port lies inside the effective allocation window of the node (and tunnel range).
+func (o *Orchestrator) PortInRange(nodeID uint64, port int, lineRange string) bool {
+	var node model.Node
+	if err := o.db.First(&node, nodeID).Error; err != nil {
+		return false
+	}
+	minP, maxP, err := o.EffectivePortRange(&node, lineRange)
+	return err == nil && port >= minP && port <= maxP
+}
+
+// AllocatePortForNode finds an unused port in the node's PortRange (narrowed to the tunnel's PortRange when the
+// optional lineRange is given). Callers must hold WithAllocLock.
+func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int, lineRange ...string) (int, error) {
 	var node model.Node
 	if err := o.db.First(&node, nodeID).Error; err != nil {
 		return 0, fmt.Errorf("node %d not found", nodeID)
+	}
+	lr := ""
+	if len(lineRange) > 0 {
+		lr = lineRange[0]
+	}
+	minP, maxP, err := o.EffectivePortRange(&node, lr)
+	if err != nil {
+		return 0, err
 	}
 
 	occupied := make(map[int]bool)
@@ -127,9 +172,8 @@ func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int) (in
 		if err := security.ValidateListenPort(requestedPort, security.DefaultPolicy); err != nil {
 			return 0, err
 		}
-		minP, maxP, err := utils.ParsePortRange(node.PortRange)
-		if err == nil && (requestedPort < minP || requestedPort > maxP) {
-			return 0, fmt.Errorf("port %d is outside node allowed range %s", requestedPort, node.PortRange)
+		if requestedPort < minP || requestedPort > maxP {
+			return 0, fmt.Errorf("端口 %d 不在允许范围 %d-%d 内", requestedPort, minP, maxP)
 		}
 		if occupied[requestedPort] {
 			return 0, fmt.Errorf("port %d is already in use on node %s", requestedPort, node.Name)
@@ -137,7 +181,7 @@ func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int) (in
 		return requestedPort, nil
 	}
 
-	port, err := utils.AllocateFreePort(node.PortRange, occupied)
+	port, err := utils.AllocateFreePort(fmt.Sprintf("%d-%d", minP, maxP), occupied)
 	if err != nil {
 		return 0, err
 	}
@@ -166,6 +210,11 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 
 	eng := rule.Engine
 	if eng == "" {
+		eng = protocol.EngineNative
+	}
+	// gost / realm cannot enforce per-rule bandwidth limits. Rules of non-admin users that carry a speed limit run on
+	// the native engine instead, so plan bandwidth limits cannot be bypassed by picking another engine.
+	if speedLimit > 0 && user.Role != "admin" && (eng == protocol.EngineGost || eng == protocol.EngineRealm) {
 		eng = protocol.EngineNative
 	}
 

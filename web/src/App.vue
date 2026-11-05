@@ -142,6 +142,14 @@ const ruleForm = ref({
   speed_mbps: 0,
 })
 
+// 当前选中隧道（或其入口节点）的可用端口范围，用于监听端口输入提示
+const ruleFormPortHint = computed(() => {
+  const line = lines.value.find((l) => l.id === ruleForm.value.tunnel_line_id)
+  if (!line) return '留空自动分配'
+  const range = line.port_range || nodes.value.find((n) => n.id === line.ingress_node_id)?.port_range || ''
+  return range ? `留空自动分配（${range}）` : '留空自动分配'
+})
+
 function openCreateRuleModal() {
   if (authorizedLines.value.length === 0) {
     showToast('当前账号暂无可用隧道权限，请联系管理员分配')
@@ -211,6 +219,7 @@ const lineForm = ref({
   billing_mode: 'one_way' as 'one_way' | 'two_way',
   rate_multiplier: 1.0,
   max_port_count: 50,
+  port_range: '',
 })
 
 function openCreateLineModal() {
@@ -226,6 +235,7 @@ function openCreateLineModal() {
     billing_mode: 'one_way',
     rate_multiplier: 1.0,
     max_port_count: 50,
+    port_range: '',
   }
   showLineModal.value = true
 }
@@ -243,6 +253,7 @@ function openEditLineModal(line: TunnelLine) {
     billing_mode: line.billing_mode || 'one_way',
     rate_multiplier: line.rate_multiplier,
     max_port_count: line.max_port_count || 50,
+    port_range: line.port_range || '',
   }
   showLineModal.value = true
 }
@@ -1644,6 +1655,7 @@ onUnmounted(() => {
                     <td>{{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x</td>
                     <td>
                       {{ rules.filter((r) => r.tunnel_line_id === line.id).length }} / {{ line.max_port_count || 50 }}
+                      <div v-if="line.port_range" style="font-size: 12px; color: var(--text-muted);">端口 {{ line.port_range }}</div>
                     </td>
                     <td style="text-align: right; white-space: nowrap;">
                       <button
@@ -2061,7 +2073,7 @@ onUnmounted(() => {
             </div>
             <div>
               <label class="form-label">监听端口</label>
-              <input v-model.number="ruleForm.listen_port" type="number" class="input" placeholder="留空自动分配" />
+              <input v-model.number="ruleForm.listen_port" type="number" class="input" :placeholder="ruleFormPortHint" />
             </div>
             <div>
               <label class="form-label">负载均衡</label>
@@ -2166,6 +2178,18 @@ onUnmounted(() => {
             <div>
               <label class="form-label">端口配额</label>
               <input v-model.number="lineForm.max_port_count" type="number" class="input" />
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">端口范围（选填）</label>
+            <input
+              v-model.trim="lineForm.port_range"
+              class="input"
+              :placeholder="'留空使用入口节点端口范围 ' + (nodes.find((n) => n.id === lineForm.ingress_node_id)?.port_range || '')"
+            />
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+              该隧道的转发规则只在此范围内分配监听端口，格式如 20000-20999，需在入口节点端口范围之内；修改后对新分配的端口生效。
             </div>
           </div>
 

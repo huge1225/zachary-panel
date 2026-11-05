@@ -684,7 +684,7 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 				return err
 			}
 		}
-		allocPort, aerr := s.orch.AllocatePortForNode(ingressNodeID, req.ListenPort)
+		allocPort, aerr := s.orch.AllocatePortForNode(ingressNodeID, req.ListenPort, line.PortRange)
 		if aerr != nil {
 			status, err = http.StatusBadRequest, aerr
 			return err
@@ -801,7 +801,7 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 			}
 		}
 		for _, item := range req.Items {
-			allocPort, aerr := s.orch.AllocatePortForNode(line.IngressNodeID, item.ListenPort)
+			allocPort, aerr := s.orch.AllocatePortForNode(line.IngressNodeID, item.ListenPort, line.PortRange)
 			if aerr != nil {
 				status, err = http.StatusBadRequest, fmt.Errorf("规则「%s」端口分配失败: %v", item.Name, aerr)
 				return err
@@ -951,20 +951,39 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 				return err
 			}
 		}
-		if rule.IngressNodeID != oldRule.IngressNodeID {
-			// 切换到了不同入口节点的隧道，需在新节点上校验或重新分配端口
+		// 规则所属隧道的端口范围（切换隧道时取新隧道）
+		lineRange := ""
+		if switchLine {
+			lineRange = newLine.PortRange
+		} else if rule.TunnelLineID > 0 {
+			var curLine model.TunnelLine
+			if s.db.Select("id", "port_range").First(&curLine, rule.TunnelLineID).Error == nil {
+				lineRange = curLine.PortRange
+			}
+		}
+		movedOutOfRange := switchLine && rule.IngressNodeID == oldRule.IngressNodeID &&
+			!s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange)
+		if rule.IngressNodeID != oldRule.IngressNodeID || movedOutOfRange {
+			// 切换到了不同入口节点的隧道（或当前端口不在新隧道的端口范围内），需重新校验或分配端口
 			desiredPort := req.ListenPort
 			if desiredPort == oldRule.ListenPort {
 				desiredPort = 0
 			}
-			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, desiredPort)
+			if movedOutOfRange {
+				// 同一节点上旧端口仍被本规则占用，先释放再分配
+				s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("listen_port", 0)
+			}
+			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, desiredPort, lineRange)
 			if aerr != nil {
+				if movedOutOfRange {
+					s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("listen_port", oldRule.ListenPort)
+				}
 				status, err = http.StatusBadRequest, aerr
 				return err
 			}
 			rule.ListenPort = allocPort
 		} else if req.ListenPort > 0 && req.ListenPort != rule.ListenPort {
-			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, req.ListenPort)
+			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, req.ListenPort, lineRange)
 			if aerr != nil {
 				status, err = http.StatusBadRequest, aerr
 				return err
@@ -973,6 +992,10 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		}
 		if serr := s.db.Omit(ruleCounterCols...).Save(&rule).Error; serr != nil {
 			log.Printf("[API] update rule failed: %v", serr)
+			// Undo the temporary port release so the port the agent still serves stays reserved in the DB.
+			s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Updates(map[string]any{
+				"listen_port": oldRule.ListenPort, "ingress_node_id": oldRule.IngressNodeID,
+			})
 			status, err = http.StatusInternalServerError, fmt.Errorf("保存规则失败，请稍后再试")
 			return err
 		}
@@ -1364,8 +1387,22 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 	if req.InternalHost != "" {
 		node.InternalHost = req.InternalHost
 	}
-	if req.PortRange != "" {
-		node.PortRange = req.PortRange
+	if req.PortRange != "" && req.PortRange != node.PortRange {
+		nmin, nmax, perr := utils.ParsePortRange(req.PortRange)
+		if perr != nil || nmin < security.DefaultPolicy.MinListenPort {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("端口范围格式应为 起始-结束，且起始端口不小于 %d", security.DefaultPolicy.MinListenPort)})
+			return
+		}
+		var ranged []model.TunnelLine
+		s.db.Where("ingress_node_id = ? AND port_range <> ''", node.ID).Find(&ranged)
+		for _, l := range ranged {
+			lmin, lmax, lerr := utils.ParsePortRange(l.PortRange)
+			if lerr == nil && (lmin < nmin || lmax > nmax) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("隧道「%s」的端口范围 %s 不在新的节点端口范围内，请先调整该隧道", l.Name, l.PortRange)})
+				return
+			}
+		}
+		node.PortRange = fmt.Sprintf("%d-%d", nmin, nmax)
 	}
 	if req.TrafficRate > 0 {
 		node.TrafficRate = req.TrafficRate
@@ -1435,6 +1472,31 @@ func (s *Server) handleAdminDeleteNode(c *gin.Context) {
 }
 
 // validateLine checks enum fields and node references of a tunnel line.
+// validateLinePortRange normalizes the tunnel's optional port range and checks it lies inside the ingress node's range.
+func (s *Server) validateLinePortRange(line *model.TunnelLine) error {
+	line.PortRange = strings.ReplaceAll(strings.TrimSpace(line.PortRange), " ", "")
+	if line.PortRange == "" {
+		return nil
+	}
+	minP, maxP, err := utils.ParsePortRange(line.PortRange)
+	if err != nil || minP < security.DefaultPolicy.MinListenPort {
+		return fmt.Errorf("隧道端口范围格式应为 起始-结束（如 20000-20999），且起始端口不小于 %d", security.DefaultPolicy.MinListenPort)
+	}
+	line.PortRange = fmt.Sprintf("%d-%d", minP, maxP)
+	var node model.Node
+	if err := s.db.First(&node, line.IngressNodeID).Error; err != nil {
+		return fmt.Errorf("入口节点不存在")
+	}
+	nmin, nmax, nerr := utils.ParsePortRange(node.PortRange)
+	if nerr != nil {
+		nmin, nmax = 10000, 50000 // same fallback as the allocator
+	}
+	if minP < nmin || maxP > nmax {
+		return fmt.Errorf("隧道端口范围 %s 必须位于入口节点「%s」的端口范围 %d-%d 之内", line.PortRange, node.Name, nmin, nmax)
+	}
+	return nil
+}
+
 func validateLine(line *model.TunnelLine) error {
 	line.Name = strings.TrimSpace(line.Name)
 	if line.Name == "" || utf8.RuneCountInString(line.Name) > 64 {
@@ -1618,6 +1680,10 @@ func (s *Server) handleAdminCreateLine(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if err := s.validateLinePortRange(&line); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	line.ID = 0
 	line.Enabled = true
 	if err := s.db.Create(&line).Error; err != nil {
@@ -1658,6 +1724,7 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	line.BillingMode = req.BillingMode
 	line.RateMultiplier = req.RateMultiplier
 	line.MaxPortCount = req.MaxPortCount
+	line.PortRange = req.PortRange
 	if line.Engine == "" {
 		line.Engine = protocol.EngineNative
 	}
@@ -1665,6 +1732,10 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		line.BillingMode = "two_way"
 	}
 	if err := validateLine(&line); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := s.validateLinePortRange(&line); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -1681,15 +1752,15 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 			s.orch.RemoveRuleFromAgents(&oldRule)
 		}
 		rules[i].Engine = line.Engine
-		_ = s.orch.WithAllocLock(func() error {
+		saveErr := s.orch.WithAllocLock(func() error {
 			if oldIngressID != line.IngressNodeID {
 				rules[i].IngressNodeID = line.IngressNodeID
 				// Persist the node change first so the rule's old port on the old node is not counted twice.
 				rules[i].ListenPort = 0
 				s.db.Model(&model.ForwardRule{}).Where("id = ?", rules[i].ID).Updates(map[string]any{"ingress_node_id": line.IngressNodeID, "listen_port": 0})
-				if p, err := s.orch.AllocatePortForNode(line.IngressNodeID, oldRule.ListenPort); err == nil {
+				if p, err := s.orch.AllocatePortForNode(line.IngressNodeID, oldRule.ListenPort, line.PortRange); err == nil {
 					rules[i].ListenPort = p
-				} else if p2, err2 := s.orch.AllocatePortForNode(line.IngressNodeID, 0); err2 == nil {
+				} else if p2, err2 := s.orch.AllocatePortForNode(line.IngressNodeID, 0, line.PortRange); err2 == nil {
 					rules[i].ListenPort = p2
 				} else {
 					rules[i].Enabled = false
@@ -1707,6 +1778,15 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 			}
 			return s.db.Omit(ruleCounterCols...).Save(&rules[i]).Error
 		})
+		if saveErr != nil {
+			log.Printf("[API] tunnel %d: failed to migrate rule %d: %v", line.ID, rules[i].ID, saveErr)
+			s.db.Model(&model.ForwardRule{}).Where("id = ?", rules[i].ID).Updates(map[string]any{
+				"enabled": false, "status": "error", "last_error": "隧道变更后规则迁移失败，请重新编辑该规则",
+			})
+			rules[i].Enabled = false
+			s.orch.RemoveRuleFromAgents(&oldRule)
+			continue
+		}
 		s.orch.DispatchRule(&rules[i])
 	}
 	c.JSON(http.StatusOK, line)

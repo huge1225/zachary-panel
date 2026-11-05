@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"sort"
@@ -437,5 +438,41 @@ func (n *NftablesEngine) Close() error {
 		return nil
 	}
 	_ = exec.Command(n.binPath, "delete", "table", "inet", "nexus_forward").Run()
+	return nil
+}
+
+// NftSelfCheck renders sample nexus_forward / nexus_acct tables (both protocols, speed limit, carried counters) and
+// validates them with `nft -c` (dry run, nothing is applied). Run it once on each new node / kernel / nft version.
+func NftSelfCheck() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("nftables is only available on Linux")
+	}
+	bin, err := exec.LookPath("nft")
+	if err != nil {
+		return fmt.Errorf("'nft' binary not found: install the nftables package")
+	}
+	sample := []nftResolvedRule{
+		{key: "1:relay", spec: protocol.RuleSpec{RuleID: 1, Role: protocol.RoleRelay, Protocol: "both", ListenPort: 40001, SpeedLimitMbps: 100},
+			dstIP: "203.0.113.10", dstPort: 443},
+		{key: "2:relay", spec: protocol.RuleSpec{RuleID: 2, Role: protocol.RoleRelay, Protocol: "tcp", ListenPort: 40002},
+			dstIP: "203.0.113.11", dstPort: 8443},
+	}
+	scripts := map[string]string{
+		"nexus_forward": buildNftForwardScript(sample, nftCounterState{"nexus_up:1:relay": 1234, "nexus_down:1:relay": 5678}),
+		"nexus_acct":    buildNftAcctScript(map[string]int{"3:relay": 40003}, nftCounterState{"acct_up:3:relay": 99}),
+	}
+	for _, name := range []string{"nexus_forward", "nexus_acct"} {
+		cmd := exec.Command(bin, "-c", "-f", "-")
+		cmd.Stdin = strings.NewReader(scripts[name])
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			hint := ""
+			if os.Geteuid() != 0 {
+				hint = "\n(hint: nft -c needs root / CAP_NET_ADMIN, re-run with sudo before treating this as a rule error)"
+			}
+			return fmt.Errorf("table %s rejected by nft: %v\n%s%s\n--- script ---\n%s", name, err, stderr.String(), hint, scripts[name])
+		}
+	}
 	return nil
 }
