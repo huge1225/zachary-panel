@@ -449,7 +449,24 @@ func (s *Server) handleListRules(c *gin.Context) {
 		query = query.Where("user_id = ?", uid)
 	}
 	query.Find(&rules)
+	s.fillEffectiveEngines(rules)
 	c.JSON(http.StatusOK, rules)
+}
+
+// fillEffectiveEngines sets the read-only EffectiveEngine field so the UI shows the engine actually running.
+func (s *Server) fillEffectiveEngines(rules []model.ForwardRule) {
+	users := map[uint64]*model.User{}
+	for i := range rules {
+		u, ok := users[rules[i].UserID]
+		if !ok {
+			var fetched model.User
+			if s.db.Select("id", "role", "speed_mbps").First(&fetched, rules[i].UserID).Error == nil {
+				u = &fetched
+			}
+			users[rules[i].UserID] = u
+		}
+		rules[i].EffectiveEngine = service.EffectiveEngine(&rules[i], u)
+	}
 }
 
 type ruleCreateUpdateReq struct {
@@ -915,6 +932,7 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		rule.IngressNodeID = newLine.IngressNodeID
 		rule.Engine = newLine.Engine
 		rule.RelayPort = 0
+		rule.RelayNodeID = 0
 		if newLine.Type == "encrypt" && newLine.EgressNodeID > 0 {
 			rule.Mode = "tunnel"
 		} else {
@@ -943,6 +961,26 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 
 	status, err := 0, error(nil)
 	_ = s.orch.WithAllocLock(func() error {
+		// Re-read under the lock: fields owned by other code paths (enabled/status set by pause or quota cut-off,
+		// ports moved by a port range change, topology set by a tunnel edit) must not be overwritten by the snapshot
+		// taken before the lock.
+		var cur model.ForwardRule
+		if e := s.db.First(&cur, ruleID).Error; e != nil {
+			status, err = http.StatusNotFound, fmt.Errorf("规则不存在")
+			return err
+		}
+		reqPort := req.ListenPort
+		if reqPort == oldRule.ListenPort {
+			reqPort = cur.ListenPort // the client did not change the port; keep whatever it is now
+		}
+		oldRule = cur
+		rule.Enabled, rule.Status, rule.LastError = cur.Enabled, cur.Status, cur.LastError
+		rule.TunnelSecret = cur.TunnelSecret
+		rule.ListenPort = cur.ListenPort
+		if !switchLine {
+			rule.TunnelLineID, rule.IngressNodeID, rule.Mode, rule.Engine = cur.TunnelLineID, cur.IngressNodeID, cur.Mode, cur.Engine
+			rule.RelayPort, rule.RelayNodeID = cur.RelayPort, cur.RelayNodeID
+		}
 		if switchLine && newLine.MaxPortCount > 0 {
 			var lineRuleCount int64
 			s.db.Model(&model.ForwardRule{}).Where("tunnel_line_id = ?", newLine.ID).Count(&lineRuleCount)
@@ -961,11 +999,11 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 				lineRange = curLine.PortRange
 			}
 		}
-		movedOutOfRange := switchLine && rule.IngressNodeID == oldRule.IngressNodeID &&
-			!s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange)
+		movedOutOfRange := rule.IngressNodeID == oldRule.IngressNodeID &&
+			(rule.ListenPort <= 0 || !s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange))
 		if rule.IngressNodeID != oldRule.IngressNodeID || movedOutOfRange {
 			// 切换到了不同入口节点的隧道（或当前端口不在新隧道的端口范围内），需重新校验或分配端口
-			desiredPort := req.ListenPort
+			desiredPort := reqPort
 			if desiredPort == oldRule.ListenPort {
 				desiredPort = 0
 			}
@@ -982,8 +1020,8 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 				return err
 			}
 			rule.ListenPort = allocPort
-		} else if req.ListenPort > 0 && req.ListenPort != rule.ListenPort {
-			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, req.ListenPort, lineRange)
+		} else if reqPort > 0 && reqPort != rule.ListenPort {
+			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, reqPort, lineRange)
 			if aerr != nil {
 				status, err = http.StatusBadRequest, aerr
 				return err
@@ -1039,13 +1077,36 @@ func (s *Server) handleToggleRule(c *gin.Context) {
 		}
 	}
 
-	rule.Enabled = !rule.Enabled
-	if rule.Enabled {
-		rule.Status = "running"
-	} else {
-		rule.Status = "paused"
+	enable := !rule.Enabled
+	status := "paused"
+	if enable {
+		status = "running"
 	}
-	s.db.Omit(ruleCounterCols...).Save(&rule)
+	errBadPort := fmt.Errorf("规则端口不在当前允许的端口范围内，请编辑规则重新分配端口后再启用")
+	// The port check and the state change run under the allocation lock so a concurrent port range change cannot slip
+	// in between; only enabled/status are written so a port moved by such a change is never overwritten.
+	terr := s.orch.WithAllocLock(func() error {
+		if err := s.db.First(&rule, rule.ID).Error; err != nil {
+			return err
+		}
+		// 端口范围调整后未能迁移的规则（无端口或端口在范围外）需先编辑重新分配端口
+		if enable && !s.ruleHasValidPort(&rule) {
+			return errBadPort
+		}
+		return s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).
+			Updates(map[string]any{"enabled": enable, "status": status}).Error
+	})
+	if terr == errBadPort {
+		c.JSON(http.StatusBadRequest, gin.H{"error": terr.Error()})
+		return
+	}
+	if terr != nil {
+		log.Printf("[API] toggle rule %d failed: %v", rule.ID, terr)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "操作失败，请稍后再试"})
+		return
+	}
+	rule.Enabled = enable
+	rule.Status = status
 	s.orch.DispatchRule(&rule)
 	c.JSON(http.StatusOK, rule)
 }
@@ -1366,6 +1427,8 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		return
 	}
 	oldServerIP := node.ServerIP
+	oldPortRange := node.PortRange
+	portRangeChanged := false
 	if req.Name != "" {
 		node.Name = req.Name
 	}
@@ -1403,6 +1466,7 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 			}
 		}
 		node.PortRange = fmt.Sprintf("%d-%d", nmin, nmax)
+		portRangeChanged = node.PortRange != oldPortRange
 	}
 	if req.TrafficRate > 0 {
 		node.TrafficRate = req.TrafficRate
@@ -1414,7 +1478,15 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		node.DefaultEngine = req.DefaultEngine
 	}
 	// Never write back fields owned by the agent / traffic accounting from a stale snapshot.
-	s.db.Omit("used_bytes", "tunnel_cert_pem", "status", "supported_engines", "last_seen_at").Save(&node)
+	if err := s.db.Omit("used_bytes", "tunnel_cert_pem", "status", "supported_engines", "last_seen_at").Save(&node).Error; err != nil {
+		log.Printf("[API] update node %d failed: %v", node.ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存节点失败，请稍后再试"})
+		return
+	}
+	if portRangeChanged {
+		// 节点端口范围收窄后，把落在范围外的规则迁移到新范围内的空闲端口
+		s.reallocNodeRulesOutOfRange(node.ID)
+	}
 	if req.UsedBytes != nil && *req.UsedBytes >= 0 {
 		node.UsedBytes = *req.UsedBytes
 		s.db.Model(&model.Node{}).Where("id = ?", node.ID).Update("used_bytes", node.UsedBytes)
@@ -1434,12 +1506,17 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		for i := range pausedRules {
 			var owner model.User
 			if s.db.First(&owner, pausedRules[i].UserID).Error != nil || !owner.CanForward(now) ||
-				!owner.HasTunnelPermission(pausedRules[i].TunnelLineID) {
+				!owner.HasTunnelPermission(pausedRules[i].TunnelLineID) || s.resumeBlockedByPort(&pausedRules[i]) {
 				continue
 			}
 			pausedRules[i].Enabled = true
 			pausedRules[i].Status = "running"
-			s.db.Omit(ruleCounterCols...).Save(&pausedRules[i])
+			// Conditional on the status it was found in, so a concurrent pause / stop is never undone.
+			if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", pausedRules[i].ID, "node_quota_exceeded").
+				Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
+				continue
+			}
+			s.db.First(&pausedRules[i], pausedRules[i].ID) // dispatch the current row, not a pre-lock snapshot
 			s.orch.DispatchRule(&pausedRules[i])
 		}
 	}
@@ -1469,6 +1546,182 @@ func (s *Server) handleAdminDeleteNode(c *gin.Context) {
 	}
 	s.db.Delete(&model.Node{}, id)
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
+}
+
+// reallocIfOutOfRange moves a rule whose listen port lies outside the effective port range of its ingress node
+// (narrowed by lineRange) to a free in-range port. Callers must hold WithAllocLock. It returns true when the port
+// changed. Rules without a port (listen_port == 0, e.g. after a failed migration) are left for the user to re-edit.
+// The old port is outside the new window, so it can never collide with the newly allocated one; the move is a single
+// conditional write, so a failure leaves the DB unchanged.
+func (s *Server) reallocIfOutOfRange(rule *model.ForwardRule, lineRange string) (bool, error) {
+	if rule.ListenPort <= 0 || s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange) {
+		return false, nil
+	}
+	p, err := s.orch.AllocatePortForNode(rule.IngressNodeID, 0, lineRange)
+	if err != nil {
+		return false, err
+	}
+	res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND listen_port = ?", rule.ID, rule.ListenPort).Update("listen_port", p)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	if res.RowsAffected == 0 {
+		return false, fmt.Errorf("rule %d changed concurrently", rule.ID)
+	}
+	rule.ListenPort = p
+	return true, nil
+}
+
+// ruleHasValidPort reports whether the rule's listen port lies inside the current node / tunnel port range. Auto-resume
+// paths use it so a rule stranded outside a narrowed range is never brought back up outside the allowed window.
+func (s *Server) ruleHasValidPort(rule *model.ForwardRule) bool {
+	lineRange := ""
+	if rule.TunnelLineID > 0 {
+		var l model.TunnelLine
+		if s.db.Select("id", "port_range").First(&l, rule.TunnelLineID).Error == nil {
+			lineRange = l.PortRange
+		}
+	}
+	return rule.ListenPort > 0 && s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange)
+}
+
+// resumeBlockedByPort handles a paused rule that would be auto-resumed but has no valid port: it is moved to the error
+// state (so it is not retried silently) and the caller must skip it.
+func (s *Server) resumeBlockedByPort(rule *model.ForwardRule) bool {
+	if s.ruleHasValidPort(rule) {
+		return false
+	}
+	s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Updates(map[string]any{
+		"enabled": false, "status": "error", "last_error": "规则端口不在当前允许的端口范围内，请编辑规则重新分配端口后再启用",
+	})
+	return true
+}
+
+// markRuleNoPort records that a rule could not get an in-range port. Enabled rules are stopped with an error status;
+// rules that are already off (paused / quota-cut) keep their status so their resume semantics are preserved.
+func (s *Server) markRuleNoPort(ruleID uint64, wasEnabled bool, msg string) {
+	updates := map[string]any{"last_error": msg}
+	if wasEnabled {
+		updates["enabled"] = false
+		updates["status"] = "error"
+	}
+	s.db.Model(&model.ForwardRule{}).Where("id = ?", ruleID).Updates(updates)
+}
+
+// reallocNodeRulesOutOfRange re-homes every rule on nodeID whose listen port (node as ingress) or relay port (node as
+// egress) no longer fits the node / tunnel port range after a range change, and pushes the new config to agents.
+// The whole scan runs under the allocation lock so concurrent rule creates/edits are either fully before it or see
+// the new range. Ranges and the occupied-port set are loaded once and new ports are handed out in memory, so the cost
+// is a handful of queries plus one conditional UPDATE per moved rule. Rules that cannot get a new port are stopped so
+// they never keep listening outside the allowed window.
+func (s *Server) reallocNodeRulesOutOfRange(nodeID uint64) {
+	var moved, failed []uint64
+	_ = s.orch.WithAllocLock(func() error {
+		var node model.Node
+		if s.db.First(&node, nodeID).Error != nil {
+			return nil
+		}
+		occupied := s.orch.OccupiedPorts(nodeID)
+		type window struct {
+			min, max int
+			ok       bool
+		}
+		windows := map[uint64]window{}
+		windowFor := func(lineID uint64) window {
+			if w, ok := windows[lineID]; ok {
+				return w
+			}
+			lr := ""
+			if lineID > 0 {
+				var l model.TunnelLine
+				if s.db.Select("id", "port_range").First(&l, lineID).Error == nil {
+					lr = l.PortRange
+				}
+			}
+			mn, mx, err := s.orch.EffectivePortRange(&node, lr)
+			w := window{mn, mx, err == nil}
+			windows[lineID] = w
+			return w
+		}
+		fail := func(id uint64, enabled bool, msg string, err error) {
+			log.Printf("[API] node %d: rule %d out of range and re-allocation failed: %v", nodeID, id, err)
+			s.markRuleNoPort(id, enabled, msg)
+			failed = append(failed, id)
+		}
+
+		// Listen ports (this node is the ingress).
+		var rules []model.ForwardRule
+		s.db.Select("id", "enabled", "tunnel_line_id", "listen_port").
+			Where("ingress_node_id = ? AND listen_port > 0", nodeID).Find(&rules)
+		for _, r := range rules {
+			w := windowFor(r.TunnelLineID)
+			if w.ok && r.ListenPort >= w.min && r.ListenPort <= w.max {
+				continue
+			}
+			if !w.ok {
+				fail(r.ID, r.Enabled, "端口范围调整后无可用端口，请重新编辑该规则", fmt.Errorf("invalid port range"))
+				continue
+			}
+			p, err := service.PickFreePort(w.min, w.max, occupied)
+			if err == nil {
+				res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND listen_port = ?", r.ID, r.ListenPort).Update("listen_port", p)
+				if err = res.Error; err == nil && res.RowsAffected == 0 {
+					err = fmt.Errorf("rule changed concurrently")
+				}
+			}
+			if err != nil {
+				fail(r.ID, r.Enabled, "端口范围调整后无可用端口，请重新编辑该规则", err)
+				continue
+			}
+			log.Printf("[API] node %d: rule %d listen port %d -> %d after port range change", nodeID, r.ID, r.ListenPort, p)
+			moved = append(moved, r.ID)
+		}
+
+		// Relay ports (this node is the egress of tunnel rules); they only follow the node range.
+		nw := windowFor(0)
+		var relays []model.ForwardRule
+		s.db.Select("id", "enabled", "relay_port").Where("relay_node_id = ? AND relay_port > 0", nodeID).Find(&relays)
+		for _, r := range relays {
+			if nw.ok && r.RelayPort >= nw.min && r.RelayPort <= nw.max {
+				continue
+			}
+			var p int
+			err := fmt.Errorf("invalid port range")
+			if nw.ok {
+				if p, err = service.PickFreePort(nw.min, nw.max, occupied); err == nil {
+					res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND relay_port = ?", r.ID, r.RelayPort).Update("relay_port", p)
+					if err = res.Error; err == nil && res.RowsAffected == 0 {
+						err = fmt.Errorf("rule changed concurrently")
+					}
+				}
+			}
+			if err != nil {
+				// Release the out-of-range relay port; it is re-allocated inside the range when the rule is next deployed.
+				res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND relay_port = ?", r.ID, r.RelayPort).
+					Updates(map[string]any{"relay_port": 0, "relay_node_id": 0})
+				if res.Error == nil && res.RowsAffected == 0 {
+					continue // the rule was changed concurrently (e.g. re-edited); leave it alone
+				}
+				fail(r.ID, r.Enabled, "出口节点端口范围调整后无可用中继端口，请调整范围后重新编辑该规则", err)
+				continue
+			}
+			log.Printf("[API] node %d: rule %d relay port %d -> %d after port range change", nodeID, r.ID, r.RelayPort, p)
+			moved = append(moved, r.ID)
+		}
+		return nil
+	})
+	// Dispatch from the current DB state (never a stale snapshot), so paused / disabled / deleted rules are not revived.
+	seen := map[uint64]bool{}
+	for _, id := range append(moved, failed...) {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		var fresh model.ForwardRule
+		if s.db.First(&fresh, id).Error == nil {
+			s.orch.DispatchRule(&fresh)
+		}
+	}
 }
 
 // validateLine checks enum fields and node references of a tunnel line.
@@ -1709,6 +1962,7 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	oldIngressID := line.IngressNodeID
 	oldEgressID := line.EgressNodeID
 	oldType := line.Type
+	oldPortRange := line.PortRange
 
 	line.Name = req.Name
 	line.Type = req.Type
@@ -1744,6 +1998,7 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	topologyChanged := oldIngressID != line.IngressNodeID || oldEgressID != line.EgressNodeID || oldType != line.Type
 
 	// 隧道固化转发方式或拓扑变更后，先清理旧节点上的残留实例，再同步更新该隧道下所有转发规则并重新下发
+	ruleGone := fmt.Errorf("rule deleted concurrently")
 	var rules []model.ForwardRule
 	s.db.Where("tunnel_line_id = ?", line.ID).Find(&rules)
 	for i := range rules {
@@ -1751,8 +2006,12 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		if topologyChanged {
 			s.orch.RemoveRuleFromAgents(&oldRule)
 		}
-		rules[i].Engine = line.Engine
 		saveErr := s.orch.WithAllocLock(func() error {
+			// Re-read under the lock so a concurrent pause / edit / delete is not overwritten by a stale snapshot.
+			if err := s.db.First(&rules[i], oldRule.ID).Error; err != nil {
+				return ruleGone
+			}
+			rules[i].Engine = line.Engine
 			if oldIngressID != line.IngressNodeID {
 				rules[i].IngressNodeID = line.IngressNodeID
 				// Persist the node change first so the rule's old port on the old node is not counted twice.
@@ -1767,9 +2026,17 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 					rules[i].Status = "error"
 					rules[i].LastError = "新入口节点无可用端口"
 				}
+			} else if _, rerr := s.reallocIfOutOfRange(&rules[i], line.PortRange); rerr != nil {
+				// 隧道端口范围收窄后当前端口已不在范围内，且范围内无空闲端口；已暂停/超额的规则保留原状态
+				if rules[i].Enabled {
+					rules[i].Enabled = false
+					rules[i].Status = "error"
+				}
+				rules[i].LastError = "隧道端口范围内无可用端口，请调整范围后重新编辑该规则"
 			}
 			if oldEgressID != line.EgressNodeID {
 				rules[i].RelayPort = 0
+				rules[i].RelayNodeID = 0
 			}
 			if line.Type == "encrypt" && line.EgressNodeID > 0 {
 				rules[i].Mode = "tunnel"
@@ -1778,6 +2045,9 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 			}
 			return s.db.Omit(ruleCounterCols...).Save(&rules[i]).Error
 		})
+		if saveErr == ruleGone {
+			continue
+		}
 		if saveErr != nil {
 			log.Printf("[API] tunnel %d: failed to migrate rule %d: %v", line.ID, rules[i].ID, saveErr)
 			s.db.Model(&model.ForwardRule{}).Where("id = ?", rules[i].ID).Updates(map[string]any{
@@ -1788,6 +2058,10 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 			continue
 		}
 		s.orch.DispatchRule(&rules[i])
+	}
+	if line.PortRange != oldPortRange {
+		// 兜底：在分配锁内整体复查入口节点，覆盖本次更新期间并发创建、仍沿用旧范围端口的规则
+		s.reallocNodeRulesOutOfRange(line.IngressNodeID)
 	}
 	c.JSON(http.StatusOK, line)
 }
@@ -1816,7 +2090,7 @@ func (s *Server) enforceUserTunnelPermissions(u *model.User) {
 		if !u.HasTunnelPermission(userRules[i].TunnelLineID) {
 			userRules[i].Enabled = false
 			userRules[i].Status = "paused"
-			s.db.Omit(ruleCounterCols...).Save(&userRules[i])
+			s.db.Model(&model.ForwardRule{}).Where("id = ?", userRules[i].ID).Updates(map[string]any{"enabled": false, "status": "paused"})
 			s.orch.RemoveRuleFromAgents(&userRules[i])
 		}
 	}
@@ -2221,10 +2495,14 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 		var rules []model.ForwardRule
 		s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
 		for i := range rules {
-			if u.HasTunnelPermission(rules[i].TunnelLineID) {
+			if u.HasTunnelPermission(rules[i].TunnelLineID) && !s.resumeBlockedByPort(&rules[i]) {
 				rules[i].Enabled = true
 				rules[i].Status = "running"
-				s.db.Omit(ruleCounterCols...).Save(&rules[i])
+				if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").
+					Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
+					continue
+				}
+				s.db.First(&rules[i], rules[i].ID) // dispatch the current row, not a pre-lock snapshot
 				s.orch.DispatchRule(&rules[i])
 			}
 		}
@@ -2250,12 +2528,16 @@ func (s *Server) handleAdminResetUserTraffic(c *gin.Context) {
 	var rules []model.ForwardRule
 	s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
 	for i := range rules {
-		if !u.HasTunnelPermission(rules[i].TunnelLineID) {
+		if !u.HasTunnelPermission(rules[i].TunnelLineID) || s.resumeBlockedByPort(&rules[i]) {
 			continue
 		}
 		rules[i].Enabled = true
 		rules[i].Status = "running"
-		s.db.Omit(ruleCounterCols...).Save(&rules[i])
+		if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").
+			Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
+			continue
+		}
+		s.db.First(&rules[i], rules[i].ID) // dispatch the current row, not a pre-lock snapshot
 		s.orch.DispatchRule(&rules[i])
 	}
 	c.JSON(http.StatusOK, u)

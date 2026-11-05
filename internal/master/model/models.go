@@ -200,6 +200,7 @@ type ForwardRule struct {
 	Protocol      string              `gorm:"size:16;default:'tcp'" json:"protocol"`  // "tcp" | "udp" | "both"
 	ListenPort    int                 `gorm:"not null" json:"listen_port"`            // 入口节点分配的公网端口
 	RelayPort     int                 `gorm:"default:0" json:"relay_port"`            // 双端模式下出口节点自动分配的内部隧道端口
+	RelayNodeID   uint64              `gorm:"default:0;index" json:"-"`               // RelayPort 所在的出口节点（用于中继端口唯一性约束与范围校验）
 	TunnelSecret  string              `gorm:"size:128" json:"-"`                      // 双端隧道自动生成的鉴权密钥
 	LoadBalance   string              `gorm:"size:32;default:'round_robin'" json:"load_balance"`
 	TargetsJSON   string              `gorm:"type:text;not null" json:"targets_json"` // JSON serialized []protocol.TargetEndpoint
@@ -212,6 +213,9 @@ type ForwardRule struct {
 	LastError     string              `gorm:"size:255" json:"last_error,omitempty"`
 	CreatedAt     time.Time           `json:"created_at"`
 	UpdatedAt     time.Time           `json:"updated_at"`
+	// EffectiveEngine is the engine the rule actually runs on (computed at read time, not persisted). It differs from
+	// Engine when a speed-limited non-admin rule falls back from gost / realm to native.
+	EffectiveEngine protocol.EngineType `gorm:"-" json:"effective_engine,omitempty"`
 }
 
 // RedeemCode allows users to top-up balance or activate plans via gift codes.
@@ -284,6 +288,8 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("schema migration failed: %w", err)
 	}
 	ensureRulePortUniqueIndex(db, driver)
+	backfillRelayNodeIDs(db)
+	ensureRelayPortUniqueIndex(db, driver)
 
 	seedInitialData(db)
 	return db, nil
@@ -307,6 +313,42 @@ func ensureRulePortUniqueIndex(db *gorm.DB, driver string) {
 	}
 	if err := db.Exec(stmt).Error; err != nil {
 		log.Printf("[DB] WARNING: could not create unique index %s (duplicate ports in existing data or unsupported database version): %v", name, err)
+	}
+}
+
+// backfillRelayNodeIDs fills RelayNodeID for tunnel rules created before the column existed.
+func backfillRelayNodeIDs(db *gorm.DB) {
+	var rules []ForwardRule
+	db.Select("id", "tunnel_line_id").Where("relay_port > 0 AND relay_node_id = 0").Find(&rules)
+	for _, r := range rules {
+		var l TunnelLine
+		if db.Select("id", "egress_node_id").First(&l, r.TunnelLineID).Error == nil && l.EgressNodeID > 0 {
+			db.Model(&ForwardRule{}).Where("id = ?", r.ID).Update("relay_node_id", l.EgressNodeID)
+		} else {
+			// Stale relay port of a rule whose tunnel no longer has an egress: release it (re-allocated on next deploy)
+			// so leftovers can never block the unique index below.
+			db.Model(&ForwardRule{}).Where("id = ?", r.ID).Update("relay_port", 0)
+		}
+	}
+}
+
+// ensureRelayPortUniqueIndex guarantees at database level that two tunnel rules never share a relay port on the same
+// egress node (relay_port 0 = not allocated is exempt). Collisions between a relay port and a listen port on the same
+// node are prevented by the allocator (single master, allocation lock).
+func ensureRelayPortUniqueIndex(db *gorm.DB, driver string) {
+	const name = "idx_rule_relay_node_port"
+	if db.Migrator().HasIndex(&ForwardRule{}, name) {
+		return
+	}
+	var stmt string
+	switch driver {
+	case "mysql":
+		stmt = "CREATE UNIQUE INDEX " + name + " ON forward_rules ((CASE WHEN relay_port > 0 THEN relay_node_id END), (CASE WHEN relay_port > 0 THEN relay_port END))"
+	default: // sqlite, postgres
+		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON forward_rules (relay_node_id, relay_port) WHERE relay_port > 0"
+	}
+	if err := db.Exec(stmt).Error; err != nil {
+		log.Printf("[DB] WARNING: could not create unique index %s (duplicate relay ports in existing data or unsupported database version): %v", name, err)
 	}
 }
 

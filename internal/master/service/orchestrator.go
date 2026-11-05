@@ -133,6 +133,49 @@ func (o *Orchestrator) PortInRange(nodeID uint64, port int, lineRange string) bo
 	return err == nil && port >= minP && port <= maxP
 }
 
+// OccupiedPorts returns every port held on nodeID: listen ports of rules entering there and relay ports of tunnel
+// legs ending there (by relay_node_id, plus rules of tunnels currently egressing there that may not have recorded
+// relay_node_id yet). Callers must hold WithAllocLock.
+func (o *Orchestrator) OccupiedPorts(nodeID uint64) map[int]bool {
+	occupied := make(map[int]bool)
+	var ports []int
+	o.db.Model(&model.ForwardRule{}).Where("ingress_node_id = ? AND listen_port > 0", nodeID).Pluck("listen_port", &ports)
+	for _, p := range ports {
+		occupied[p] = true
+	}
+	ports = ports[:0]
+	o.db.Model(&model.ForwardRule{}).Where("relay_node_id = ? AND relay_port > 0", nodeID).Pluck("relay_port", &ports)
+	for _, p := range ports {
+		occupied[p] = true
+	}
+	var lineIDs []uint64
+	o.db.Model(&model.TunnelLine{}).Where("egress_node_id = ?", nodeID).Pluck("id", &lineIDs)
+	if len(lineIDs) > 0 {
+		ports = ports[:0]
+		o.db.Model(&model.ForwardRule{}).Where("tunnel_line_id IN ? AND relay_port > 0", lineIDs).Pluck("relay_port", &ports)
+		for _, p := range ports {
+			occupied[p] = true
+		}
+	}
+	return occupied
+}
+
+// PickFreePort returns the lowest port in [minP, maxP] that is neither occupied nor rejected by the listen-port
+// policy, and marks it occupied so repeated calls with the same map hand out distinct ports (batch allocation).
+func PickFreePort(minP, maxP int, occupied map[int]bool) (int, error) {
+	for p := minP; p <= maxP; p++ {
+		if occupied[p] {
+			continue
+		}
+		if security.ValidateListenPort(p, security.DefaultPolicy) != nil {
+			continue
+		}
+		occupied[p] = true
+		return p, nil
+	}
+	return 0, fmt.Errorf("no free ports available in range %d-%d", minP, maxP)
+}
+
 // AllocatePortForNode finds an unused port in the node's PortRange (narrowed to the tunnel's PortRange when the
 // optional lineRange is given). Callers must hold WithAllocLock.
 func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int, lineRange ...string) (int, error) {
@@ -148,25 +191,7 @@ func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int, lin
 	if err != nil {
 		return 0, err
 	}
-
-	occupied := make(map[int]bool)
-
-	var ingressPorts []int
-	o.db.Model(&model.ForwardRule{}).Where("ingress_node_id = ?", nodeID).Pluck("listen_port", &ingressPorts)
-	for _, p := range ingressPorts {
-		occupied[p] = true
-	}
-
-	// Also check relay ports if this node serves as an Egress node for any TunnelLine
-	var lineIDs []uint64
-	o.db.Model(&model.TunnelLine{}).Where("egress_node_id = ?", nodeID).Pluck("id", &lineIDs)
-	if len(lineIDs) > 0 {
-		var relayPorts []int
-		o.db.Model(&model.ForwardRule{}).Where("tunnel_line_id IN ?", lineIDs).Pluck("relay_port", &relayPorts)
-		for _, p := range relayPorts {
-			occupied[p] = true
-		}
-	}
+	occupied := o.OccupiedPorts(nodeID)
 
 	if requestedPort > 0 {
 		if err := security.ValidateListenPort(requestedPort, security.DefaultPolicy); err != nil {
@@ -180,15 +205,26 @@ func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int, lin
 		}
 		return requestedPort, nil
 	}
+	return PickFreePort(minP, maxP, occupied)
+}
 
-	port, err := utils.AllocateFreePort(fmt.Sprintf("%d-%d", minP, maxP), occupied)
-	if err != nil {
-		return 0, err
+// EffectiveEngine returns the engine a rule actually runs on. gost / realm cannot enforce per-rule bandwidth limits,
+// so rules of non-admin users that carry a speed limit (own or inherited from the plan) run on the native engine
+// instead; plan bandwidth limits therefore cannot be bypassed by picking another engine.
+func EffectiveEngine(rule *model.ForwardRule, owner *model.User) protocol.EngineType {
+	eng := rule.Engine
+	if eng == "" {
+		eng = protocol.EngineNative
 	}
-	if err := security.ValidateListenPort(port, security.DefaultPolicy); err != nil {
-		return 0, err
+	speedLimit := rule.SpeedMbps
+	if speedLimit <= 0 && owner != nil {
+		speedLimit = owner.SpeedMbps
 	}
-	return port, nil
+	isAdmin := owner != nil && owner.Role == "admin"
+	if speedLimit > 0 && !isAdmin && (eng == protocol.EngineGost || eng == protocol.EngineRealm) {
+		eng = protocol.EngineNative
+	}
+	return eng
 }
 
 // CompileRuleSpecs transforms a database ForwardRule into 1 (Direct) or 2 (Ingress + Egress) runtime RuleSpecs.
@@ -208,15 +244,7 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 		return nil, 0, nil, fmt.Errorf("invalid targets_json for rule %d", rule.ID)
 	}
 
-	eng := rule.Engine
-	if eng == "" {
-		eng = protocol.EngineNative
-	}
-	// gost / realm cannot enforce per-rule bandwidth limits. Rules of non-admin users that carry a speed limit run on
-	// the native engine instead, so plan bandwidth limits cannot be bypassed by picking another engine.
-	if speedLimit > 0 && user.Role != "admin" && (eng == protocol.EngineGost || eng == protocol.EngineRealm) {
-		eng = protocol.EngineNative
-	}
+	eng := EffectiveEngine(rule, &user)
 
 	// Check if this rule uses an encrypted dual-node tunnel (Type == "encrypt") or direct forwarding (Type == "direct")
 	var line model.TunnelLine
@@ -257,8 +285,9 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 		err := o.WithAllocLock(func() error {
 			// Re-read under the lock in case a concurrent dispatch already allocated it.
 			var cur model.ForwardRule
-			if err := o.db.Select("id, relay_port").First(&cur, rule.ID).Error; err == nil && cur.RelayPort > 0 {
+			if err := o.db.Select("id, relay_port, relay_node_id").First(&cur, rule.ID).Error; err == nil && cur.RelayPort > 0 {
 				rule.RelayPort = cur.RelayPort
+				rule.RelayNodeID = cur.RelayNodeID
 				return nil
 			}
 			rp, err := o.AllocatePortForNode(egressNode.ID, 0)
@@ -266,7 +295,9 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 				return err
 			}
 			rule.RelayPort = rp
-			return o.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("relay_port", rp).Error
+			rule.RelayNodeID = egressNode.ID
+			return o.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).
+				Updates(map[string]any{"relay_port": rp, "relay_node_id": egressNode.ID}).Error
 		})
 		if err != nil {
 			return nil, 0, nil, fmt.Errorf("failed to allocate egress port: %w", err)

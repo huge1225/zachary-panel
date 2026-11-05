@@ -102,6 +102,7 @@ export interface ForwardRule {
   ingress_node_id: number
   tunnel_line_id: number
   engine: EngineType
+  effective_engine?: EngineType // 实际运行的引擎（限速规则会从 gost/realm 回退到 native）
   protocol: 'tcp' | 'udp' | 'both'
   listen_port: number
   relay_port: number

@@ -1045,6 +1045,11 @@ function getTunnelById(id: number): TunnelLine | undefined {
   return lines.value.find((l) => l.id === id)
 }
 
+// 规则实际运行引擎与配置引擎不同（限速规则从 gost/realm 回退到 native）
+function ruleEngineFallback(rule: ForwardRule): boolean {
+  return !!rule.effective_engine && rule.effective_engine !== (rule.engine || 'native')
+}
+
 function nodeNameById(id: number): string {
   return nodes.value.find((n) => n.id === id)?.name || `#${id}`
 }
@@ -1557,8 +1562,12 @@ onUnmounted(() => {
                       </span>
                     </td>
                     <td>
-                      <span class="badge badge-neutral">
-                        {{ getTunnelById(rule.tunnel_line_id)?.engine || rule.engine }}
+                      <span
+                        class="badge badge-neutral"
+                        :title="ruleEngineFallback(rule) ? '已设置限速，gost/realm 无法限速，实际以 native 引擎运行' : ''"
+                      >
+                        {{ rule.effective_engine || getTunnelById(rule.tunnel_line_id)?.engine || rule.engine }}
+                        <template v-if="ruleEngineFallback(rule)">（限速回退）</template>
                       </span>
                     </td>
                     <td>
