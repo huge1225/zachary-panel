@@ -139,6 +139,7 @@ func (s *Server) SetupRouter() *gin.Engine {
 			auth.POST("/rules/:id/toggle", ruleMutationLimit(), s.handleToggleRule)
 			auth.POST("/rules/:id/probe", userRateLimit(), s.handleProbeRule)
 			auth.DELETE("/rules/:id", ruleMutationLimit(), s.handleDeleteRule)
+			auth.POST("/rules/batch-delete", ruleMutationLimit(), s.handleBatchDeleteRules)
 
 			// Roles, Plans & Redeem Codes
 			auth.GET("/roles", s.handleListRoleGroups)
@@ -865,6 +866,7 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 	for i := range created {
 		s.orch.DispatchRule(&created[i])
 	}
+	s.fillEffectiveEngines(created)
 	if err != nil {
 		msg := err.Error()
 		if len(created) > 0 {
@@ -1179,6 +1181,55 @@ func (s *Server) handleDeleteRule(c *gin.Context) {
 	s.orch.RemoveRuleFromAgents(&rule)
 	s.db.Delete(&rule)
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
+}
+
+func (s *Server) handleBatchDeleteRules(c *gin.Context) {
+	var req struct {
+		IDs []uint64 `json:"ids" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.IDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择要删除的规则"})
+		return
+	}
+	seen := make(map[uint64]bool, len(req.IDs))
+	ids := make([]uint64, 0, len(req.IDs))
+	for _, id := range req.IDs {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择要删除的规则"})
+		return
+	}
+	if len(ids) > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "单次批量删除最多支持 200 条规则"})
+		return
+	}
+
+	var rules []model.ForwardRule
+	s.db.Where("id IN ?", ids).Find(&rules)
+	if len(rules) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "未找到要删除的规则"})
+		return
+	}
+	uid := s.currentUserID(c)
+	admin := s.isAdmin(c)
+	for i := range rules {
+		if rules[i].UserID != uid && !admin {
+			c.JSON(http.StatusForbidden, gin.H{"error": "无权删除他人规则"})
+			return
+		}
+	}
+
+	deletedIDs := make([]uint64, 0, len(rules))
+	for i := range rules {
+		s.orch.RemoveRuleFromAgents(&rules[i])
+		deletedIDs = append(deletedIDs, rules[i].ID)
+	}
+	s.db.Where("id IN ?", deletedIDs).Delete(&model.ForwardRule{})
+	c.JSON(http.StatusOK, gin.H{"deleted": len(deletedIDs), "ids": deletedIDs})
 }
 
 func (s *Server) handleListRoleGroups(c *gin.Context) {

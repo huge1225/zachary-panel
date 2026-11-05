@@ -332,13 +332,54 @@ function formatUptime(sec: number): string {
   return `${hours}小时 ${mins}分`
 }
 
-// --- 规则批量导入与导出 ---
+// --- 规则批量导入、导出与批量删除 ---
 const showBatchModal = ref(false)
+const batchFileInput = ref<HTMLInputElement | null>(null)
 const batchForm = ref({
   tunnel_line_id: 1,
   protocol: 'tcp' as 'tcp' | 'udp' | 'both',
   rawText: '业务节点A|0|1.1.1.1:443\n业务节点B|0|8.8.8.8:53',
 })
+
+const selectedRuleIds = ref<number[]>([])
+const validSelectedRuleIds = computed(() => {
+  const visibleSet = new Set(visibleRules.value.map((r) => r.id))
+  return selectedRuleIds.value.filter((id) => visibleSet.has(id))
+})
+const allVisibleSelected = computed(
+  () =>
+    visibleRules.value.length > 0 &&
+    visibleRules.value.every((r) => selectedRuleIds.value.includes(r.id)),
+)
+
+function toggleSelectAllRules(e: Event) {
+  const checked = (e.target as HTMLInputElement).checked
+  if (checked) {
+    selectedRuleIds.value = visibleRules.value.map((r) => r.id)
+  } else {
+    selectedRuleIds.value = []
+  }
+}
+
+async function handleBatchDeleteRules() {
+  const ids = validSelectedRuleIds.value
+  if (ids.length === 0) {
+    showToast('请先勾选要删除的规则')
+    return
+  }
+  if (!window.confirm(`确认删除选中的 ${ids.length} 条转发规则吗？`)) {
+    return
+  }
+  try {
+    const res = await api.batchDeleteRules(ids)
+    const deletedSet = new Set(res.ids || ids)
+    rules.value = rules.value.filter((r) => !deletedSet.has(r.id))
+    selectedRuleIds.value = selectedRuleIds.value.filter((id) => !deletedSet.has(id))
+    showToast(`已批量删除 ${res.deleted} 条规则`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
 
 function openBatchModal() {
   if (authorizedLines.value.length === 0) {
@@ -353,26 +394,109 @@ function openBatchModal() {
   showBatchModal.value = true
 }
 
+function parseBatchRuleItems(rawText: string): Array<{
+  name: string
+  listen_port: number
+  targets: TargetEndpoint[]
+  protocol?: 'tcp' | 'udp' | 'both'
+  load_balance?: 'round_robin' | 'failover'
+}> {
+  const trimmed = rawText.trim()
+  if (!trimmed) return []
+  if (trimmed.startsWith('[')) {
+    try {
+      const arr = JSON.parse(trimmed)
+      if (Array.isArray(arr)) {
+        return arr
+          .map((item, idx) => {
+            if (!item || typeof item !== 'object') return null
+            const name = String(item.name || `批量规则-${idx + 1}`).trim()
+            const listen_port = Number(item.listen_port) || 0
+            let targets: TargetEndpoint[] = []
+            if (Array.isArray(item.targets)) {
+              targets = item.targets
+                .map((t: any) => ({ address: String(typeof t === 'string' ? t : t?.address || '').trim() }))
+                .filter((t: TargetEndpoint) => Boolean(t.address))
+            } else if (typeof item.targets_json === 'string') {
+              targets = parseTargets(item.targets_json)
+            } else if (typeof item.target === 'string' && item.target.trim()) {
+              targets = item.target
+                .split(',')
+                .map((s: string) => ({ address: s.trim() }))
+                .filter((t: TargetEndpoint) => Boolean(t.address))
+            }
+            if (targets.length === 0) return null
+            const proto = ['tcp', 'udp', 'both'].includes(String(item.protocol || '').toLowerCase())
+              ? (String(item.protocol).toLowerCase() as 'tcp' | 'udp' | 'both')
+              : undefined
+            const lb = ['round_robin', 'failover'].includes(String(item.load_balance || ''))
+              ? (String(item.load_balance) as 'round_robin' | 'failover')
+              : undefined
+            return { name, listen_port, targets, protocol: proto, load_balance: lb }
+          })
+          .filter(Boolean) as Array<{
+          name: string
+          listen_port: number
+          targets: TargetEndpoint[]
+          protocol?: 'tcp' | 'udp' | 'both'
+          load_balance?: 'round_robin' | 'failover'
+        }>
+      }
+    } catch {
+      // fall through to line parser
+    }
+  }
+
+  const rows = trimmed
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter((s) => Boolean(s) && !s.startsWith('#'))
+  return rows
+    .map((row, idx) => {
+      const sep = row.includes('|') ? '|' : ','
+      const parts = row.split(sep).map((s) => s.trim())
+      if (parts.length < 2) return null
+      const name = parts.length >= 3 ? parts[0] : `批量规则-${idx + 1}`
+      const listen_port = parts.length >= 3 ? Number(parts[1]) || 0 : Number(parts[0]) || 0
+      const rawAddr = parts.length >= 3 ? parts[2] : parts[1]
+      const targets = (rawAddr || '')
+        .split(';')
+        .map((a) => ({ address: a.trim() }))
+        .filter((t) => Boolean(t.address))
+      if (targets.length === 0) return null
+      const protoRaw = parts.length >= 4 ? (parts[3] || '').toLowerCase() : ''
+      const protocol = ['tcp', 'udp', 'both'].includes(protoRaw)
+        ? (protoRaw as 'tcp' | 'udp' | 'both')
+        : undefined
+      return { name, listen_port, targets, protocol }
+    })
+    .filter(Boolean) as Array<{
+    name: string
+    listen_port: number
+    targets: TargetEndpoint[]
+    protocol?: 'tcp' | 'udp' | 'both'
+  }>
+}
+
+function handleBatchFileSelect(e: Event) {
+  const input = e.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    batchForm.value.rawText = String(reader.result || '')
+    showToast(`已读取文件 ${file.name}`)
+  }
+  reader.readAsText(file)
+  input.value = ''
+}
+
 async function submitBatchRules() {
   if (!userHasTunnel(user.value, batchForm.value.tunnel_line_id)) {
     showToast('无权在该隧道下导入规则')
     return
   }
-  const rows = batchForm.value.rawText
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
-  const items = rows
-    .map((row, idx) => {
-      const parts = row.split('|').map((s) => s.trim())
-      if (parts.length < 2) return null
-      const name = parts.length >= 3 ? parts[0] : `批量规则-${idx + 1}`
-      const listen_port = parts.length >= 3 ? Number(parts[1]) || 0 : Number(parts[0]) || 0
-      const addr = parts.length >= 3 ? parts[2] : parts[1]
-      return { name, listen_port, targets: [{ address: addr }] }
-    })
-    .filter(Boolean) as Array<{ name: string; listen_port: number; targets: TargetEndpoint[] }>
-
+  const items = parseBatchRuleItems(batchForm.value.rawText)
   if (items.length === 0) {
     showToast('请输入有效规则')
     return
@@ -392,14 +516,21 @@ async function submitBatchRules() {
 }
 
 function exportRulesToClipboard() {
-  const text = visibleRules.value
+  const source =
+    validSelectedRuleIds.value.length > 0
+      ? visibleRules.value.filter((r) => validSelectedRuleIds.value.includes(r.id))
+      : visibleRules.value
+  const text = source
     .map((r) => {
-      const firstTarget = parseTargets(r.targets_json)[0]?.address || ''
-      return `${r.name}|${r.listen_port}|${firstTarget}`
+      const addrs = parseTargets(r.targets_json)
+        .map((t) => t.address)
+        .filter(Boolean)
+        .join(';')
+      return `${r.name}|${r.listen_port}|${addrs}|${r.protocol}`
     })
     .join('\n')
   copyConnectAddr(text)
-  showToast(`已导出 ${visibleRules.value.length} 条规则到剪贴板`)
+  showToast(`已导出 ${source.length} 条规则到剪贴板`)
 }
 
 // --- 角色管理 (管理员：角色决定可用隧道) ---
@@ -933,6 +1064,7 @@ async function handleDeleteRule(id: number) {
   try {
     await api.deleteRule(id)
     rules.value = rules.value.filter((r) => r.id !== id)
+    selectedRuleIds.value = selectedRuleIds.value.filter((rid) => rid !== id)
   } catch (e: any) {
     showToast(e.message)
   }
@@ -1524,7 +1656,16 @@ onUnmounted(() => {
                 <span v-if="authorizedLines.length === 0" style="color: var(--danger-text);">无可用隧道权限</span>
               </div>
               <div style="display: flex; gap: 8px;">
-                <button @click="exportRulesToClipboard" class="btn btn-outline">导出规则</button>
+                <button
+                  v-if="validSelectedRuleIds.length > 0"
+                  @click="handleBatchDeleteRules"
+                  class="btn btn-danger"
+                >
+                  批量删除 ({{ validSelectedRuleIds.length }})
+                </button>
+                <button @click="exportRulesToClipboard" class="btn btn-outline">
+                  {{ validSelectedRuleIds.length > 0 ? `导出已选 (${validSelectedRuleIds.length})` : '导出规则' }}
+                </button>
                 <button @click="openBatchModal" class="btn btn-soft">批量导入</button>
                 <button @click="openCreateRuleModal" class="btn btn-primary">+ 新增转发</button>
               </div>
@@ -1533,6 +1674,16 @@ onUnmounted(() => {
               <table>
                 <thead>
                   <tr>
+                    <th style="width: 36px; text-align: center;">
+                      <input
+                        type="checkbox"
+                        :checked="allVisibleSelected"
+                        :disabled="visibleRules.length === 0"
+                        @change="toggleSelectAllRules"
+                        title="全选 / 取消全选"
+                        style="cursor: pointer;"
+                      />
+                    </th>
                     <th>名称</th>
                     <th v-if="isAdmin">所属用户</th>
                     <th>隧道</th>
@@ -1546,6 +1697,14 @@ onUnmounted(() => {
                 </thead>
                 <tbody>
                   <tr v-for="rule in visibleRules" :key="rule.id">
+                    <td style="text-align: center;">
+                      <input
+                        type="checkbox"
+                        :value="rule.id"
+                        v-model="selectedRuleIds"
+                        style="cursor: pointer;"
+                      />
+                    </td>
                     <td>
                       <div style="font-weight: 500;">{{ rule.name }}</div>
                       <div style="font-size: 12px; color: var(--text-muted);">{{ rule.protocol.toUpperCase() }}</div>
@@ -2377,8 +2536,30 @@ onUnmounted(() => {
             </div>
           </div>
           <div>
-            <label class="form-label">规则列表</label>
-            <textarea v-model="batchForm.rawText" rows="5" class="textarea" placeholder="格式：名称|监听端口|目标IP:端口"></textarea>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label class="form-label" style="margin-bottom: 0;">规则列表（最多 50 条）</label>
+              <div>
+                <input
+                  ref="batchFileInput"
+                  type="file"
+                  accept=".txt,.csv,.json"
+                  style="display: none;"
+                  @change="handleBatchFileSelect"
+                />
+                <button type="button" @click="batchFileInput?.click()" class="btn btn-outline btn-sm">
+                  从文件导入 (.txt/.csv/.json)
+                </button>
+              </div>
+            </div>
+            <textarea
+              v-model="batchForm.rawText"
+              rows="6"
+              class="textarea"
+              placeholder="每行一条：名称|监听端口|目标IP:端口(|协议)&#10;例如：业务节点A|0|1.1.1.1:443|tcp&#10;多目标用分号分隔：业务节点B|0|1.1.1.1:443;1.0.0.1:443"
+            ></textarea>
+            <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+              支持格式：<code>名称|监听端口|目标地址(|协议)</code>（监听端口填 0 自动分配，多目标用 <code>;</code> 分隔），或 JSON 数组。
+            </div>
           </div>
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showBatchModal = false" class="btn btn-outline">取消</button>

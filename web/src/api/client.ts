@@ -238,6 +238,8 @@ export const api = {
       name: string
       listen_port: number
       targets: TargetEndpoint[]
+      protocol?: 'tcp' | 'udp' | 'both'
+      load_balance?: 'round_robin' | 'failover'
     }>
   }) =>
     request<ForwardRule[]>('/rules/batch', {
@@ -261,6 +263,12 @@ export const api = {
 
   deleteRule: (id: number) =>
     request<{ deleted: boolean }>(`/rules/${id}`, { method: 'DELETE' }),
+
+  batchDeleteRules: (ids: number[]) =>
+    request<{ deleted: number; ids: number[] }>('/rules/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ ids }),
+    }),
 
   getRoles: () => request<RoleGroup[]>('/roles'),
   getPlans: () => request<Plan[]>('/plans'),

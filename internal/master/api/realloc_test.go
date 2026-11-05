@@ -349,3 +349,74 @@ func TestPickFreePort(t *testing.T) {
 		t.Fatal("exhausted range must error")
 	}
 }
+
+// Batch create + batch delete rules, including cross-user ownership checks.
+func TestBatchCreateAndDeleteRules(t *testing.T) {
+	r, db, cleanup := setupTestServerWithDB(t)
+	defer cleanup()
+	admin := login(t, r, "admin@nexus.local", "admin123")
+	userTok := login(t, r, "user@nexus.local", "user12345")
+
+	var line model.TunnelLine
+	if err := db.First(&line).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// Admin creates a rule
+	w := doJSON(r, http.MethodPost, "/api/v1/rules", admin, map[string]any{
+		"name": "admin-rule", "tunnel_line_id": line.ID, "protocol": "tcp",
+		"targets": []map[string]string{{"address": "1.1.1.1:443"}},
+	}, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create admin rule: %d %s", w.Code, w.Body.String())
+	}
+	var adminRule model.ForwardRule
+	db.Where("name = ?", "admin-rule").First(&adminRule)
+
+	// User batch creates 2 rules
+	w = doJSON(r, http.MethodPost, "/api/v1/rules/batch", userTok, map[string]any{
+		"tunnel_line_id": line.ID,
+		"protocol":       "tcp",
+		"items": []map[string]any{
+			{"name": "ub-1", "listen_port": 0, "targets": []map[string]string{{"address": "1.1.1.1:443"}, {"address": "1.0.0.1:443"}}},
+			{"name": "ub-2", "listen_port": 0, "protocol": "udp", "targets": []map[string]string{{"address": "8.8.8.8:53"}}},
+		},
+	}, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("user batch create: %d %s", w.Code, w.Body.String())
+	}
+	var ub1, ub2 model.ForwardRule
+	db.Where("name = ?", "ub-1").First(&ub1)
+	db.Where("name = ?", "ub-2").First(&ub2)
+	if ub1.ID == 0 || ub2.ID == 0 || ub2.Protocol != "udp" {
+		t.Fatalf("unexpected batch rules: ub1=%+v ub2=%+v", ub1, ub2)
+	}
+
+	// Empty ids -> 400
+	if w := doJSON(r, http.MethodPost, "/api/v1/rules/batch-delete", userTok, map[string]any{"ids": []uint64{}}, ""); w.Code != http.StatusBadRequest {
+		t.Fatalf("empty batch delete must return 400, got %d", w.Code)
+	}
+
+	// User trying to batch delete including admin's rule -> 403 and nothing deleted
+	if w := doJSON(r, http.MethodPost, "/api/v1/rules/batch-delete", userTok, map[string]any{
+		"ids": []uint64{ub1.ID, adminRule.ID},
+	}, ""); w.Code != http.StatusForbidden {
+		t.Fatalf("cross-user batch delete must return 403, got %d %s", w.Code, w.Body.String())
+	}
+	var cnt int64
+	db.Model(&model.ForwardRule{}).Where("id IN ?", []uint64{ub1.ID, adminRule.ID}).Count(&cnt)
+	if cnt != 2 {
+		t.Fatalf("atomic check failed: expected 2 remaining, got %d", cnt)
+	}
+
+	// User batch deletes own rules (with duplicate ID) -> 200
+	if w := doJSON(r, http.MethodPost, "/api/v1/rules/batch-delete", userTok, map[string]any{
+		"ids": []uint64{ub1.ID, ub2.ID, ub1.ID},
+	}, ""); w.Code != http.StatusOK {
+		t.Fatalf("user batch delete own rules: %d %s", w.Code, w.Body.String())
+	}
+	db.Model(&model.ForwardRule{}).Where("id IN ?", []uint64{ub1.ID, ub2.ID}).Count(&cnt)
+	if cnt != 0 {
+		t.Fatalf("expected 0 remaining after batch delete, got %d", cnt)
+	}
+}
