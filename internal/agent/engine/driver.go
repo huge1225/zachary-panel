@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"nexus-panel/internal/agent/security"
@@ -180,6 +181,9 @@ func (m *Manager) applyRuleLocked(ctx context.Context, spec protocol.RuleSpec) e
 			spec.Engine, protocol.EngineNative, spec.RuleID, spec.Role)
 		spec.Engine = protocol.EngineNative
 	}
+	if (spec.AccessMode == "allow" || spec.AccessMode == "deny") && strings.TrimSpace(spec.AccessCIDRs) != "" && spec.Engine != protocol.EngineNative {
+		spec.Engine = protocol.EngineNative
+	}
 
 	// Enforce Agent-side security sandbox validation (Anti-SSRF, Protected Port Guard, Injection Filter)
 	if err := security.ValidateRuleSpec(spec, m.policy); err != nil {
@@ -313,6 +317,9 @@ func effectiveEngine(spec protocol.RuleSpec) protocol.EngineType {
 	if (spec.Role == protocol.RoleIngress || spec.Role == protocol.RoleEgress) && !supportsEncryptedTunnel(e) {
 		e = protocol.EngineNative
 	}
+	if (spec.AccessMode == "allow" || spec.AccessMode == "deny") && strings.TrimSpace(spec.AccessCIDRs) != "" {
+		e = protocol.EngineNative
+	}
 	return e
 }
 
@@ -322,6 +329,7 @@ func sameRuleSpec(a, b protocol.RuleSpec) bool {
 	if a.RuleID != b.RuleID || a.Role != b.Role || effectiveEngine(a) != effectiveEngine(b) ||
 		a.Protocol != b.Protocol || a.ListenHost != b.ListenHost || a.ListenPort != b.ListenPort ||
 		a.LoadBalance != b.LoadBalance || a.SpeedLimitMbps != b.SpeedLimitMbps || a.MaxConns != b.MaxConns ||
+		a.AccessMode != b.AccessMode || a.AccessCIDRs != b.AccessCIDRs ||
 		len(a.Targets) != len(b.Targets) {
 		return false
 	}

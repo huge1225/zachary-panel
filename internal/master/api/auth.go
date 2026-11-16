@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"log"
 	"net/http"
@@ -262,7 +263,30 @@ func GenerateToken(u *model.User) (string, error) {
 
 func (s *Server) AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		apiKey := strings.TrimSpace(c.GetHeader("X-API-Key"))
 		authHeader := c.GetHeader("Authorization")
+		if apiKey == "" && strings.HasPrefix(authHeader, "Bearer zp_live_") {
+			apiKey = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		}
+		if apiKey != "" {
+			cfg := s.getSystemConfig()
+			expectedHash := strings.TrimSpace(cfg.AdminAPIKeyHash)
+			givenHash := hashAPIKey(apiKey)
+			if expectedHash == "" || subtle.ConstantTimeCompare([]byte(expectedHash), []byte(givenHash)) != 1 {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or revoked API key"})
+				return
+			}
+			var adminUser model.User
+			if err := s.db.Select("id, role, status").Where("role = 'admin' AND status = 'active'").Order("id asc").First(&adminUser).Error; err != nil {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "no active administrator account"})
+				return
+			}
+			c.Set("user_id", adminUser.ID)
+			c.Set("user_role", "admin")
+			c.Next()
+			return
+		}
+
 		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing authorization token"})
 			return
@@ -375,6 +399,7 @@ func (s *Server) handleLogin(c *gin.Context) {
 	var req struct {
 		Email    string `json:"email" binding:"required"`
 		Password string `json:"password" binding:"required"`
+		TOTPCode string `json:"totp_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入邮箱和密码"})
@@ -407,6 +432,24 @@ func (s *Server) handleLogin(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "账号已被封禁"})
 		return
 	}
+	if user.TOTPEnabled && strings.TrimSpace(user.TOTPSecret) != "" {
+		totpCode := strings.TrimSpace(req.TOTPCode)
+		if totpCode == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":         "该账号已开启双因素认证 (2FA)，请输入 6 位动态验证码",
+				"totp_required": true,
+			})
+			return
+		}
+		if !VerifyTOTPCode(user.TOTPSecret, totpCode, time.Now()) {
+			accountGuard.fail(email, clientIP)
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":         "双因素认证 (2FA) 动态验证码错误",
+				"totp_required": true,
+			})
+			return
+		}
+	}
 	accountGuard.success(email, clientIP)
 
 	token, err := GenerateToken(&user)
@@ -414,6 +457,7 @@ func (s *Server) handleLogin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
 		return
 	}
+	s.recordAuditForUser(c, user.ID, user.Email, "user.login", user.Email, "用户登录成功")
 
 	c.JSON(http.StatusOK, gin.H{
 		"token": token,
@@ -500,6 +544,7 @@ func (s *Server) handleRegister(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "注册失败，请稍后再试"})
 		return
 	}
+	s.recordAuditForUser(c, user.ID, user.Email, "user.register", user.Email, "新用户注册账号")
 
 	token, _ := GenerateToken(&user)
 	c.JSON(http.StatusCreated, gin.H{
@@ -545,6 +590,7 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 		return
 	}
 	_ = s.db.First(&user, uid).Error
+	s.recordAuditForUser(c, user.ID, user.Email, "user.change_password", user.Email, "用户自助修改登录密码")
 	token, _ := GenerateToken(&user)
 	c.JSON(http.StatusOK, gin.H{"message": "密码已修改，其他设备上的登录已失效", "token": token})
 }

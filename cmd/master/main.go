@@ -61,11 +61,14 @@ func main() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			now := time.Now()
+			orch.ProcessPeriodicResets(now)
 			var expiredUsers []model.User
-			db.Where("used_bytes >= quota_bytes OR expire_at < ?", time.Now()).Find(&expiredUsers)
+			db.Where("used_bytes >= quota_bytes OR expire_at < ?", now).Find(&expiredUsers)
 			for _, u := range expiredUsers {
 				orch.EnforceUserQuotaCutoff(u.ID)
 			}
+			orch.PruneOldTrafficStats(now)
 			orch.ReconcileAllOnlineNodes()
 		}
 	}()

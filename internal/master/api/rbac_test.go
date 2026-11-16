@@ -54,6 +54,7 @@ func loginAndGetToken(t *testing.T, r *gin.Engine, email, password string) strin
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = nextIP()
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

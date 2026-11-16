@@ -20,8 +20,9 @@ import (
 // Orchestrator coordinates rule compilation, dual-end tunnel pairing (Ingress <-> Egress),
 // port allocation, and real-time traffic billing.
 type Orchestrator struct {
-	db  *gorm.DB
-	hub *hub.AgentHub
+	db       *gorm.DB
+	hub      *hub.AgentHub
+	notifier *Notifier
 
 	// allocMu serializes quota checks, port allocation and rule persistence so that concurrent requests cannot
 	// exceed rule / port quotas or allocate the same port twice (TOCTOU).
@@ -34,13 +35,39 @@ const maxDeltaBytes int64 = 64 << 30 // 64 GiB
 
 func NewOrchestrator(db *gorm.DB, agentHub *hub.AgentHub) *Orchestrator {
 	o := &Orchestrator{
-		db:  db,
-		hub: agentHub,
+		db:       db,
+		hub:      agentHub,
+		notifier: NewNotifier(db),
 	}
-	agentHub.SetCallbacks(o.HandleTrafficReport, func(nodeID uint64) { o.SyncNodeRules(nodeID) })
+	agentHub.SetCallbacks(o.HandleTrafficReport, func(nodeID uint64) {
+		o.SyncNodeRules(nodeID)
+		var n model.Node
+		if err := o.db.First(&n, nodeID).Error; err == nil {
+			o.notifier.NotifyNodeEventAsync(
+				"node_online",
+				"节点上线通知",
+				fmt.Sprintf("节点 #%d「%s」(%s) 已建立连接并同步规则。", n.ID, n.Name, n.ConnectIP),
+			)
+		}
+	})
+	agentHub.SetOfflineCallback(func(nodeID uint64) {
+		var n model.Node
+		if err := o.db.First(&n, nodeID).Error; err == nil {
+			o.notifier.NotifyNodeEventAsync(
+				"node_offline",
+				"节点离线告警",
+				fmt.Sprintf("节点 #%d「%s」(%s) 已与主控面板断开连接，请检查服务器网络或 Agent 状态。", n.ID, n.Name, n.ConnectIP),
+			)
+		}
+	})
 	agentHub.SetCertChangedCallback(o.OnEgressCertChanged)
 	agentHub.SetAckScope(o.NodeOwnsRuleRole)
 	return o
+}
+
+// Notifier returns the operational alert notifier instance.
+func (o *Orchestrator) Notifier() *Notifier {
+	return o.notifier
 }
 
 // WithAllocLock runs fn while holding the allocation lock. Handlers must perform quota counting, port allocation
@@ -208,13 +235,16 @@ func (o *Orchestrator) AllocatePortForNode(nodeID uint64, requestedPort int, lin
 	return PickFreePort(minP, maxP, occupied)
 }
 
-// EffectiveEngine returns the engine a rule actually runs on. gost / realm cannot enforce per-rule bandwidth limits,
-// so rules of non-admin users that carry a speed limit (own or inherited from the plan) run on the native engine
-// instead; plan bandwidth limits therefore cannot be bypassed by picking another engine.
+// EffectiveEngine returns the engine a rule actually runs on. gost / realm cannot enforce per-rule bandwidth limits
+// or per-rule IP ACLs, so rules that carry a speed limit (for non-admins, or explicit rule-level speed limit) or
+// an active IP ACL run on the native engine instead.
 func EffectiveEngine(rule *model.ForwardRule, owner *model.User) protocol.EngineType {
 	eng := rule.Engine
 	if eng == "" {
 		eng = protocol.EngineNative
+	}
+	if (rule.AccessMode == "allow" || rule.AccessMode == "deny") && strings.TrimSpace(rule.AccessCIDRs) != "" {
+		return protocol.EngineNative
 	}
 	speedLimit := rule.SpeedMbps
 	if speedLimit <= 0 && owner != nil {
@@ -269,6 +299,8 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 			LoadBalance:    rule.LoadBalance,
 			Targets:        targets,
 			SpeedLimitMbps: speedLimit,
+			AccessMode:     rule.AccessMode,
+			AccessCIDRs:    rule.AccessCIDRs,
 			UpdatedAt:      rule.UpdatedAt,
 		}
 		return spec, 0, nil, nil
@@ -365,6 +397,8 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 		},
 		Tunnel:         tunnelCfg,
 		SpeedLimitMbps: speedLimit,
+		AccessMode:     rule.AccessMode,
+		AccessCIDRs:    rule.AccessCIDRs,
 		UpdatedAt:      rule.UpdatedAt,
 	}
 
@@ -648,6 +682,14 @@ func (o *Orchestrator) EnforceNodeQuotaCutoff(nodeID uint64) {
 	}
 	if len(rules) > 0 {
 		log.Printf("[Orchestrator] Cut off %d rules on Node #%d due to node traffic quota exhaustion", len(rules), nodeID)
+		var n model.Node
+		if err := o.db.First(&n, nodeID).Error; err == nil {
+			o.notifier.NotifyQuotaEventAsync(
+				"node_quota_exceeded",
+				"节点月流量配额耗尽告警",
+				fmt.Sprintf("节点 #%d「%s」已达到月流量上限，已自动暂停该节点上的 %d 条转发规则。", n.ID, n.Name, len(rules)),
+			)
+		}
 	}
 }
 
@@ -672,5 +714,122 @@ func (o *Orchestrator) EnforceUserQuotaCutoff(userID uint64) {
 	}
 	if len(activeRules) > 0 {
 		log.Printf("[Orchestrator] Cut off %d rules for User #%d due to quota/expiration", len(activeRules), userID)
+		var u model.User
+		if err := o.db.First(&u, userID).Error; err == nil {
+			o.notifier.NotifyQuotaEventAsync(
+				"user_quota_exceeded",
+				"用户流量耗尽或到期停机通知",
+				fmt.Sprintf("用户 #%d (%s) 套餐已到期或流量已用尽，已自动暂停其 %d 条运行中的转发规则。", u.ID, u.Email, len(activeRules)),
+			)
+		}
 	}
 }
+
+// PruneOldTrafficStats deletes hourly traffic records older than 30 days so the table remains bounded.
+func (o *Orchestrator) PruneOldTrafficStats(now time.Time) {
+	cutoff := now.UTC().AddDate(0, 0, -30).Format("2006-01-02 15:00")
+	o.db.Where("hour_bucket < ?", cutoff).Delete(&model.TrafficHourlyStat{})
+}
+
+// ResetNodeTraffic clears a node's accumulated traffic counter and resumes any `node_quota_exceeded` rules on that node
+// whose owners are currently eligible to forward.
+func (o *Orchestrator) ResetNodeTraffic(nodeID uint64, now time.Time) int {
+	var node model.Node
+	if err := o.db.First(&node, nodeID).Error; err != nil {
+		return 0
+	}
+	o.db.Model(&model.Node{}).Where("id = ?", nodeID).Updates(map[string]any{
+		"used_bytes":       0,
+		"last_reset_month": now.UTC().Format("2006-01"),
+	})
+
+	var rules []model.ForwardRule
+	o.db.Where("ingress_node_id = ? AND status = ?", nodeID, "node_quota_exceeded").Find(&rules)
+	resumed := 0
+	for i := range rules {
+		var u model.User
+		if err := o.db.First(&u, rules[i].UserID).Error; err != nil || !u.CanForward(now) || !u.HasTunnelPermission(rules[i].TunnelLineID) {
+			continue
+		}
+		if res := o.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "node_quota_exceeded").
+			Updates(map[string]any{"enabled": true, "status": "running"}); res.Error == nil && res.RowsAffected > 0 {
+			o.db.First(&rules[i], rules[i].ID)
+			o.DispatchRule(&rules[i])
+			resumed++
+		}
+	}
+	o.SyncNodeRules(nodeID)
+	return resumed
+}
+
+// ResumeUserQuotaRules resumes any `quota_exceeded` rules belonging to the user if the user is eligible to forward.
+func (o *Orchestrator) ResumeUserQuotaRules(u *model.User, now time.Time) int {
+	if u == nil || !u.CanForward(now) {
+		return 0
+	}
+	var rules []model.ForwardRule
+	o.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
+	resumed := 0
+	for i := range rules {
+		if !u.HasTunnelPermission(rules[i].TunnelLineID) || rules[i].ListenPort <= 0 {
+			continue
+		}
+		if res := o.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").
+			Updates(map[string]any{"enabled": true, "status": "running"}); res.Error == nil && res.RowsAffected > 0 {
+			o.db.First(&rules[i], rules[i].ID)
+			o.DispatchRule(&rules[i])
+			resumed++
+		}
+	}
+	return resumed
+}
+
+// ProcessPeriodicResets runs the automatic monthly traffic reset for nodes (on ResetDay 1..28)
+// and for active long-cycle users (with MonthlyReset == true every 30 days).
+func (o *Orchestrator) ProcessPeriodicResets(now time.Time) {
+	utcNow := now.UTC()
+	currentYM := utcNow.Format("2006-01")
+	currentDay := utcNow.Day()
+
+	// 1. Node monthly traffic reset on ResetDay
+	var nodes []model.Node
+	o.db.Where("reset_day >= 1 AND reset_day <= 28").Find(&nodes)
+	for _, n := range nodes {
+		if currentDay >= n.ResetDay && n.LastResetMonth != currentYM {
+			res := o.db.Model(&model.Node{}).
+				Where("id = ? AND last_reset_month <> ?", n.ID, currentYM).
+				Updates(map[string]any{"used_bytes": 0, "last_reset_month": currentYM})
+			if res.Error == nil && res.RowsAffected > 0 {
+				resumed := o.ResetNodeTraffic(n.ID, utcNow)
+				log.Printf("[Orchestrator] Auto-reset monthly traffic for Node #%d (%s) on day %d (resumed %d rules)", n.ID, n.Name, n.ResetDay, resumed)
+			}
+		}
+	}
+
+	// 2. User 30-day periodic traffic reset for long-cycle subscriptions (quarterly / annual)
+	var users []model.User
+	o.db.Where("monthly_reset = ? AND status = ?", true, "active").Find(&users)
+	for i := range users {
+		u := &users[i]
+		if u.Role != "admin" && !u.ExpireAt.IsZero() && utcNow.After(u.ExpireAt) {
+			continue
+		}
+		refTime := u.CreatedAt
+		if u.LastResetAt != nil && !u.LastResetAt.IsZero() {
+			refTime = *u.LastResetAt
+		}
+		if refTime.IsZero() || utcNow.Sub(refTime) >= 30*24*time.Hour {
+			resetTime := utcNow
+			if err := o.db.Model(&model.User{}).Where("id = ?", u.ID).Updates(map[string]any{
+				"used_bytes":    0,
+				"last_reset_at": &resetTime,
+			}).Error; err == nil {
+				u.UsedBytes = 0
+				u.LastResetAt = &resetTime
+				resumed := o.ResumeUserQuotaRules(u, utcNow)
+				log.Printf("[Orchestrator] Auto-reset 30-day cycle traffic for User #%d (%s, resumed %d rules)", u.ID, u.Email, resumed)
+			}
+		}
+	}
+}
+

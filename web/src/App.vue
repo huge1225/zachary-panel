@@ -8,6 +8,9 @@ import {
   type TunnelLine,
   type ForwardRule,
   type Plan,
+  type RedeemCodeItem,
+  type BillingOrder,
+  type AuditLogItem,
   type RoleGroup,
   type EngineType,
   type TargetEndpoint,
@@ -60,6 +63,9 @@ const nodes = ref<NodeItem[]>([])
 const lines = ref<TunnelLine[]>([])
 const rules = ref<ForwardRule[]>([])
 const plans = ref<Plan[]>([])
+const redeemCodesList = ref<RedeemCodeItem[]>([])
+const ordersList = ref<BillingOrder[]>([])
+const auditLogsList = ref<AuditLogItem[]>([])
 
 const isAdmin = computed(() => user.value?.role === 'admin')
 
@@ -111,6 +117,54 @@ const visibleRules = computed(() => {
   return rules.value.filter((r) => r.user_id === user.value?.id)
 })
 
+const ruleSearchQuery = ref('')
+const ruleFilterTunnelId = ref<number>(0)
+const ruleFilterProtocol = ref<string>('all')
+const ruleFilterStatus = ref<string>('all')
+
+const filteredRules = computed(() => {
+  const q = ruleSearchQuery.value.trim().toLowerCase()
+  return visibleRules.value.filter((r) => {
+    if (ruleFilterTunnelId.value > 0 && r.tunnel_line_id !== ruleFilterTunnelId.value) return false
+    if (ruleFilterProtocol.value !== 'all' && r.protocol !== ruleFilterProtocol.value) return false
+    if (ruleFilterStatus.value === 'running' && !r.enabled) return false
+    if (ruleFilterStatus.value === 'paused' && r.enabled) return false
+    if (q) {
+      const matchName = (r.name || '').toLowerCase().includes(q)
+      const matchPort = String(r.listen_port).includes(q)
+      const matchTarget = (r.targets_json || '').toLowerCase().includes(q)
+      const matchUser = isAdmin.value && userEmailById(r.user_id).toLowerCase().includes(q)
+      if (!matchName && !matchPort && !matchTarget && !matchUser) return false
+    }
+    return true
+  })
+})
+
+const userSearchQuery = ref('')
+const userFilterPlanId = ref<number>(-1)
+const userFilterRoleId = ref<number>(-1)
+const userFilterStatus = ref<string>('all')
+
+const filteredUsersList = computed(() => {
+  const q = userSearchQuery.value.trim().toLowerCase()
+  return usersList.value.filter((u) => {
+    if (userFilterPlanId.value >= 0 && (u.plan_id || 0) !== userFilterPlanId.value) return false
+    if (userFilterRoleId.value >= 0 && (u.role_group_id || 0) !== userFilterRoleId.value) return false
+    const expired = isUserExpired(u)
+    const overQuota = u.quota_bytes > 0 && u.used_bytes >= u.quota_bytes
+    if (userFilterStatus.value === 'banned' && u.status === 'active') return false
+    if (userFilterStatus.value === 'expired' && (u.status !== 'active' || !expired)) return false
+    if (userFilterStatus.value === 'over_quota' && (u.status !== 'active' || !overQuota)) return false
+    if (userFilterStatus.value === 'active' && (u.status !== 'active' || expired || overQuota)) return false
+    if (q) {
+      const matchEmail = (u.email || '').toLowerCase().includes(q)
+      const matchId = String(u.id) === q
+      if (!matchEmail && !matchId) return false
+    }
+    return true
+  })
+})
+
 const toastMsg = ref('')
 let toastTimer: ReturnType<typeof setTimeout> | null = null
 function showToast(msg: string) {
@@ -140,6 +194,8 @@ const ruleForm = ref({
   load_balance: 'round_robin' as 'round_robin' | 'failover',
   targetsText: '1.1.1.1:443',
   speed_mbps: 0,
+  access_mode: 'off' as 'off' | 'allow' | 'deny',
+  access_cidrs: '',
 })
 
 // 当前选中隧道（或其入口节点）的可用端口范围，用于监听端口输入提示
@@ -164,6 +220,8 @@ function openCreateRuleModal() {
     load_balance: 'round_robin',
     targetsText: '1.1.1.1:443',
     speed_mbps: 0,
+    access_mode: 'off',
+    access_cidrs: '',
   }
   showRuleModal.value = true
 }
@@ -183,6 +241,8 @@ function openEditRuleModal(rule: ForwardRule) {
     load_balance: rule.load_balance,
     targetsText: targets.map((t) => t.address).join('\n'),
     speed_mbps: rule.speed_mbps,
+    access_mode: (rule.access_mode as 'off' | 'allow' | 'deny') || 'off',
+    access_cidrs: rule.access_cidrs || '',
   }
   showRuleModal.value = true
 }
@@ -202,6 +262,8 @@ function quickCreateRuleForTunnel(line: TunnelLine) {
     load_balance: 'round_robin',
     targetsText: '1.1.1.1:443',
     speed_mbps: 0,
+    access_mode: 'off',
+    access_cidrs: '',
   }
   showRuleModal.value = true
 }
@@ -270,6 +332,7 @@ const nodeForm = ref({
   traffic_rate: 1.0,
   quota_gb: 2000,
   used_gb: 0,
+  reset_day: 0,
 })
 
 function openCreateNodeModal() {
@@ -283,6 +346,7 @@ function openCreateNodeModal() {
     traffic_rate: 1.0,
     quota_gb: 2000,
     used_gb: 0,
+    reset_day: 0,
   }
   showNodeModal.value = true
 }
@@ -298,6 +362,7 @@ function openEditNodeModal(node: NodeItem) {
     traffic_rate: node.traffic_rate,
     quota_gb: Math.round((node.quota_bytes || 0) / GB),
     used_gb: Number(((node.used_bytes || 0) / GB).toFixed(1)),
+    reset_day: node.reset_day || 0,
   }
   showNodeModal.value = true
 }
@@ -343,19 +408,19 @@ const batchForm = ref({
 
 const selectedRuleIds = ref<number[]>([])
 const validSelectedRuleIds = computed(() => {
-  const visibleSet = new Set(visibleRules.value.map((r) => r.id))
+  const visibleSet = new Set(filteredRules.value.map((r) => r.id))
   return selectedRuleIds.value.filter((id) => visibleSet.has(id))
 })
 const allVisibleSelected = computed(
   () =>
-    visibleRules.value.length > 0 &&
-    visibleRules.value.every((r) => selectedRuleIds.value.includes(r.id)),
+    filteredRules.value.length > 0 &&
+    filteredRules.value.every((r) => selectedRuleIds.value.includes(r.id)),
 )
 
 function toggleSelectAllRules(e: Event) {
   const checked = (e.target as HTMLInputElement).checked
   if (checked) {
-    selectedRuleIds.value = visibleRules.value.map((r) => r.id)
+    selectedRuleIds.value = filteredRules.value.map((r) => r.id)
   } else {
     selectedRuleIds.value = []
   }
@@ -432,11 +497,13 @@ function parseBatchRuleItems(rawText: string): Array<{
             const lb = ['round_robin', 'failover'].includes(String(item.load_balance || ''))
               ? (String(item.load_balance) as 'round_robin' | 'failover')
               : undefined
-            return { name, listen_port, targets, protocol: proto, load_balance: lb }
+            const port_range = item.port_range ? String(item.port_range).trim() : undefined
+            return { name, listen_port, port_range, targets, protocol: proto, load_balance: lb }
           })
           .filter(Boolean) as Array<{
           name: string
           listen_port: number
+          port_range?: string
           targets: TargetEndpoint[]
           protocol?: 'tcp' | 'udp' | 'both'
           load_balance?: 'round_robin' | 'failover'
@@ -457,7 +524,10 @@ function parseBatchRuleItems(rawText: string): Array<{
       const parts = row.split(sep).map((s) => s.trim())
       if (parts.length < 2) return null
       const name = parts.length >= 3 ? parts[0] : `批量规则-${idx + 1}`
-      const listen_port = parts.length >= 3 ? Number(parts[1]) || 0 : Number(parts[0]) || 0
+      const portToken = parts.length >= 3 ? parts[1] : parts[0]
+      const isRange = /^\d+\s*-\s*\d+$/.test(portToken || '')
+      const listen_port = isRange ? 0 : Number(portToken) || 0
+      const port_range = isRange ? portToken.replace(/\s+/g, '') : undefined
       const rawAddr = parts.length >= 3 ? parts[2] : parts[1]
       const targets = (rawAddr || '')
         .split(';')
@@ -468,11 +538,12 @@ function parseBatchRuleItems(rawText: string): Array<{
       const protocol = ['tcp', 'udp', 'both'].includes(protoRaw)
         ? (protoRaw as 'tcp' | 'udp' | 'both')
         : undefined
-      return { name, listen_port, targets, protocol }
+      return { name, listen_port, port_range, targets, protocol }
     })
     .filter(Boolean) as Array<{
     name: string
     listen_port: number
+    port_range?: string
     targets: TargetEndpoint[]
     protocol?: 'tcp' | 'udp' | 'both'
   }>
@@ -518,8 +589,8 @@ async function submitBatchRules() {
 function exportRulesToClipboard() {
   const source =
     validSelectedRuleIds.value.length > 0
-      ? visibleRules.value.filter((r) => validSelectedRuleIds.value.includes(r.id))
-      : visibleRules.value
+      ? filteredRules.value.filter((r) => validSelectedRuleIds.value.includes(r.id))
+      : filteredRules.value
   const text = source
     .map((r) => {
       const addrs = parseTargets(r.targets_json)
@@ -620,6 +691,7 @@ const planForm = ref({
   max_rules: 10,
   speed_mbps: 200,
   role_group_id: 1,
+  monthly_reset: false,
 })
 
 function openCreatePlanModal() {
@@ -634,6 +706,7 @@ function openCreatePlanModal() {
     max_rules: 15,
     speed_mbps: 300,
     role_group_id: rolesList.value[0]?.id || 1,
+    monthly_reset: false,
   }
   showPlanModal.value = true
 }
@@ -650,6 +723,7 @@ function openEditPlanModal(p: Plan) {
     max_rules: p.max_rules || 10,
     speed_mbps: p.speed_mbps || 100,
     role_group_id: p.role_group_id || rolesList.value[0]?.id || 1,
+    monthly_reset: Boolean(p.monthly_reset),
   }
   showPlanModal.value = true
 }
@@ -668,6 +742,7 @@ async function submitPlanForm() {
     max_rules: Math.max(1, Number(planForm.value.max_rules) || 10),
     speed_mbps: Math.max(10, Number(planForm.value.speed_mbps) || 100),
     role_group_id: Number(planForm.value.role_group_id) || 1,
+    monthly_reset: Boolean(planForm.value.monthly_reset),
   }
   try {
     if (editingPlanId.value) {
@@ -710,6 +785,7 @@ const userForm = ref({
   balance_yuan: 0,
   max_rules: 20,
   speed_mbps: 100,
+  monthly_reset: false,
   expire_at: '',
 })
 
@@ -742,6 +818,7 @@ function onUserPlanChange() {
     userForm.value.quota_gb = Math.round((p.quota_bytes || 0) / GB)
     userForm.value.max_rules = p.max_rules
     userForm.value.speed_mbps = p.speed_mbps
+    userForm.value.monthly_reset = Boolean(p.monthly_reset)
   }
 }
 
@@ -762,6 +839,7 @@ function openCreateUserModal() {
     balance_yuan: 0,
     max_rules: defPlan ? defPlan.max_rules : siteConfig.value.default_max_rules || 5,
     speed_mbps: defPlan ? defPlan.speed_mbps : siteConfig.value.default_speed_mbps || 100,
+    monthly_reset: Boolean(defPlan?.monthly_reset),
     expire_at: formatDateInput(nextMonth.toISOString()),
   }
   showUserModal.value = true
@@ -782,6 +860,7 @@ function openEditUserModal(u: User) {
     balance_yuan: Number(((u.balance_cents || 0) / 100).toFixed(2)),
     max_rules: u.max_rules,
     speed_mbps: u.speed_mbps,
+    monthly_reset: Boolean(u.monthly_reset),
     expire_at: formatDateInput(u.expire_at),
   }
   showUserModal.value = true
@@ -802,6 +881,7 @@ async function submitUserEdit() {
         balance_cents: Math.round(Math.max(0, Number(userForm.value.balance_yuan) || 0) * 100),
         max_rules: userForm.value.max_rules,
         speed_mbps: userForm.value.speed_mbps,
+        monthly_reset: Boolean(userForm.value.monthly_reset),
         allowed_tunnels: allowedStr,
         expire_at: userForm.value.expire_at ? userForm.value.expire_at.trim() : undefined,
         password: userForm.value.password || undefined,
@@ -821,6 +901,7 @@ async function submitUserEdit() {
         quota_bytes: Math.max(0, Number(userForm.value.quota_gb) || 0) * GB,
         max_rules: userForm.value.max_rules,
         speed_mbps: userForm.value.speed_mbps,
+        monthly_reset: Boolean(userForm.value.monthly_reset),
         allowed_tunnels: allowedStr,
         expire_at: userForm.value.expire_at ? userForm.value.expire_at.trim() : undefined,
       })
@@ -955,6 +1036,17 @@ const settingsForm = ref({
   default_max_rules: 5,
   default_speed_mbps: 100,
   default_role_group_id: 1,
+  payment_enabled: false,
+  epay_url: '',
+  epay_pid: '',
+  epay_key: '',
+  usdt_address: '',
+  recharge_notice: '',
+  notify_telegram_bot_token: '',
+  notify_telegram_chat_id: '',
+  notify_webhook_url: '',
+  notify_on_node_events: false,
+  notify_on_quota_events: false,
 })
 
 function syncSettingsForm() {
@@ -967,6 +1059,17 @@ function syncSettingsForm() {
     default_max_rules: siteConfig.value.default_max_rules ?? 5,
     default_speed_mbps: siteConfig.value.default_speed_mbps ?? 100,
     default_role_group_id: siteConfig.value.default_role_group_id || rolesList.value[0]?.id || 1,
+    payment_enabled: !!siteConfig.value.payment_enabled,
+    epay_url: siteConfig.value.epay_url || '',
+    epay_pid: siteConfig.value.epay_pid || '',
+    epay_key: siteConfig.value.epay_key || '',
+    usdt_address: siteConfig.value.usdt_address || '',
+    recharge_notice: siteConfig.value.recharge_notice || '',
+    notify_telegram_bot_token: siteConfig.value.notify_telegram_bot_token || '',
+    notify_telegram_chat_id: siteConfig.value.notify_telegram_chat_id || '',
+    notify_webhook_url: siteConfig.value.notify_webhook_url || '',
+    notify_on_node_events: !!siteConfig.value.notify_on_node_events,
+    notify_on_quota_events: !!siteConfig.value.notify_on_quota_events,
   }
 }
 
@@ -984,10 +1087,67 @@ async function saveSystemSettings() {
       default_speed_mbps: Number(settingsForm.value.default_speed_mbps) || 100,
       default_role_group_id: Number(settingsForm.value.default_role_group_id) || 1,
       default_tunnels: defRole ? defRole.allowed_tunnels : siteConfig.value.default_tunnels,
+      payment_enabled: settingsForm.value.payment_enabled,
+      epay_url: settingsForm.value.epay_url.trim(),
+      epay_pid: settingsForm.value.epay_pid.trim(),
+      epay_key: settingsForm.value.epay_key.trim(),
+      usdt_address: settingsForm.value.usdt_address.trim(),
+      recharge_notice: settingsForm.value.recharge_notice.trim(),
+      notify_telegram_bot_token: settingsForm.value.notify_telegram_bot_token.trim(),
+      notify_telegram_chat_id: settingsForm.value.notify_telegram_chat_id.trim(),
+      notify_webhook_url: settingsForm.value.notify_webhook_url.trim(),
+      notify_on_node_events: settingsForm.value.notify_on_node_events,
+      notify_on_quota_events: settingsForm.value.notify_on_quota_events,
     })
     siteConfig.value = updated
     document.title = siteConfig.value.site_name
-    showToast('面板基础配置已保存')
+    showToast('面板基础、支付与告警配置已保存')
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function sendTestNotify() {
+  if (!isAdmin.value) return
+  await saveSystemSettings()
+  try {
+    const res = await api.adminTestNotify()
+    showToast(res.message || '测试通知已发送')
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+const auditFilterAction = ref('all')
+const auditSearchQuery = ref('')
+
+const filteredAuditLogs = computed(() => {
+  const q = auditSearchQuery.value.trim().toLowerCase()
+  return auditLogsList.value.filter((item) => {
+    if (auditFilterAction.value !== 'all' && item.action !== auditFilterAction.value) return false
+    if (q) {
+      const hay = `${item.user_email || ''} ${item.action || ''} ${item.target || ''} ${item.detail || ''} ${item.client_ip || item.ip || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+})
+
+async function refreshAuditLogs() {
+  if (!isAdmin.value) return
+  try {
+    auditLogsList.value = await api.adminListAuditLogs()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function downloadSQLiteBackup() {
+  if (!isAdmin.value) return
+  try {
+    const filename = await api.adminDownloadSQLiteBackup()
+    showToast(`已生成并下载 SQLite 热备快照 ${filename}`)
+    await refreshAuditLogs()
   } catch (e: any) {
     showToast(e.message)
   }
@@ -998,15 +1158,102 @@ const quotaPercent = computed(() => {
   return Math.min(100, Number(((user.value.used_bytes / user.value.quota_bytes) * 100).toFixed(1)))
 })
 
-// 修改密码
+// 修改密码与双因素认证 (2FA)
 const showPasswordModal = ref(false)
 const pwdForm = ref({ old: '', next: '', confirm: '' })
 const pwdError = ref('')
+const totpInput = ref('')
+const totpRequired = ref(false)
+const totpSetupData = ref<{ secret: string; otpauth_url: string } | null>(null)
+const totpVerifyInput = ref('')
+const totpDisableInput = ref('')
+const generatedAdminAPIKey = ref('')
 
 function openPasswordModal() {
   pwdForm.value = { old: '', next: '', confirm: '' }
   pwdError.value = ''
+  totpSetupData.value = null
+  totpVerifyInput.value = ''
+  totpDisableInput.value = ''
   showPasswordModal.value = true
+}
+
+async function handleStartTOTPSetup() {
+  try {
+    totpSetupData.value = await api.setupTOTP()
+    totpVerifyInput.value = ''
+    showToast('已生成 2FA 密钥，请使用身份验证器扫描或输入密钥后填写 6 位验证码')
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function handleConfirmEnableTOTP() {
+  if (!totpVerifyInput.value.trim()) {
+    showToast('请输入身份验证器显示的 6 位动态验证码')
+    return
+  }
+  try {
+    const res = await api.enableTOTP(totpVerifyInput.value.trim())
+    if (user.value) user.value.totp_enabled = true
+    totpSetupData.value = null
+    totpVerifyInput.value = ''
+    showToast(res.message)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function handleConfirmDisableTOTP() {
+  if (!totpDisableInput.value.trim()) {
+    showToast('请输入当前登录密码或 6 位 2FA 验证码以确认关闭')
+    return
+  }
+  const v = totpDisableInput.value.trim()
+  const payload = /^\d{6}$/.test(v) ? { code: v } : { password: v }
+  try {
+    const res = await api.disableTOTP(payload)
+    if (user.value) user.value.totp_enabled = false
+    totpDisableInput.value = ''
+    totpSetupData.value = null
+    showToast(res.message)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function generateAdminAPIKey() {
+  if (!isAdmin.value) return
+  try {
+    const res = await api.adminGenerateAPIKey()
+    generatedAdminAPIKey.value = res.api_key
+    siteConfig.value.admin_api_key_prefix = res.admin_api_key_prefix
+    try {
+      await navigator.clipboard.writeText(res.api_key)
+      showToast('管理 API Key 已生成并复制到剪贴板')
+    } catch {
+      showToast(res.message)
+    }
+    await refreshAuditLogs()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function revokeAdminAPIKey() {
+  if (!isAdmin.value) return
+  if (!window.confirm('确定吊销当前管理 API Key 吗？吊销后外部系统的调用将立即失效。')) {
+    return
+  }
+  try {
+    const res = await api.adminRevokeAPIKey()
+    generatedAdminAPIKey.value = ''
+    siteConfig.value.admin_api_key_prefix = ''
+    showToast(res.message)
+    await refreshAuditLogs()
+  } catch (e: any) {
+    showToast(e.message)
+  }
 }
 
 async function submitChangePassword() {
@@ -1033,8 +1280,10 @@ async function submitChangePassword() {
 async function handleAuth() {
   authError.value = ''
   try {
-    const res = await api.login(emailInput.value.trim(), passwordInput.value)
+    const res = await api.login(emailInput.value.trim(), passwordInput.value, totpInput.value.trim())
     passwordInput.value = ''
+    totpInput.value = ''
+    totpRequired.value = false
     localStorage.setItem('nexus_token', res.token)
     token.value = res.token
     user.value = res.user
@@ -1043,6 +1292,9 @@ async function handleAuth() {
     }
     await refreshAll()
   } catch (e: any) {
+    if (e?.totp_required) {
+      totpRequired.value = true
+    }
     authError.value = e.message || '登录失败'
   }
 }
@@ -1052,6 +1304,32 @@ function logout() {
   token.value = null
   user.value = null
 }
+
+const hourlyStats = ref<Array<{ hour_bucket: string; upload_bytes: number; down_bytes: number; billed_bytes: number }>>([])
+const globalHourlyStats = ref<Array<{ hour_bucket: string; upload_bytes: number; down_bytes: number; billed_bytes: number }>>([])
+const chartViewScope = ref<'global' | 'personal'>('global')
+const topUsers = ref<Array<{ id: number; email: string; used_bytes: number; quota_bytes: number; plan_id: number }>>([])
+const topNodes = ref<Array<{ id: number; name: string; used_bytes: number; quota_bytes: number; status: string }>>([])
+
+const activeHourlySeries = computed(() => {
+  if (isAdmin.value && chartViewScope.value === 'global' && globalHourlyStats.value.length > 0) {
+    return globalHourlyStats.value
+  }
+  return hourlyStats.value
+})
+
+const maxHourlyBilled = computed(() => {
+  let max = 1
+  for (const pt of activeHourlySeries.value) {
+    const val = Math.max(pt.billed_bytes || 0, (pt.upload_bytes || 0) + (pt.down_bytes || 0))
+    if (val > max) max = val
+  }
+  return max
+})
+
+const total24hBilled = computed(() =>
+  activeHourlySeries.value.reduce((acc, pt) => acc + (pt.billed_bytes || 0), 0),
+)
 
 async function refreshAll() {
   try {
@@ -1074,23 +1352,36 @@ async function refreshAll() {
       api.getRoles().catch(() => []),
     ])
     user.value = dash.user
+    hourlyStats.value = dash.hourly_stats || []
+    globalHourlyStats.value = dash.global_hourly_stats || []
+    topUsers.value = dash.top_users || []
+    topNodes.value = dash.top_nodes || []
     nodes.value = nodeList
     lines.value = lineList
     rules.value = ruleList
     plans.value = planList
     rolesList.value = roleList
     if (dash.user.role === 'admin') {
-      const [uList, adminCfg] = await Promise.all([
+      const [uList, adminCfg, rcList, ordList, aLogs] = await Promise.all([
         api.adminListUsers().catch(() => []),
         api.adminGetSettings().catch(() => null),
+        api.adminListRedeemCodes().catch(() => []),
+        api.getOrders({ all: true }).catch(() => []),
+        api.adminListAuditLogs().catch(() => []),
       ])
       usersList.value = uList
+      redeemCodesList.value = rcList
+      ordersList.value = ordList
+      auditLogsList.value = aLogs
       if (adminCfg) {
         siteConfig.value = adminCfg
         syncSettingsForm()
       }
-    } else if (['lines', 'nodes', 'roles', 'users', 'settings'].includes(activeTab.value)) {
-      activeTab.value = 'dashboard'
+    } else {
+      ordersList.value = await api.getOrders().catch(() => [])
+      if (['lines', 'nodes', 'roles', 'users', 'settings'].includes(activeTab.value)) {
+        activeTab.value = 'dashboard'
+      }
     }
   } catch (e: any) {
     if (String(e.message).includes('401')) logout()
@@ -1124,6 +1415,8 @@ async function submitRule() {
         load_balance: ruleForm.value.load_balance,
         targets,
         speed_mbps: Number(ruleForm.value.speed_mbps) || 0,
+        access_mode: ruleForm.value.access_mode,
+        access_cidrs: ruleForm.value.access_cidrs.trim(),
       })
       showToast('修改已保存')
     } else {
@@ -1138,6 +1431,8 @@ async function submitRule() {
         load_balance: ruleForm.value.load_balance,
         targets,
         speed_mbps: Number(ruleForm.value.speed_mbps) || 0,
+        access_mode: ruleForm.value.access_mode,
+        access_cidrs: ruleForm.value.access_cidrs.trim(),
       })
       showToast('创建成功')
     }
@@ -1217,6 +1512,7 @@ async function submitNode() {
     traffic_rate: nodeForm.value.traffic_rate,
     quota_bytes: Math.max(0, Number(nodeForm.value.quota_gb) || 0) * GB,
     used_bytes: Math.max(0, Number(nodeForm.value.used_gb) || 0) * GB,
+    reset_day: Math.min(28, Math.max(0, Number(nodeForm.value.reset_day) || 0)),
   }
   try {
     if (editingNodeId.value) {
@@ -1243,6 +1539,20 @@ async function resyncNodeRules(node: NodeItem) {
   }
 }
 
+async function resetNodeTraffic(node: NodeItem) {
+  if (!isAdmin.value) return
+  if (!window.confirm(`确定清零节点「${node.name}」的已用流量并恢复超额暂停规则吗？`)) {
+    return
+  }
+  try {
+    const res = await api.adminResetNodeTraffic(node.id)
+    showToast(`节点已用流量已清零（已自动恢复 ${res.resumed_rules} 条规则）`)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
 async function deleteNode(id: number) {
   if (!isAdmin.value) return
   try {
@@ -1258,6 +1568,30 @@ async function openInstallCmd(nodeId: number) {
   try {
     installInfo.value = await api.adminGetNodeInstallCmd(nodeId)
     showInstallModal.value = true
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function upgradeNodeRemote(node: NodeItem) {
+  if (!isAdmin.value) return
+  if (node.status !== 'online') {
+    showToast(`节点「${node.name}」当前离线，无法远程升级`)
+    return
+  }
+  try {
+    const res = await api.adminUpgradeNode(node.id)
+    showToast(res.message)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function batchUpgradeOnlineNodes() {
+  if (!isAdmin.value) return
+  try {
+    const res = await api.adminBatchUpgradeNodes()
+    showToast(res.message)
   } catch (e: any) {
     showToast(e.message)
   }
@@ -1314,13 +1648,230 @@ async function handleResetSubscription() {
 }
 
 async function handleRedeem() {
+  if (!redeemInput.value.trim()) {
+    showToast('请输入兑换码')
+    return
+  }
   try {
-    const res = await api.redeemCode(redeemInput.value)
+    const res = await api.redeemCode(redeemInput.value.trim())
     redeemInput.value = ''
     showToast(res.message)
     await refreshAll()
   } catch (e: any) {
     showToast(e.message)
+  }
+}
+
+// --- 管理员兑换码 / 卡密管理 ---
+const showRedeemGenModal = ref(false)
+const redeemFilterStatus = ref<'all' | 'unused' | 'used'>('all')
+const redeemSearchKeyword = ref('')
+const lastGeneratedCodes = ref<string[]>([])
+const redeemGenForm = ref({
+  cardType: 'plan' as 'plan' | 'balance' | 'quota',
+  count: 5,
+  plan_id: 1,
+  balance_yuan: 50,
+  quota_gb: 100,
+  duration_days: 30,
+  prefix: 'ZP',
+  note: '',
+})
+
+const filteredRedeemCodes = computed(() => {
+  const kw = redeemSearchKeyword.value.trim().toLowerCase()
+  return redeemCodesList.value.filter((rc) => {
+    if (redeemFilterStatus.value === 'unused' && rc.used_by > 0) return false
+    if (redeemFilterStatus.value === 'used' && rc.used_by === 0) return false
+    if (kw) {
+      const hay = `${rc.code} ${rc.note || ''} ${rc.plan_name || ''} ${rc.used_by_email || ''}`.toLowerCase()
+      if (!hay.includes(kw)) return false
+    }
+    return true
+  })
+})
+
+function openRedeemGenModal() {
+  if (!isAdmin.value) return
+  lastGeneratedCodes.value = []
+  const defPlan = plans.value[0]
+  redeemGenForm.value = {
+    cardType: defPlan ? 'plan' : 'balance',
+    count: 5,
+    plan_id: defPlan?.id || 0,
+    balance_yuan: 50,
+    quota_gb: defPlan ? Math.round((defPlan.quota_bytes || 0) / GB) : 100,
+    duration_days: defPlan ? defPlan.duration_days : 30,
+    prefix: 'ZP',
+    note: '',
+  }
+  showRedeemGenModal.value = true
+}
+
+function onRedeemGenPlanChange() {
+  const p = plans.value.find((x) => x.id === Number(redeemGenForm.value.plan_id))
+  if (p) {
+    redeemGenForm.value.quota_gb = Math.round((p.quota_bytes || 0) / GB)
+    redeemGenForm.value.duration_days = p.duration_days
+  }
+}
+
+async function submitGenerateRedeemCodes() {
+  if (!isAdmin.value) return
+  const f = redeemGenForm.value
+  const payload: {
+    count: number
+    plan_id?: number
+    balance_cents?: number
+    quota_gb?: number
+    duration_days?: number
+    prefix?: string
+    note?: string
+  } = {
+    count: Math.min(100, Math.max(1, Number(f.count) || 5)),
+    prefix: (f.prefix || 'ZP').trim(),
+    note: (f.note || '').trim(),
+  }
+
+  if (f.cardType === 'plan') {
+    payload.plan_id = Number(f.plan_id) || 0
+    payload.quota_gb = Math.max(0, Number(f.quota_gb) || 0)
+    payload.duration_days = Math.max(0, Number(f.duration_days) || 0)
+  } else if (f.cardType === 'balance') {
+    payload.balance_cents = Math.round(Math.max(0.01, Number(f.balance_yuan) || 0) * 100)
+    payload.quota_gb = 0
+    payload.duration_days = 0
+  } else {
+    payload.quota_gb = Math.max(1, Number(f.quota_gb) || 100)
+    payload.duration_days = Math.max(0, Number(f.duration_days) || 30)
+  }
+
+  try {
+    const created = await api.adminGenerateRedeemCodes(payload)
+    lastGeneratedCodes.value = created.map((c) => c.code)
+    redeemCodesList.value = [...created, ...redeemCodesList.value]
+    try {
+      await navigator.clipboard.writeText(lastGeneratedCodes.value.join('\n'))
+      showToast(`已生成 ${created.length} 张卡密并自动复制到剪贴板`)
+    } catch {
+      showToast(`已生成 ${created.length} 张卡密`)
+    }
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function copyAllUnusedRedeemCodes() {
+  const unused = filteredRedeemCodes.value.filter((rc) => rc.used_by === 0).map((rc) => rc.code)
+  if (unused.length === 0) {
+    showToast('当前列表没有未使用的卡密')
+    return
+  }
+  await copyConnectAddr(unused.join('\n'))
+  showToast(`已复制 ${unused.length} 张未使用卡密`)
+}
+
+async function deleteRedeemCodeItem(rc: RedeemCodeItem) {
+  if (!isAdmin.value) return
+  try {
+    await api.adminDeleteRedeemCode(rc.id)
+    redeemCodesList.value = redeemCodesList.value.filter((x) => x.id !== rc.id)
+    showToast(`已删除卡密 ${rc.code}`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function clearUsedRedeemCodes() {
+  if (!isAdmin.value) return
+  const usedCount = redeemCodesList.value.filter((x) => x.used_by > 0).length
+  if (usedCount === 0) {
+    showToast('当前没有已核销的卡密')
+    return
+  }
+  if (!window.confirm(`确定一键清理全部 ${usedCount} 条已核销卡密记录吗？`)) {
+    return
+  }
+  try {
+    const res = await api.adminBatchDeleteRedeemCodes({ mode: 'used' })
+    redeemCodesList.value = redeemCodesList.value.filter((x) => x.used_by === 0)
+    showToast(`已清理 ${res.deleted} 条已核销卡密`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+// --- 在线充值与账单明细 ---
+const showRechargeModal = ref(false)
+const lastCreatedOrder = ref<BillingOrder | null>(null)
+const rechargeForm = ref({
+  amount_yuan: 50,
+  gateway: 'epay' as 'epay' | 'usdt' | 'manual',
+  pay_type: 'alipay' as 'alipay' | 'wxpay' | 'qqpay' | 'usdt',
+})
+
+function openRechargeModal() {
+  lastCreatedOrder.value = null
+  const epayReady = !!siteConfig.value.epay_enabled || !!(siteConfig.value.payment_enabled && siteConfig.value.epay_url)
+  rechargeForm.value = {
+    amount_yuan: 50,
+    gateway: epayReady ? 'epay' : siteConfig.value.usdt_address ? 'usdt' : 'manual',
+    pay_type: 'alipay',
+  }
+  showRechargeModal.value = true
+}
+
+async function submitRechargeOrder() {
+  const cents = Math.round(Math.max(1, Number(rechargeForm.value.amount_yuan) || 0) * 100)
+  try {
+    const order = await api.createRechargeOrder({
+      amount_cents: cents,
+      gateway: rechargeForm.value.gateway,
+      pay_type: rechargeForm.value.pay_type,
+    })
+    lastCreatedOrder.value = order
+    ordersList.value = [order, ...ordersList.value]
+    if (order.pay_url) {
+      window.open(order.pay_url, '_blank', 'noopener,noreferrer')
+      showToast('已生成充值订单并打开支付页面')
+    } else {
+      showToast(`充值订单 ${order.order_no} 已创建，请按说明完成支付`)
+    }
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function confirmOrderAdmin(ord: BillingOrder) {
+  if (!isAdmin.value) return
+  if (
+    !window.confirm(
+      `确定确认订单 ${ord.order_no} (${ord.user_email} 充值 ¥${(ord.amount_cents / 100).toFixed(2)}) 已收款并入账吗？`,
+    )
+  ) {
+    return
+  }
+  try {
+    const res = await api.adminConfirmOrder(ord.id)
+    showToast(res.message)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+function orderTypeLabel(tp: string): string {
+  switch (tp) {
+    case 'recharge':
+      return '余额充值'
+    case 'plan_purchase':
+      return '套餐购买'
+    case 'plan_reset':
+      return '重置周期'
+    case 'redeem':
+      return '卡密核销'
+    default:
+      return tp
   }
 }
 
@@ -1379,7 +1930,9 @@ function isAnyModalOpen(): boolean {
     showPlanModal.value ||
     showUserModal.value ||
     showPasswordModal.value ||
-    showAdminResetPwdModal.value
+    showAdminResetPwdModal.value ||
+    showRedeemGenModal.value ||
+    showRechargeModal.value
   )
 }
 
@@ -1482,6 +2035,18 @@ onUnmounted(() => {
           <div>
             <label class="form-label">密码</label>
             <input v-model="passwordInput" type="password" class="input" autocomplete="current-password" @keyup.enter="handleAuth" />
+          </div>
+          <div v-if="totpRequired">
+            <label class="form-label">双因素认证 (2FA) 6 位动态验证码</label>
+            <input
+              v-model="totpInput"
+              type="text"
+              maxlength="6"
+              class="input mono"
+              placeholder="请输入验证器中的 6 位数字"
+              autocomplete="one-time-code"
+              @keyup.enter="handleAuth"
+            />
           </div>
           <p v-if="authError" style="font-size: 12px; color: var(--danger-text);">{{ authError }}</p>
           <button @click="handleAuth" class="btn btn-primary" style="width: 100%; padding: 8px;">登录</button>
@@ -1751,6 +2316,91 @@ onUnmounted(() => {
               </div>
             </div>
 
+            <!-- 24 小时流量趋势图 -->
+            <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                  <span style="font-weight: 600; font-size: 14px;">近 24 小时流量趋势</span>
+                  <span class="badge badge-primary">24h 合计计费：{{ formatBytes(total24hBilled) }}</span>
+                </div>
+                <div v-if="isAdmin" style="display: flex; gap: 6px;">
+                  <button
+                    class="btn btn-sm"
+                    :class="chartViewScope === 'global' ? 'btn-primary' : 'btn-soft'"
+                    @click="chartViewScope = 'global'"
+                  >
+                    全站总流量
+                  </button>
+                  <button
+                    class="btn btn-sm"
+                    :class="chartViewScope === 'personal' ? 'btn-primary' : 'btn-soft'"
+                    @click="chartViewScope = 'personal'"
+                  >
+                    仅我个人
+                  </button>
+                </div>
+              </div>
+
+              <div
+                style="display: grid; grid-template-columns: repeat(24, minmax(0, 1fr)); align-items: end; gap: 4px; height: 110px; padding: 10px 6px 4px; background: var(--bg-soft); border-radius: var(--radius-md); border: 1px solid var(--border-color);"
+              >
+                <div
+                  v-for="pt in activeHourlySeries"
+                  :key="pt.hour_bucket"
+                  :title="`${pt.hour_bucket}\n上行: ${formatBytes(pt.upload_bytes)}\n下行: ${formatBytes(pt.down_bytes)}\n计费: ${formatBytes(pt.billed_bytes)}`"
+                  style="display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; gap: 4px;"
+                >
+                  <div
+                    style="width: 100%; max-width: 18px; border-radius: 3px 3px 0 0; background: var(--primary); transition: height 0.25s ease;"
+                    :style="{
+                      height: Math.max(4, Math.round(((pt.billed_bytes || 0) / maxHourlyBilled) * 76)) + 'px',
+                      opacity: pt.billed_bytes > 0 ? 0.92 : 0.22,
+                    }"
+                  ></div>
+                  <span style="font-size: 9.5px; color: var(--text-muted); white-space: nowrap;">
+                    {{ pt.hour_bucket.slice(11, 13) }}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 管理员可见：流量消耗 Top 5 用户与节点排行 -->
+            <div v-if="isAdmin" class="grid-2">
+              <div class="card" style="display: flex; flex-direction: column; gap: 10px;">
+                <div style="font-weight: 600; font-size: 14px;">用户累计流量 Top 5</div>
+                <div
+                  v-for="(tu, idx) in topUsers"
+                  :key="tu.id"
+                  style="display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-soft);"
+                >
+                  <div style="display: flex; align-items: center; gap: 8px;">
+                    <span class="badge badge-neutral">#{{ idx + 1 }}</span>
+                    <span style="font-weight: 500;">{{ tu.email }}</span>
+                  </div>
+                  <span style="font-family: monospace; color: var(--text-secondary);">
+                    {{ formatBytes(tu.used_bytes) }} / {{ formatBytes(tu.quota_bytes) }}
+                  </span>
+                </div>
+              </div>
+
+              <div class="card" style="display: flex; flex-direction: column; gap: 10px;">
+                <div style="font-weight: 600; font-size: 14px;">节点累计流量 Top 5</div>
+                <div
+                  v-for="(tn, idx) in topNodes"
+                  :key="tn.id"
+                  style="display: flex; justify-content: space-between; align-items: center; font-size: 12.5px; padding: 6px 8px; border-radius: var(--radius-sm); background: var(--bg-soft);"
+                >
+                  <div style="display: flex; align-items: center; gap: 8px;">
+                    <span class="badge badge-neutral">#{{ idx + 1 }}</span>
+                    <span style="font-weight: 500;">{{ tn.name }}</span>
+                  </div>
+                  <span style="font-family: monospace; color: var(--text-secondary);">
+                    {{ formatBytes(tn.used_bytes) }} / {{ tn.quota_bytes > 0 ? formatBytes(tn.quota_bytes) : '不限' }}
+                  </span>
+                </div>
+              </div>
+            </div>
+
             <!-- 管理员可见：服务器硬件与流量探针 -->
             <div v-if="isAdmin" class="grid-3">
               <div
@@ -1859,7 +2509,7 @@ onUnmounted(() => {
 
           <!-- 转发管理 -->
           <div v-if="activeTab === 'rules'" style="display: flex; flex-direction: column; gap: 14px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
               <div style="font-size: 12.5px; color: var(--text-secondary);">
                 可用隧道：
                 <span
@@ -1872,7 +2522,7 @@ onUnmounted(() => {
                 </span>
                 <span v-if="authorizedLines.length === 0" style="color: var(--danger-text);">无可用隧道权限</span>
               </div>
-              <div style="display: flex; gap: 8px;">
+              <div style="display: flex; gap: 8px; flex-wrap: wrap;">
                 <button
                   v-if="validSelectedRuleIds.length > 0"
                   @click="handleBatchDeleteRules"
@@ -1887,6 +2537,35 @@ onUnmounted(() => {
                 <button @click="openCreateRuleModal" class="btn btn-primary">+ 新增转发</button>
               </div>
             </div>
+
+            <!-- 规则搜索与多维筛选栏 -->
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <input
+                v-model="ruleSearchQuery"
+                class="input"
+                style="width: 240px;"
+                :placeholder="isAdmin ? '搜索规则名称 / 端口 / 目标 / 邮箱' : '搜索规则名称 / 端口 / 目标地址'"
+              />
+              <select v-model="ruleFilterTunnelId" class="select" style="width: 150px;">
+                <option :value="0">全部隧道</option>
+                <option v-for="l in authorizedLines" :key="l.id" :value="l.id">{{ l.name }}</option>
+              </select>
+              <select v-model="ruleFilterProtocol" class="select" style="width: 120px;">
+                <option value="all">全部协议</option>
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="both">TCP+UDP</option>
+              </select>
+              <select v-model="ruleFilterStatus" class="select" style="width: 120px;">
+                <option value="all">全部状态</option>
+                <option value="running">正常运行</option>
+                <option value="paused">已暂停</option>
+              </select>
+              <span style="font-size: 12px; color: var(--text-muted); margin-left: auto;">
+                共 {{ filteredRules.length }} / {{ visibleRules.length }} 条规则
+              </span>
+            </div>
+
             <div class="table-wrap">
               <table>
                 <thead>
@@ -1895,7 +2574,7 @@ onUnmounted(() => {
                       <input
                         type="checkbox"
                         :checked="allVisibleSelected"
-                        :disabled="visibleRules.length === 0"
+                        :disabled="filteredRules.length === 0"
                         @change="toggleSelectAllRules"
                         title="全选 / 取消全选"
                         style="cursor: pointer;"
@@ -1913,7 +2592,7 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="rule in visibleRules" :key="rule.id">
+                  <tr v-for="rule in filteredRules" :key="rule.id">
                     <td style="text-align: center;">
                       <input
                         type="checkbox"
@@ -2063,14 +2742,15 @@ onUnmounted(() => {
 
           <!-- 节点管理 (仅管理员) -->
           <div v-if="activeTab === 'nodes' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
-            <div style="display: flex; justify-content: flex-end;">
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+              <button @click="batchUpgradeOnlineNodes" class="btn btn-soft">一键升级在线节点</button>
               <button @click="openCreateNodeModal" class="btn btn-primary">+ 新增节点</button>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>名称</th>
+                    <th>名称 / 版本</th>
                     <th>连接地址</th>
                     <th>节点 IP</th>
                     <th>端口范围</th>
@@ -2082,7 +2762,12 @@ onUnmounted(() => {
                 </thead>
                 <tbody>
                   <tr v-for="node in nodes" :key="node.id">
-                    <td style="font-weight: 500;">{{ node.name }}</td>
+                    <td style="font-weight: 500;">
+                      <div>{{ node.name }}</div>
+                      <div style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+                        Agent v{{ node.agent_version || '1.1.0-sec' }}
+                      </div>
+                    </td>
                     <td>
                       <button class="copy-pill" @click="copyConnectAddr(node.connect_ip || node.public_host)">
                         {{ node.connect_ip || node.public_host }}
@@ -2092,8 +2777,13 @@ onUnmounted(() => {
                     <td style="color: var(--text-secondary);">{{ node.port_range }}</td>
                     <td>{{ node.traffic_rate || 1 }}x</td>
                     <td>
-                      {{ formatBytes(node.used_bytes) }} /
-                      {{ node.quota_bytes > 0 ? formatBytes(node.quota_bytes) : '不限' }}
+                      <div>
+                        {{ formatBytes(node.used_bytes) }} /
+                        {{ node.quota_bytes > 0 ? formatBytes(node.quota_bytes) : '不限' }}
+                      </div>
+                      <div v-if="node.reset_day && node.reset_day > 0" style="font-size: 11.5px; color: var(--text-muted);">
+                        每月 {{ node.reset_day }} 号自动重置
+                      </div>
                     </td>
                     <td>
                       <span class="badge" :class="node.status === 'online' ? 'badge-success' : 'badge-danger'">
@@ -2104,8 +2794,14 @@ onUnmounted(() => {
                       <button @click="openInstallCmd(node.id)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
                         对接
                       </button>
+                      <button @click="upgradeNodeRemote(node)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        升级
+                      </button>
                       <button @click="resyncNodeRules(node)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
                         同步
+                      </button>
+                      <button @click="resetNodeTraffic(node)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                        重置流量
                       </button>
                       <button @click="openEditNodeModal(node)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
                         编辑
@@ -2171,10 +2867,34 @@ onUnmounted(() => {
 
           <!-- 用户管理 (仅管理员，分配套餐和角色) -->
           <div v-if="activeTab === 'users' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <span style="font-size: 12.5px; color: var(--text-secondary);">
-                为用户分配套餐与角色，用户的可用隧道由其所属角色决定。
-              </span>
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <input
+                  v-model="userSearchQuery"
+                  class="input"
+                  style="width: 220px;"
+                  placeholder="搜索用户邮箱 / ID"
+                />
+                <select v-model="userFilterPlanId" class="select" style="width: 145px;">
+                  <option :value="-1">全部套餐</option>
+                  <option :value="0">未绑定套餐</option>
+                  <option v-for="p in plans" :key="p.id" :value="p.id">{{ p.name }}</option>
+                </select>
+                <select v-model="userFilterRoleId" class="select" style="width: 145px;">
+                  <option :value="-1">全部角色</option>
+                  <option v-for="rg in rolesList" :key="rg.id" :value="rg.id">{{ rg.name }}</option>
+                </select>
+                <select v-model="userFilterStatus" class="select" style="width: 135px;">
+                  <option value="all">全部状态</option>
+                  <option value="active">正常可用</option>
+                  <option value="expired">套餐已过期</option>
+                  <option value="over_quota">流量超额</option>
+                  <option value="banned">已封禁</option>
+                </select>
+                <span style="font-size: 12px; color: var(--text-muted);">
+                  共 {{ filteredUsersList.length }} / {{ usersList.length }} 人
+                </span>
+              </div>
               <button @click="openCreateUserModal" class="btn btn-primary">+ 新增用户</button>
             </div>
             <div class="table-wrap">
@@ -2194,7 +2914,7 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="u in usersList" :key="u.id">
+                  <tr v-for="u in filteredUsersList" :key="u.id">
                     <td style="font-weight: 500;">{{ u.email }}</td>
                     <td>
                       <span class="badge" :class="u.role === 'admin' ? 'badge-purple' : 'badge-neutral'">
@@ -2314,6 +3034,7 @@ onUnmounted(() => {
                 </span>
               </div>
               <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <button @click="openRechargeModal" class="btn btn-primary btn-sm">+ 在线充值余额</button>
                 <button
                   v-if="currentBoundPlan && currentBoundPlan.price_cents > 0"
                   @click="handleResetSubscription"
@@ -2327,10 +3048,19 @@ onUnmounted(() => {
 
             <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
               <div style="display: flex; align-items: center; gap: 8px;">
-                <input v-model="redeemInput" class="input" style="width: 240px;" placeholder="输入兑换码" />
-                <button @click="handleRedeem" class="btn btn-soft">兑换套餐</button>
+                <input
+                  v-model="redeemInput"
+                  class="input"
+                  style="width: 240px;"
+                  placeholder="输入套餐 / 充值 / 流量兑换码"
+                  @keyup.enter="handleRedeem"
+                />
+                <button @click="handleRedeem" class="btn btn-soft">立即核销兑换码</button>
               </div>
-              <button v-if="isAdmin" @click="openCreatePlanModal" class="btn btn-primary">+ 新增套餐</button>
+              <div v-if="isAdmin" style="display: flex; gap: 8px; flex-wrap: wrap;">
+                <button @click="openRedeemGenModal" class="btn btn-soft">+ 批量生成卡密</button>
+                <button @click="openCreatePlanModal" class="btn btn-primary">+ 新增套餐</button>
+              </div>
             </div>
 
             <!-- 管理员视角：套餐列表与绑定角色管理表 -->
@@ -2377,6 +3107,93 @@ onUnmounted(() => {
               </table>
             </div>
 
+            <!-- 管理员视角：兑换码 / 卡密管理中心 -->
+            <div v-if="isAdmin" class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <div>
+                  <div style="font-weight: 600; font-size: 14px;">兑换码 / 卡密管理中心</div>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    支持生成套餐激活卡、余额充值卡与流量时长叠加卡，核销后自动发放权益
+                  </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <input
+                    v-model="redeemSearchKeyword"
+                    class="input"
+                    style="width: 190px; height: 32px; font-size: 12.5px;"
+                    placeholder="搜索卡密 / 备注 / 核销邮箱"
+                  />
+                  <select v-model="redeemFilterStatus" class="select" style="width: 120px; height: 32px; font-size: 12.5px;">
+                    <option value="all">全部状态</option>
+                    <option value="unused">未使用</option>
+                    <option value="used">已核销</option>
+                  </select>
+                  <button @click="copyAllUnusedRedeemCodes" class="btn btn-soft btn-sm">复制未用卡密</button>
+                  <button @click="clearUsedRedeemCodes" class="btn btn-outline btn-sm">清理已核销</button>
+                  <button @click="openRedeemGenModal" class="btn btn-primary btn-sm">+ 生成卡密</button>
+                </div>
+              </div>
+
+              <div class="table-wrap" style="max-height: 320px; overflow-y: auto;">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>卡密 (点击复制)</th>
+                      <th>卡密类型 / 权益内容</th>
+                      <th>备注</th>
+                      <th>状态 / 核销人</th>
+                      <th style="text-align: right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="rc in filteredRedeemCodes" :key="rc.id">
+                      <td>
+                        <button
+                          @click="copyConnectAddr(rc.code)"
+                          class="btn btn-soft btn-sm"
+                          style="font-family: monospace; font-weight: 600;"
+                        >
+                          {{ rc.code }}
+                        </button>
+                      </td>
+                      <td style="font-size: 12.5px;">
+                        <span v-if="rc.plan_id > 0" class="badge badge-purple" style="margin-right: 6px;">
+                          套餐: {{ rc.plan_name || planNameById(rc.plan_id) }}
+                        </span>
+                        <span v-if="rc.balance_cents > 0" class="badge badge-success" style="margin-right: 6px;">
+                          余额 +¥{{ (rc.balance_cents / 100).toFixed(2) }}
+                        </span>
+                        <span v-if="rc.quota_bytes > 0" style="margin-right: 6px;">
+                          流量 +{{ formatBytes(rc.quota_bytes) }}
+                        </span>
+                        <span v-if="rc.duration_days > 0" style="color: var(--text-secondary);">
+                          时长 +{{ rc.duration_days }}天
+                        </span>
+                      </td>
+                      <td style="font-size: 12.5px; color: var(--text-secondary);">{{ rc.note || '-' }}</td>
+                      <td style="font-size: 12.5px;">
+                        <span v-if="rc.used_by === 0" class="badge badge-success">未使用</span>
+                        <div v-else style="display: flex; flex-direction: column; gap: 2px;">
+                          <span class="badge badge-neutral">已核销</span>
+                          <span style="font-size: 11.5px; color: var(--text-muted);">
+                            {{ rc.used_by_email || '#' + rc.used_by }} ({{ formatDateDisplay(rc.used_at) }})
+                          </span>
+                        </div>
+                      </td>
+                      <td style="text-align: right;">
+                        <button @click="deleteRedeemCodeItem(rc)" class="btn btn-danger btn-sm">删除</button>
+                      </td>
+                    </tr>
+                    <tr v-if="filteredRedeemCodes.length === 0">
+                      <td colspan="5" style="text-align: center; padding: 20px; color: var(--text-muted);">
+                        暂无符合条件的兑换码记录
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
             <!-- 套餐商城卡片展示 -->
             <div class="grid-2">
               <div
@@ -2418,11 +3235,79 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+
+            <!-- 账单与订单明细 -->
+            <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                  <div style="font-weight: 600; font-size: 14px;">{{ isAdmin ? '全站账单与充值订单明细' : '我的账单与充值记录' }}</div>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    自动记录在线充值、套餐购买、周期重置与卡密核销流水
+                  </div>
+                </div>
+                <button @click="openRechargeModal" class="btn btn-soft btn-sm">+ 创建充值订单</button>
+              </div>
+
+              <div class="table-wrap" style="max-height: 300px; overflow-y: auto;">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>订单号</th>
+                      <th v-if="isAdmin">用户</th>
+                      <th>类型</th>
+                      <th>说明 / 套餐</th>
+                      <th>金额</th>
+                      <th>通道</th>
+                      <th>状态</th>
+                      <th>时间</th>
+                      <th v-if="isAdmin" style="text-align: right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="ord in ordersList" :key="ord.id">
+                      <td style="font-family: monospace; font-size: 12px;">{{ ord.order_no }}</td>
+                      <td v-if="isAdmin" style="font-size: 12.5px;">{{ ord.user_email || '#' + ord.user_id }}</td>
+                      <td>
+                        <span class="badge badge-neutral">{{ orderTypeLabel(ord.type) }}</span>
+                      </td>
+                      <td style="font-size: 12.5px;">{{ ord.plan_name || '-' }}</td>
+                      <td style="font-weight: 600;">¥{{ ((ord.amount_cents || 0) / 100).toFixed(2) }}</td>
+                      <td style="font-size: 12px; color: var(--text-secondary);">{{ ord.gateway.toUpperCase() }}</td>
+                      <td>
+                        <span
+                          class="badge"
+                          :class="ord.status === 'paid' ? 'badge-success' : ord.status === 'pending' ? 'badge-primary' : 'badge-neutral'"
+                        >
+                          {{ ord.status === 'paid' ? '已入账' : ord.status === 'pending' ? '待支付' : '已取消' }}
+                        </span>
+                      </td>
+                      <td style="font-size: 12px; color: var(--text-muted);">{{ formatDateDisplay(ord.created_at) }}</td>
+                      <td v-if="isAdmin" style="text-align: right;">
+                        <button
+                          v-if="ord.type === 'recharge' && ord.status === 'pending'"
+                          @click="confirmOrderAdmin(ord)"
+                          class="btn btn-primary btn-sm"
+                        >
+                          确认入账
+                        </button>
+                        <span v-else style="color: var(--text-muted); font-size: 12px;">-</span>
+                      </td>
+                    </tr>
+                    <tr v-if="ordersList.length === 0">
+                      <td :colspan="isAdmin ? 9 : 7" style="text-align: center; padding: 18px; color: var(--text-muted);">
+                        暂无账单与订单记录
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
 
           <!-- 系统设置 (仅管理员) -->
-          <div v-if="activeTab === 'settings' && isAdmin" style="max-width: 680px;">
+          <div v-if="activeTab === 'settings' && isAdmin" style="max-width: 720px; display: flex; flex-direction: column; gap: 16px;">
             <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
+              <div style="font-weight: 600; font-size: 14px;">基础站点与默认权限</div>
               <div class="grid-2">
                 <div>
                   <label class="form-label">面板名称</label>
@@ -2474,9 +3359,195 @@ onUnmounted(() => {
                   <span>开放新用户注册</span>
                 </label>
               </div>
+            </div>
 
-              <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
-                <button @click="saveSystemSettings" class="btn btn-primary">保存配置</button>
+            <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: 600; font-size: 14px;">在线充值与支付网关 (易支付 EPay / USDT)</span>
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                  <input type="checkbox" v-model="settingsForm.payment_enabled" />
+                  <span>启用在线充值</span>
+                </label>
+              </div>
+
+              <div class="grid-3">
+                <div>
+                  <label class="form-label">彩虹易支付网关地址</label>
+                  <input v-model="settingsForm.epay_url" class="input" placeholder="https://pay.example.com" />
+                </div>
+                <div>
+                  <label class="form-label">商户 ID (PID)</label>
+                  <input v-model="settingsForm.epay_pid" class="input" placeholder="1001" />
+                </div>
+                <div>
+                  <label class="form-label">商户密钥 (Key)</label>
+                  <input v-model="settingsForm.epay_key" type="password" class="input" placeholder="MD5 签名密钥" />
+                </div>
+              </div>
+
+              <div>
+                <label class="form-label">USDT-TRC20 收款地址（选填，供加密货币或人工审核入账）</label>
+                <input v-model="settingsForm.usdt_address" class="input" placeholder="T..." />
+              </div>
+
+              <div>
+                <label class="form-label">充值引导说明</label>
+                <textarea
+                  v-model="settingsForm.recharge_notice"
+                  rows="2"
+                  class="textarea"
+                  placeholder="例如：支持支付宝/微信易支付自动回调到账，或转账后联系管理员确认入账"
+                ></textarea>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                <span style="font-weight: 600; font-size: 14px;">运维告警通知中心 (Telegram Bot / 通用 Webhook)</span>
+                <div style="display: flex; gap: 16px; align-items: center;">
+                  <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                    <input type="checkbox" v-model="settingsForm.notify_on_node_events" />
+                    <span>节点上下线告警</span>
+                  </label>
+                  <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                    <input type="checkbox" v-model="settingsForm.notify_on_quota_events" />
+                    <span>流量超额 / 套餐到期告警</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">Telegram Bot Token</label>
+                  <input
+                    v-model="settingsForm.notify_telegram_bot_token"
+                    type="password"
+                    class="input"
+                    placeholder="123456789:AAH..."
+                  />
+                </div>
+                <div>
+                  <label class="form-label">Telegram Chat ID</label>
+                  <input
+                    v-model="settingsForm.notify_telegram_chat_id"
+                    class="input"
+                    placeholder="-1001234567890 或个人 Chat ID"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label class="form-label">通用 Webhook URL（支持飞书 / 钉钉 / 企业微信 / Slack / 自定义 JSON 接收端）</label>
+                <input
+                  v-model="settingsForm.notify_webhook_url"
+                  class="input"
+                  placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."
+                />
+              </div>
+
+              <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px;">
+                <button @click="sendTestNotify" class="btn btn-soft">发送测试通知</button>
+                <button @click="saveSystemSettings" class="btn btn-primary">保存全部设置</button>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div>
+                  <span style="font-weight: 600; font-size: 14px;">外部对接管理 API Key 与管理员双因素认证 (2FA)</span>
+                  <span style="font-size: 12px; color: var(--text-muted); margin-left: 8px;">
+                    支持通过请求头 <code>X-API-Key: zp_live_...</code> 调用全部管理 API，并为账号绑定 TOTP 动态验证器
+                  </span>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                  <button @click="openPasswordModal" class="btn btn-outline btn-sm">
+                    {{ user?.totp_enabled ? '双因素认证 (2FA)：已启用' : '配置双因素认证 (2FA)' }}
+                  </button>
+                  <button @click="generateAdminAPIKey" class="btn btn-primary btn-sm">
+                    {{ siteConfig.admin_api_key_prefix ? '轮换生成新 API Key' : '生成管理 API Key' }}
+                  </button>
+                  <button
+                    v-if="siteConfig.admin_api_key_prefix"
+                    @click="revokeAdminAPIKey"
+                    class="btn btn-danger btn-sm"
+                  >
+                    吊销 API Key
+                  </button>
+                </div>
+              </div>
+
+              <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap; font-size: 12.5px;">
+                <div>
+                  当前 API Key 状态：
+                  <span v-if="siteConfig.admin_api_key_prefix" class="badge badge-success mono">
+                    生效中 ({{ siteConfig.admin_api_key_prefix }})
+                  </span>
+                  <span v-else class="badge badge-neutral">未启用</span>
+                </div>
+                <div v-if="generatedAdminAPIKey" style="display: flex; align-items: center; gap: 8px;">
+                  <span>新生成密钥（仅显示一次）：</span>
+                  <code class="mono" style="padding: 3px 8px; background: var(--bg-soft); border-radius: 4px;">
+                    {{ generatedAdminAPIKey }}
+                  </code>
+                  <button @click="copyConnectAddr(generatedAdminAPIKey)" class="btn btn-soft btn-sm">复制</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                <div>
+                  <span style="font-weight: 600; font-size: 14px;">数据安全热备与操作审计日志</span>
+                  <span style="font-size: 12px; color: var(--text-muted); margin-left: 8px;">
+                    记录登录、密码修改、节点/用户/卡密/设置变更与数据库快照导出
+                  </span>
+                </div>
+                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                  <input
+                    v-model="auditSearchQuery"
+                    class="input"
+                    style="width: 200px; padding: 5px 10px; font-size: 12.5px;"
+                    placeholder="搜索邮箱 / 动作 / IP / 详情..."
+                  />
+                  <button @click="refreshAuditLogs" class="btn btn-outline btn-sm">刷新日志</button>
+                  <button @click="downloadSQLiteBackup" class="btn btn-primary btn-sm">
+                    一键导出 SQLite 热备快照 (.db)
+                  </button>
+                </div>
+              </div>
+
+              <div class="table-wrap" style="max-height: 300px; overflow-y: auto;">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>操作者</th>
+                      <th>动作</th>
+                      <th>对象</th>
+                      <th>详情</th>
+                      <th>来源 IP</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="log in filteredAuditLogs" :key="log.id">
+                      <td class="mono" style="font-size: 12px; color: var(--text-secondary);">
+                        {{ formatDateDisplay(log.created_at) }}
+                      </td>
+                      <td style="font-size: 12.5px;">{{ log.user_email || `#${log.user_id}` }}</td>
+                      <td>
+                        <span class="badge badge-info">{{ log.action }}</span>
+                      </td>
+                      <td class="mono" style="font-size: 12px;">{{ log.target || '-' }}</td>
+                      <td style="font-size: 12.5px; color: var(--text-secondary);">{{ log.detail || '-' }}</td>
+                      <td class="mono" style="font-size: 12px; color: var(--text-muted);">{{ log.client_ip || log.ip || '-' }}</td>
+                    </tr>
+                    <tr v-if="filteredAuditLogs.length === 0">
+                      <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 18px;">
+                        暂无匹配的审计日志记录
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
           </div>
@@ -2530,8 +3601,34 @@ onUnmounted(() => {
           </div>
 
           <div>
-            <label class="form-label">目标地址</label>
+            <label class="form-label">目标地址（多目标自动启用主动健康检查与故障剔除）</label>
             <textarea v-model="ruleForm.targetsText" rows="3" class="textarea" placeholder="每行一个 IP:端口"></textarea>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">单规则限速 (Mbps，0=继承套餐限速)</label>
+              <input v-model.number="ruleForm.speed_mbps" type="number" min="0" class="input" placeholder="0 为继承套餐限速" />
+            </div>
+            <div>
+              <label class="form-label">来源 IP 访问控制 (ACL)</label>
+              <select v-model="ruleForm.access_mode" class="select">
+                <option value="off">关闭（允许所有来源 IP）</option>
+                <option value="allow">白名单（仅允许指定 IP / CIDR）</option>
+                <option value="deny">黑名单（拦截指定 IP / CIDR）</option>
+              </select>
+            </div>
+          </div>
+
+          <div v-if="ruleForm.access_mode !== 'off'">
+            <label class="form-label">
+              {{ ruleForm.access_mode === 'allow' ? '允许访问的来源 IP / CIDR 列表' : '禁止访问的来源 IP / CIDR 列表' }}
+            </label>
+            <input
+              v-model="ruleForm.access_cidrs"
+              class="input"
+              placeholder="多个条目用逗号分隔，例如 203.0.113.5, 198.51.100.0/24"
+            />
           </div>
 
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
@@ -2678,7 +3775,7 @@ onUnmounted(() => {
               <input v-model.number="nodeForm.traffic_rate" type="number" step="0.1" class="input" />
             </div>
           </div>
-          <div class="grid-2">
+          <div class="grid-3">
             <div>
               <label class="form-label">流量限额 (GB)</label>
               <input v-model.number="nodeForm.quota_gb" type="number" step="1" class="input" placeholder="0 为不限" />
@@ -2686,6 +3783,10 @@ onUnmounted(() => {
             <div>
               <label class="form-label">已用流量 (GB)</label>
               <input v-model.number="nodeForm.used_gb" type="number" step="0.1" class="input" />
+            </div>
+            <div>
+              <label class="form-label">月重置日 (0=关闭, 1-28)</label>
+              <input v-model.number="nodeForm.reset_day" type="number" min="0" max="28" class="input" placeholder="0 为不自动重置" />
             </div>
           </div>
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
@@ -2696,11 +3797,11 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 修改密码弹窗 -->
+    <!-- 修改密码与双因素认证 (2FA) 弹窗 -->
     <div v-if="showPasswordModal" class="modal-backdrop" @click.self="showPasswordModal = false">
-      <div class="modal-box" style="max-width: 420px;">
+      <div class="modal-box" style="max-width: 480px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-          <span style="font-weight: 600;">修改密码</span>
+          <span style="font-weight: 600;">安全中心：修改密码与双因素认证 (2FA)</span>
           <button @click="showPasswordModal = false" class="btn btn-outline btn-sm">✕</button>
         </div>
         <div style="display: flex; flex-direction: column; gap: 12px;">
@@ -2718,7 +3819,65 @@ onUnmounted(() => {
           </div>
           <p v-if="pwdError" style="font-size: 12px; color: var(--danger-text);">{{ pwdError }}</p>
           <p style="font-size: 12px; color: var(--text-secondary);">修改后其他设备上的登录会立即失效。</p>
-          <button @click="submitChangePassword" class="btn btn-primary" style="width: 100%;">确认修改</button>
+          <button @click="submitChangePassword" class="btn btn-primary" style="width: 100%;">确认修改密码</button>
+
+          <hr style="border: none; border-top: 1px solid var(--border-color); margin: 6px 0;" />
+
+          <div style="display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-weight: 600; font-size: 13.5px;">TOTP 双因素认证 (Google / Microsoft Authenticator)</span>
+              <span class="badge" :class="user?.totp_enabled ? 'badge-success' : 'badge-neutral'">
+                {{ user?.totp_enabled ? '已开启' : '未开启' }}
+              </span>
+            </div>
+
+            <div v-if="!user?.totp_enabled">
+              <div v-if="!totpSetupData">
+                <button @click="handleStartTOTPSetup" class="btn btn-soft" style="width: 100%;">
+                  生成 2FA 绑定密钥
+                </button>
+              </div>
+              <div v-else style="display: flex; flex-direction: column; gap: 8px; font-size: 12.5px;">
+                <div>
+                  1. 在身份验证器中添加账号并填入 Base32 密钥：
+                  <div style="display: flex; align-items: center; gap: 6px; margin-top: 4px;">
+                    <code class="mono" style="padding: 4px 8px; background: var(--bg-soft); border-radius: 4px; flex: 1; word-break: break-all;">
+                      {{ totpSetupData.secret }}
+                    </code>
+                    <button @click="copyConnectAddr(totpSetupData.secret)" class="btn btn-outline btn-sm">复制密钥</button>
+                    <button @click="copyConnectAddr(totpSetupData.otpauth_url)" class="btn btn-outline btn-sm">复制 URI</button>
+                  </div>
+                </div>
+                <div>
+                  <label class="form-label">2. 输入验证器显示的 6 位动态验证码完成激活</label>
+                  <div style="display: flex; gap: 8px;">
+                    <input
+                      v-model="totpVerifyInput"
+                      maxlength="6"
+                      class="input mono"
+                      placeholder="6 位数字验证码"
+                      @keyup.enter="handleConfirmEnableTOTP"
+                    />
+                    <button @click="handleConfirmEnableTOTP" class="btn btn-primary">验证并启用</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div v-else style="display: flex; flex-direction: column; gap: 8px;">
+              <label class="form-label">输入当前密码或 6 位动态验证码以关闭 2FA</label>
+              <div style="display: flex; gap: 8px;">
+                <input
+                  v-model="totpDisableInput"
+                  type="password"
+                  class="input"
+                  placeholder="当前密码 或 6 位验证码"
+                  @keyup.enter="handleConfirmDisableTOTP"
+                />
+                <button @click="handleConfirmDisableTOTP" class="btn btn-danger">关闭 2FA</button>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2952,6 +4111,11 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" v-model="planForm.monthly_reset" />
+            <span>按月自动重置已用流量（每满 30 天清零，适合季付 / 年付长周期套餐）</span>
+          </label>
+
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showPlanModal = false" class="btn btn-outline">取消</button>
             <button @click="submitPlanForm" class="btn btn-primary">保存套餐</button>
@@ -3051,6 +4215,11 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" v-model="userForm.monthly_reset" />
+            <span>按月自动重置已用流量（每满 30 天清零并恢复超额暂停规则）</span>
+          </label>
+
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showUserModal = false" class="btn btn-outline">取消</button>
             <button @click="submitUserEdit" class="btn btn-primary">保存</button>
@@ -3096,6 +4265,195 @@ onUnmounted(() => {
           <div style="display: flex; justify-content: flex-end; gap: 8px;">
             <button @click="submitAdminResetPwd(true)" class="btn btn-soft">随机生成并重置</button>
             <button @click="submitAdminResetPwd(false)" class="btn btn-primary">使用自定义密码重置</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 管理员批量生成兑换码 / 卡密弹窗 -->
+    <div v-if="showRedeemGenModal && isAdmin" class="modal-backdrop" @click.self="showRedeemGenModal = false">
+      <div class="modal-box" style="max-width: 520px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">批量生成兑换码 / 卡密</span>
+          <button @click="showRedeemGenModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label class="form-label">卡密类型</label>
+            <div class="grid-3">
+              <div
+                class="mode-card"
+                :class="{ active: redeemGenForm.cardType === 'plan' }"
+                @click="redeemGenForm.cardType = 'plan'"
+              >
+                <div class="mode-title">套餐激活卡</div>
+                <div class="mode-desc">绑定指定套餐与角色</div>
+              </div>
+              <div
+                class="mode-card"
+                :class="{ active: redeemGenForm.cardType === 'balance' }"
+                @click="redeemGenForm.cardType = 'balance'"
+              >
+                <div class="mode-title">余额充值卡</div>
+                <div class="mode-desc">直接增加账户余额</div>
+              </div>
+              <div
+                class="mode-card"
+                :class="{ active: redeemGenForm.cardType === 'quota' }"
+                @click="redeemGenForm.cardType = 'quota'"
+              >
+                <div class="mode-title">流量时长卡</div>
+                <div class="mode-desc">叠加流量与有效天数</div>
+              </div>
+            </div>
+          </div>
+
+          <div v-if="redeemGenForm.cardType === 'plan'" class="grid-3">
+            <div>
+              <label class="form-label">绑定套餐</label>
+              <select v-model.number="redeemGenForm.plan_id" @change="onRedeemGenPlanChange" class="select">
+                <option v-for="p in plans" :key="p.id" :value="p.id">{{ p.name }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">包含流量 (GB)</label>
+              <input v-model.number="redeemGenForm.quota_gb" type="number" class="input" />
+            </div>
+            <div>
+              <label class="form-label">延长周期 (天)</label>
+              <input v-model.number="redeemGenForm.duration_days" type="number" class="input" />
+            </div>
+          </div>
+
+          <div v-if="redeemGenForm.cardType === 'balance'">
+            <label class="form-label">面额 / 充值金额 (元)</label>
+            <input v-model.number="redeemGenForm.balance_yuan" type="number" step="0.01" class="input" placeholder="50" />
+          </div>
+
+          <div v-if="redeemGenForm.cardType === 'quota'" class="grid-2">
+            <div>
+              <label class="form-label">叠加流量 (GB)</label>
+              <input v-model.number="redeemGenForm.quota_gb" type="number" class="input" />
+            </div>
+            <div>
+              <label class="form-label">延长有效期 (天)</label>
+              <input v-model.number="redeemGenForm.duration_days" type="number" class="input" />
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div>
+              <label class="form-label">生成数量 (1-100)</label>
+              <input v-model.number="redeemGenForm.count" type="number" min="1" max="100" class="input" />
+            </div>
+            <div>
+              <label class="form-label">卡密前缀</label>
+              <input v-model="redeemGenForm.prefix" class="input" maxlength="12" placeholder="ZP" />
+            </div>
+            <div>
+              <label class="form-label">批次备注</label>
+              <input v-model="redeemGenForm.note" class="input" placeholder="如：发卡网首批" />
+            </div>
+          </div>
+
+          <div v-if="lastGeneratedCodes.length > 0" style="display: flex; flex-direction: column; gap: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <label class="form-label" style="margin: 0;">本次生成的 {{ lastGeneratedCodes.length }} 张卡密：</label>
+              <button @click="copyConnectAddr(lastGeneratedCodes.join('\n'))" class="btn btn-soft btn-sm">一键复制全部</button>
+            </div>
+            <textarea
+              readonly
+              rows="4"
+              class="textarea"
+              style="font-family: monospace; font-size: 12px;"
+              :value="lastGeneratedCodes.join('\n')"
+            ></textarea>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showRedeemGenModal = false" class="btn btn-outline">关闭</button>
+            <button @click="submitGenerateRedeemCodes" class="btn btn-primary">立即生成并复制</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 在线充值弹窗 -->
+    <div v-if="showRechargeModal" class="modal-backdrop" @click.self="showRechargeModal = false">
+      <div class="modal-box" style="max-width: 460px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">账户余额在线充值</span>
+          <button @click="showRechargeModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div
+            v-if="siteConfig.recharge_notice"
+            style="padding: 10px 12px; border-radius: var(--radius-md); background: var(--bg-soft); font-size: 12.5px; color: var(--text-secondary);"
+          >
+            {{ siteConfig.recharge_notice }}
+          </div>
+
+          <div>
+            <label class="form-label">充值金额 (元)</label>
+            <input v-model.number="rechargeForm.amount_yuan" type="number" min="1" step="1" class="input" />
+            <div style="display: flex; gap: 6px; margin-top: 6px;">
+              <button
+                v-for="preset in [20, 50, 100, 200]"
+                :key="preset"
+                @click="rechargeForm.amount_yuan = preset"
+                class="btn btn-soft btn-sm"
+              >
+                ¥{{ preset }}
+              </button>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">支付网关</label>
+              <select v-model="rechargeForm.gateway" class="select">
+                <option value="epay">易支付在线收银台</option>
+                <option value="usdt">USDT-TRC20 转账</option>
+                <option value="manual">人工审核充值</option>
+              </select>
+            </div>
+            <div v-if="rechargeForm.gateway === 'epay'">
+              <label class="form-label">支付方式</label>
+              <select v-model="rechargeForm.pay_type" class="select">
+                <option value="alipay">支付宝 (Alipay)</option>
+                <option value="wxpay">微信支付 (WeChat)</option>
+                <option value="qqpay">QQ 钱包</option>
+              </select>
+            </div>
+          </div>
+
+          <div
+            v-if="rechargeForm.gateway === 'usdt' && siteConfig.usdt_address"
+            style="padding: 10px 12px; border-radius: var(--radius-md); background: var(--bg-soft); font-size: 12px;"
+          >
+            <div>USDT-TRC20 收款地址：</div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 4px; gap: 8px;">
+              <code style="word-break: break-all;">{{ siteConfig.usdt_address }}</code>
+              <button @click="copyConnectAddr(siteConfig.usdt_address)" class="btn btn-soft btn-sm">复制</button>
+            </div>
+          </div>
+
+          <div
+            v-if="lastCreatedOrder"
+            style="padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color); font-size: 12.5px;"
+          >
+            <div>已创建订单：<code>{{ lastCreatedOrder.order_no }}</code></div>
+            <div v-if="lastCreatedOrder.pay_url" style="margin-top: 6px;">
+              <a :href="lastCreatedOrder.pay_url" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">
+                前往支付收银台
+              </a>
+            </div>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showRechargeModal = false" class="btn btn-outline">关闭</button>
+            <button @click="submitRechargeOrder" class="btn btn-primary">生成充值订单</button>
           </div>
         </div>
       </div>

@@ -2,18 +2,22 @@ package api
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -120,6 +124,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 		v1.POST("/auth/login", s.handleLogin)
 		v1.POST("/auth/register", s.handleRegister)
 		v1.GET("/sub/:token", subRateLimit(), s.handleGetSubscription)
+		v1.GET("/pay/epay/notify", s.handleEpayNotify)
+		v1.POST("/pay/epay/notify", s.handleEpayNotify)
 
 		// Authenticated user endpoints
 		auth := v1.Group("")
@@ -127,6 +133,9 @@ func (s *Server) SetupRouter() *gin.Engine {
 		{
 			auth.GET("/user/profile", s.handleProfile)
 			auth.POST("/user/password", userRateLimit(), s.handleChangePassword)
+			auth.POST("/user/totp/setup", userRateLimit(), s.handleSetupTOTP)
+			auth.POST("/user/totp/enable", userRateLimit(), s.handleEnableTOTP)
+			auth.POST("/user/totp/disable", userRateLimit(), s.handleDisableTOTP)
 			auth.POST("/user/reset-sub-token", userRateLimit(), s.handleUserResetSubToken)
 			auth.POST("/user/reset-subscription", userRateLimit(), s.handleUserResetSubscription)
 			auth.GET("/dashboard", s.handleDashboard)
@@ -146,11 +155,13 @@ func (s *Server) SetupRouter() *gin.Engine {
 			auth.DELETE("/rules/:id", ruleMutationLimit(), s.handleDeleteRule)
 			auth.POST("/rules/batch-delete", ruleMutationLimit(), s.handleBatchDeleteRules)
 
-			// Roles, Plans & Redeem Codes
+			// Roles, Plans, Orders & Redeem Codes
 			auth.GET("/roles", s.handleListRoleGroups)
 			auth.GET("/plans", s.handleListPlans)
 			auth.POST("/plans/:id/purchase", userRateLimit(), s.handlePurchasePlan)
 			auth.POST("/redeem", userRateLimit(), s.handleRedeemCode)
+			auth.GET("/orders", s.handleListOrders)
+			auth.POST("/orders/recharge", userRateLimit(), s.handleCreateRechargeOrder)
 
 			// Admin-only management endpoints
 			admin := auth.Group("/admin")
@@ -158,6 +169,9 @@ func (s *Server) SetupRouter() *gin.Engine {
 			{
 				admin.GET("/settings", s.handleAdminGetSettings)
 				admin.PUT("/settings", s.handleAdminUpdateSettings)
+				admin.POST("/settings/test-notify", s.handleAdminTestNotify)
+				admin.POST("/settings/api-key", s.handleAdminGenerateAPIKey)
+				admin.DELETE("/settings/api-key", s.handleAdminRevokeAPIKey)
 
 				admin.POST("/roles", s.handleAdminCreateRoleGroup)
 				admin.PUT("/roles/:id", s.handleAdminUpdateRoleGroup)
@@ -168,6 +182,9 @@ func (s *Server) SetupRouter() *gin.Engine {
 				admin.DELETE("/nodes/:id", s.handleAdminDeleteNode)
 				admin.GET("/nodes/:id/install-cmd", s.handleAdminNodeInstallCmd)
 				admin.POST("/nodes/:id/resync", s.handleAdminResyncNode)
+				admin.POST("/nodes/:id/reset-traffic", s.handleAdminResetNodeTraffic)
+				admin.POST("/nodes/:id/upgrade", s.handleAdminUpgradeNode)
+				admin.POST("/nodes/batch-upgrade", s.handleAdminBatchUpgradeNodes)
 
 				admin.POST("/lines", s.handleAdminCreateLine)
 				admin.PUT("/lines/:id", s.handleAdminUpdateLine)
@@ -185,7 +202,13 @@ func (s *Server) SetupRouter() *gin.Engine {
 				admin.POST("/users/:id/reset-subscription", s.handleAdminResetUserSubscription)
 				admin.POST("/users/:id/reset-password", s.handleAdminResetUserPassword)
 				admin.POST("/users/:id/reset-sub-token", s.handleAdminResetUserSubToken)
+				admin.GET("/redeem", s.handleAdminListRedeemCodes)
 				admin.POST("/redeem/generate", s.handleAdminGenerateRedeem)
+				admin.DELETE("/redeem/:id", s.handleAdminDeleteRedeemCode)
+				admin.POST("/redeem/batch-delete", s.handleAdminBatchDeleteRedeemCodes)
+				admin.POST("/orders/:id/confirm", s.handleAdminConfirmOrder)
+				admin.GET("/audit-logs", s.handleAdminListAuditLogs)
+				admin.GET("/backup/sqlite", s.handleAdminBackupSQLite)
 			}
 		}
 	}
@@ -204,6 +227,49 @@ func (s *Server) isAdmin(c *gin.Context) bool {
 	return role == "admin"
 }
 
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	end := 0
+	for i := range s {
+		if i > maxBytes {
+			break
+		}
+		end = i
+	}
+	return s[:end]
+}
+
+func (s *Server) recordAuditForUser(c *gin.Context, uid uint64, email, action, target, detail string) {
+	target = truncateUTF8(target, 191)
+	detail = truncateUTF8(detail, 512)
+	clientIP := ""
+	if c != nil {
+		clientIP = c.ClientIP()
+	}
+	_ = s.db.Create(&model.AuditLog{
+		UserID:    uid,
+		UserEmail: email,
+		Action:    action,
+		Target:    target,
+		Detail:    detail,
+		ClientIP:  clientIP,
+	}).Error
+}
+
+func (s *Server) recordAudit(c *gin.Context, action, target, detail string) {
+	uid := s.currentUserID(c)
+	email := ""
+	if uid > 0 {
+		var u model.User
+		if s.db.Select("id, email").First(&u, uid).Error == nil {
+			email = u.Email
+		}
+	}
+	s.recordAuditForUser(c, uid, email, action, target, detail)
+}
+
 func (s *Server) handleProfile(c *gin.Context) {
 	var user model.User
 	if err := s.db.First(&user, s.currentUserID(c)).Error; err != nil {
@@ -211,6 +277,34 @@ func (s *Server) handleProfile(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, user)
+}
+
+type hourlyBucketPoint struct {
+	HourBucket  string `json:"hour_bucket"`
+	UploadBytes int64  `json:"upload_bytes"`
+	DownBytes   int64  `json:"down_bytes"`
+	BilledBytes int64  `json:"billed_bytes"`
+}
+
+func build24HourSeries(now time.Time, rows []model.TrafficHourlyStat) []hourlyBucketPoint {
+	cur := now.Truncate(time.Hour)
+	start := cur.Add(-23 * time.Hour)
+	byBucket := make(map[string]*hourlyBucketPoint, 24)
+	series := make([]hourlyBucketPoint, 0, 24)
+	for i := 0; i < 24; i++ {
+		b := start.Add(time.Duration(i) * time.Hour).Format("2006-01-02 15:00")
+		pt := hourlyBucketPoint{HourBucket: b}
+		series = append(series, pt)
+		byBucket[b] = &series[len(series)-1]
+	}
+	for _, r := range rows {
+		if pt, ok := byBucket[r.HourBucket]; ok {
+			pt.UploadBytes += r.UploadBytes
+			pt.DownBytes += r.DownBytes
+			pt.BilledBytes += r.BilledBytes
+		}
+	}
+	return series
 }
 
 func (s *Server) handleDashboard(c *gin.Context) {
@@ -232,23 +326,65 @@ func (s *Server) handleDashboard(c *gin.Context) {
 		}
 	}
 
-	var hourly []model.TrafficHourlyStat
-	s.db.Where("user_id = ?", uid).Order("hour_bucket asc").Limit(24).Find(&hourly)
+	now := time.Now()
+	startBucket := now.Truncate(time.Hour).Add(-23 * time.Hour).Format("2006-01-02 15:00")
 
-	c.JSON(http.StatusOK, gin.H{
+	var userRows []model.TrafficHourlyStat
+	s.db.Where("user_id = ? AND hour_bucket >= ?", uid, startBucket).Find(&userRows)
+	hourlySeries := build24HourSeries(now, userRows)
+
+	resp := gin.H{
 		"user":          user,
 		"total_rules":   ruleCount,
 		"running_rules": runningRules,
 		"total_nodes":   len(nodes),
 		"online_nodes":  onlineNodes,
-		"hourly_stats":  hourly,
+		"hourly_stats":  hourlySeries,
 		"engines": []map[string]string{
 			{"id": "native", "name": "Native (内置/自研协议底座)", "desc": "纯 Go 零依赖转发与自研加密隧道扩展接口"},
 			{"id": "gost", "name": "GOST v3 (多跳加密隧道)", "desc": "支持 TLS / WS / WSS / QUIC / KCP 多跳链路"},
 			{"id": "realm", "name": "Realm (极速轻量直转)", "desc": "Rust 编写的高性能低内存 TCP/UDP 转发引擎"},
 			{"id": "nftables", "name": "nftables (Linux 内核零拷贝)", "desc": "Linux 内核态 DNAT/SNAT 转发，极致吞吐零 CPU 开销"},
 		},
-	})
+	}
+
+	if s.isAdmin(c) {
+		var globalRows []model.TrafficHourlyStat
+		s.db.Where("hour_bucket >= ?", startBucket).Find(&globalRows)
+		resp["global_hourly_stats"] = build24HourSeries(now, globalRows)
+
+		type topUserItem struct {
+			ID         uint64 `json:"id"`
+			Email      string `json:"email"`
+			UsedBytes  int64  `json:"used_bytes"`
+			QuotaBytes int64  `json:"quota_bytes"`
+			PlanID     uint64 `json:"plan_id"`
+		}
+		var topUsers []topUserItem
+		s.db.Model(&model.User{}).
+			Select("id, email, used_bytes, quota_bytes, plan_id").
+			Order("used_bytes desc").
+			Limit(5).
+			Scan(&topUsers)
+		resp["top_users"] = topUsers
+
+		type topNodeItem struct {
+			ID         uint64 `json:"id"`
+			Name       string `json:"name"`
+			UsedBytes  int64  `json:"used_bytes"`
+			QuotaBytes int64  `json:"quota_bytes"`
+			Status     string `json:"status"`
+		}
+		var topNodes []topNodeItem
+		s.db.Model(&model.Node{}).
+			Select("id, name, used_bytes, quota_bytes, status").
+			Order("used_bytes desc").
+			Limit(5).
+			Scan(&topNodes)
+		resp["top_nodes"] = topNodes
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) getSystemConfig() model.SystemConfig {
@@ -272,11 +408,19 @@ func (s *Server) getSystemConfig() model.SystemConfig {
 
 func (s *Server) handleGetSiteConfig(c *gin.Context) {
 	cfg := s.getSystemConfig()
+	epayEnabled := cfg.PaymentEnabled &&
+		strings.TrimSpace(cfg.EpayURL) != "" &&
+		strings.TrimSpace(cfg.EpayPID) != "" &&
+		strings.TrimSpace(cfg.EpayKey) != ""
 	c.JSON(http.StatusOK, gin.H{
-		"site_name":      cfg.SiteName,
-		"site_logo":      cfg.SiteLogo,
-		"announcement":   cfg.Announcement,
-		"allow_register": cfg.AllowRegister,
+		"site_name":       cfg.SiteName,
+		"site_logo":       cfg.SiteLogo,
+		"announcement":    cfg.Announcement,
+		"allow_register":  cfg.AllowRegister,
+		"payment_enabled": cfg.PaymentEnabled,
+		"epay_enabled":    epayEnabled,
+		"usdt_address":    cfg.USDTAddress,
+		"recharge_notice": cfg.RechargeNotice,
 	})
 }
 
@@ -298,6 +442,17 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 		DefaultMaxRules    *int    `json:"default_max_rules"`
 		DefaultSpeedMbps   *int    `json:"default_speed_mbps"`
 		DefaultTunnels     *string `json:"default_tunnels"`
+		PaymentEnabled         *bool   `json:"payment_enabled"`
+		EpayURL                *string `json:"epay_url"`
+		EpayPID                *string `json:"epay_pid"`
+		EpayKey                *string `json:"epay_key"`
+		USDTAddress            *string `json:"usdt_address"`
+		RechargeNotice         *string `json:"recharge_notice"`
+		NotifyTelegramBotToken *string `json:"notify_telegram_bot_token"`
+		NotifyTelegramChatID   *string `json:"notify_telegram_chat_id"`
+		NotifyWebhookURL       *string `json:"notify_webhook_url"`
+		NotifyOnNodeEvents     *bool   `json:"notify_on_node_events"`
+		NotifyOnQuotaEvents    *bool   `json:"notify_on_quota_events"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -337,8 +492,70 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 	if req.DefaultTunnels != nil && req.DefaultRoleGroupID == nil {
 		cfg.DefaultTunnels = strings.TrimSpace(*req.DefaultTunnels)
 	}
+	if req.PaymentEnabled != nil {
+		cfg.PaymentEnabled = *req.PaymentEnabled
+	}
+	if req.EpayURL != nil {
+		u := strings.TrimSpace(*req.EpayURL)
+		if u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "易支付接口地址需以 http:// 或 https:// 开头"})
+			return
+		}
+		cfg.EpayURL = strings.TrimRight(u, "/")
+	}
+	if req.EpayPID != nil {
+		cfg.EpayPID = strings.TrimSpace(*req.EpayPID)
+	}
+	if req.EpayKey != nil {
+		cfg.EpayKey = strings.TrimSpace(*req.EpayKey)
+	}
+	if req.USDTAddress != nil {
+		cfg.USDTAddress = strings.TrimSpace(*req.USDTAddress)
+	}
+	if req.RechargeNotice != nil {
+		cfg.RechargeNotice = strings.TrimSpace(*req.RechargeNotice)
+	}
+	if req.NotifyTelegramBotToken != nil {
+		cfg.NotifyTelegramBotToken = strings.TrimSpace(*req.NotifyTelegramBotToken)
+	}
+	if req.NotifyTelegramChatID != nil {
+		cfg.NotifyTelegramChatID = strings.TrimSpace(*req.NotifyTelegramChatID)
+	}
+	if req.NotifyWebhookURL != nil {
+		wurl := strings.TrimSpace(*req.NotifyWebhookURL)
+		if wurl != "" {
+			if err := service.ValidateWebhookURL(wurl); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+		}
+		cfg.NotifyWebhookURL = wurl
+	}
+	if req.NotifyOnNodeEvents != nil {
+		cfg.NotifyOnNodeEvents = *req.NotifyOnNodeEvents
+	}
+	if req.NotifyOnQuotaEvents != nil {
+		cfg.NotifyOnQuotaEvents = *req.NotifyOnQuotaEvents
+	}
 	s.db.Save(&cfg)
+	s.recordAudit(c, "admin.update_settings", cfg.SiteName, "更新系统设置、支付网关或告警配置")
 	c.JSON(http.StatusOK, cfg)
+}
+
+func (s *Server) handleAdminTestNotify(c *gin.Context) {
+	if s.orch == nil || s.orch.Notifier() == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "告警通知服务未初始化"})
+		return
+	}
+	if err := s.orch.Notifier().SendAlert(
+		"test_alert",
+		"告警通道连通性测试",
+		"这是一条来自控制面板的测试通知，说明您的 Webhook / Telegram 告警通道已配置成功。",
+	); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "发送测试通知失败: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "测试通知已成功发送"})
 }
 
 func (s *Server) handleListNodes(c *gin.Context) {
@@ -403,7 +620,7 @@ func (s *Server) handleTelemetry(c *gin.Context) {
 
 	nodes := make([]model.Node, 0)
 	if s.isAdmin(c) {
-		s.db.Select("id, status, quota_bytes, used_bytes").Order("id asc").Find(&nodes)
+		s.db.Select("id, status, quota_bytes, used_bytes, agent_version").Order("id asc").Find(&nodes)
 		for i := range nodes {
 			s.hub.EnrichNodeMetrics(&nodes[i])
 		}
@@ -460,6 +677,29 @@ func (s *Server) handleListRules(c *gin.Context) {
 	query := s.db.Order("id desc")
 	if !s.isAdmin(c) || c.Query("all") != "1" {
 		query = query.Where("user_id = ?", uid)
+	} else if uidParam := strings.TrimSpace(c.Query("user_id")); uidParam != "" {
+		if filterUID, err := strconv.ParseUint(uidParam, 10, 64); err == nil && filterUID > 0 {
+			query = query.Where("user_id = ?", filterUID)
+		}
+	}
+	if tidParam := strings.TrimSpace(c.Query("tunnel_line_id")); tidParam != "" {
+		if tid, err := strconv.ParseUint(tidParam, 10, 64); err == nil && tid > 0 {
+			query = query.Where("tunnel_line_id = ?", tid)
+		}
+	}
+	if status := strings.TrimSpace(c.Query("status")); status != "" {
+		query = query.Where("status = ?", status)
+	}
+	if proto := strings.TrimSpace(c.Query("protocol")); proto != "" {
+		query = query.Where("protocol = ?", proto)
+	}
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		like := "%" + q + "%"
+		if portNum, err := strconv.Atoi(q); err == nil && portNum > 0 {
+			query = query.Where("(name LIKE ? OR targets_json LIKE ? OR listen_port = ?)", like, like, portNum)
+		} else {
+			query = query.Where("(name LIKE ? OR targets_json LIKE ?)", like, like)
+		}
 	}
 	query.Find(&rules)
 	s.fillEffectiveEngines(rules)
@@ -490,9 +730,102 @@ type ruleCreateUpdateReq struct {
 	Engine        protocol.EngineType       `json:"engine"`          // "native" | "gost" | "realm" | "nftables"
 	Protocol      string                    `json:"protocol"`        // "tcp" | "udp" | "both"
 	ListenPort    int                       `json:"listen_port"`     // 0 表示自动从节点端口池分配
+	PortRange     string                    `json:"port_range"`      // 批量导入时支持端口段如 "20201-20205"
 	LoadBalance   string                    `json:"load_balance"`    // "round_robin" | "failover"
 	Targets       []protocol.TargetEndpoint `json:"targets" binding:"required"`
 	SpeedMbps     int                       `json:"speed_mbps"`
+	AccessMode    string                    `json:"access_mode"`  // "off" | "allow" | "deny"
+	AccessCIDRs   string                    `json:"access_cidrs"` // 逗号分隔的 IP 或 CIDR
+}
+
+func validateRuleAccessACL(mode, cidrs string) (string, string, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		mode = "off"
+	}
+	if mode != "off" && mode != "allow" && mode != "deny" {
+		return "", "", fmt.Errorf("无效的访问控制模式 %q（仅支持 off / allow / deny）", mode)
+	}
+	var normalized []string
+	for _, token := range strings.FieldsFunc(cidrs, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	}) {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if strings.Contains(token, "/") {
+			_, ipNet, err := net.ParseCIDR(token)
+			if err != nil || ipNet == nil {
+				return "", "", fmt.Errorf("无效的 CIDR 网段 %q", token)
+			}
+			normalized = append(normalized, ipNet.String())
+		} else {
+			ip := net.ParseIP(token)
+			if ip == nil {
+				return "", "", fmt.Errorf("无效的 IP 地址 %q", token)
+			}
+			normalized = append(normalized, ip.String())
+		}
+	}
+	if len(normalized) > 64 {
+		return "", "", fmt.Errorf("单条规则最多支持配置 64 个 IP/CIDR 条目")
+	}
+	if (mode == "allow" || mode == "deny") && len(normalized) == 0 {
+		return "", "", fmt.Errorf("启用 IP 白名单或黑名单时，请至少填写一个有效 IP 或 CIDR 网段")
+	}
+	return mode, strings.Join(normalized, ","), nil
+}
+
+func expandBatchRuleItems(items []ruleCreateUpdateReq) ([]ruleCreateUpdateReq, error) {
+	var expanded []ruleCreateUpdateReq
+	for _, item := range items {
+		pr := strings.TrimSpace(item.PortRange)
+		if pr == "" {
+			expanded = append(expanded, item)
+			continue
+		}
+		startP, endP, err := utils.ParsePortRange(pr)
+		if err != nil || startP <= 0 || endP < startP {
+			return nil, fmt.Errorf("规则「%s」端口段格式无效 (%s)", item.Name, pr)
+		}
+		span := endP - startP + 1
+		if span > 50 {
+			return nil, fmt.Errorf("规则「%s」单次展开端口段不能超过 50 个端口", item.Name)
+		}
+		for offset := 0; offset < span; offset++ {
+			port := startP + offset
+			cloned := item
+			cloned.PortRange = ""
+			cloned.ListenPort = port
+			if span > 1 {
+				cloned.Name = fmt.Sprintf("%s-%d", strings.TrimSpace(item.Name), port)
+			}
+			mappedTargets := make([]protocol.TargetEndpoint, 0, len(item.Targets))
+			for _, t := range item.Targets {
+				addr := strings.TrimSpace(t.Address)
+				host, portPart, splitErr := net.SplitHostPort(addr)
+				if splitErr == nil && strings.Contains(portPart, "-") {
+					tStart, tEnd, tErr := utils.ParsePortRange(portPart)
+					if tErr != nil || (tEnd-tStart+1) != span {
+						return nil, fmt.Errorf("规则「%s」目标端口段 %s 必须与监听端口段 %s 长度一致 (%d 个端口)", item.Name, addr, pr, span)
+					}
+					addr = net.JoinHostPort(host, strconv.Itoa(tStart+offset))
+				}
+				mappedTargets = append(mappedTargets, protocol.TargetEndpoint{
+					Address: addr,
+					Weight:  t.Weight,
+					Backup:  t.Backup,
+				})
+			}
+			cloned.Targets = mappedTargets
+			expanded = append(expanded, cloned)
+		}
+	}
+	if len(expanded) > 50 {
+		return nil, fmt.Errorf("批量规则展开后总条数 (%d) 超过单次上限 50 条", len(expanded))
+	}
+	return expanded, nil
 }
 
 // validateRuleInput enforces whitelists and size limits on user-supplied rule fields.
@@ -674,6 +1007,11 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 	}
 
 	targetsBytes, _ := json.Marshal(req.Targets)
+	aclMode, aclCIDRs, aclErr := validateRuleAccessACL(req.AccessMode, req.AccessCIDRs)
+	if aclErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": aclErr.Error()})
+		return
+	}
 	speedLimit := req.SpeedMbps
 	if !s.isAdmin(c) && (speedLimit <= 0 || speedLimit > user.SpeedMbps) {
 		speedLimit = user.SpeedMbps
@@ -692,6 +1030,8 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 		LoadBalance:   req.LoadBalance,
 		TargetsJSON:   string(targetsBytes),
 		SpeedMbps:     speedLimit,
+		AccessMode:    aclMode,
+		AccessCIDRs:   aclCIDRs,
 		Enabled:       true,
 		Status:        "running",
 	}
@@ -733,6 +1073,7 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 	}
 
 	s.orch.DispatchRule(&rule)
+	rule.EffectiveEngine = service.EffectiveEngine(&rule, &user)
 	c.JSON(http.StatusCreated, rule)
 }
 
@@ -773,6 +1114,13 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "单次批量导入最多支持 50 条规则"})
 		return
 	}
+	expandedItems, expErr := expandBatchRuleItems(req.Items)
+	if expErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": expErr.Error()})
+		return
+	}
+	req.Items = expandedItems
+
 	switch req.Protocol {
 	case "", "tcp", "udp", "both":
 	default:
@@ -802,6 +1150,13 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("规则「%s」: %v", item.Name, err)})
 			return
 		}
+		aclMode, aclCIDRs, aclErr := validateRuleAccessACL(item.AccessMode, item.AccessCIDRs)
+		if aclErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("规则「%s」: %v", item.Name, aclErr)})
+			return
+		}
+		req.Items[i].AccessMode = aclMode
+		req.Items[i].AccessCIDRs = aclCIDRs
 	}
 
 	ruleMode := "direct"
@@ -864,6 +1219,8 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 				LoadBalance:   lb,
 				TargetsJSON:   string(targetsBytes),
 				SpeedMbps:     speedLimit,
+				AccessMode:    item.AccessMode,
+				AccessCIDRs:   item.AccessCIDRs,
 				Enabled:       true,
 				Status:        "running",
 			}
@@ -915,6 +1272,15 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 	if err := s.checkNodeAddressTargets(req.Targets); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if req.AccessMode != "" || req.AccessCIDRs != "" {
+		aclMode, aclCIDRs, aclErr := validateRuleAccessACL(req.AccessMode, req.AccessCIDRs)
+		if aclErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": aclErr.Error()})
+			return
+		}
+		rule.AccessMode = aclMode
+		rule.AccessCIDRs = aclCIDRs
 	}
 
 	var owner model.User
@@ -1283,6 +1649,7 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 		durationDays = 30
 	}
 	var updatedUser model.User
+	now := time.Now()
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{
 			"balance_cents": gorm.Expr("balance_cents - ?", plan.PriceCents),
@@ -1290,7 +1657,9 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 			"quota_bytes":   plan.QuotaBytes,
 			"max_rules":     plan.MaxRules,
 			"speed_mbps":    plan.SpeedMbps,
-			"expire_at":     time.Now().AddDate(0, 0, durationDays),
+			"monthly_reset": plan.MonthlyReset,
+			"last_reset_at": &now,
+			"expire_at":     now.AddDate(0, 0, durationDays),
 		}
 		// 付费套餐购买时重置已用流量；免费套餐 (price=0) 可被反复"购买"，绝不能借此清零用量
 		if plan.PriceCents > 0 {
@@ -1312,7 +1681,22 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 		if res.RowsAffected == 0 {
 			return fmt.Errorf("insufficient_balance")
 		}
-		return tx.First(&updatedUser, uid).Error
+		if err := tx.First(&updatedUser, uid).Error; err != nil {
+			return err
+		}
+		order := model.BillingOrder{
+			OrderNo:     newOrderNo(),
+			UserID:      uid,
+			UserEmail:   updatedUser.Email,
+			Type:        "plan_purchase",
+			PlanID:      plan.ID,
+			PlanName:    plan.Name,
+			AmountCents: plan.PriceCents,
+			Status:      "paid",
+			Gateway:     "balance",
+			PaidAt:      &now,
+		}
+		return tx.Create(&order).Error
 	})
 	if err != nil {
 		if err.Error() == "insufficient_balance" {
@@ -1364,6 +1748,7 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 	}
 
 	var updatedUser model.User
+	now := time.Now()
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{
 			"balance_cents": gorm.Expr("balance_cents - ?", plan.PriceCents),
@@ -1371,7 +1756,9 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 			"quota_bytes":   plan.QuotaBytes,
 			"max_rules":     plan.MaxRules,
 			"speed_mbps":    plan.SpeedMbps,
-			"expire_at":     time.Now().AddDate(0, 0, durationDays),
+			"monthly_reset": plan.MonthlyReset,
+			"last_reset_at": &now,
+			"expire_at":     now.AddDate(0, 0, durationDays),
 		}
 		if plan.RoleGroupID > 0 {
 			updates["role_group_id"] = plan.RoleGroupID
@@ -1388,7 +1775,22 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 		if res.RowsAffected == 0 {
 			return fmt.Errorf("insufficient_balance")
 		}
-		return tx.First(&updatedUser, uid).Error
+		if err := tx.First(&updatedUser, uid).Error; err != nil {
+			return err
+		}
+		order := model.BillingOrder{
+			OrderNo:     newOrderNo(),
+			UserID:      uid,
+			UserEmail:   updatedUser.Email,
+			Type:        "plan_reset",
+			PlanID:      plan.ID,
+			PlanName:    plan.Name + " (重置流量周期)",
+			AmountCents: plan.PriceCents,
+			Status:      "paid",
+			Gateway:     "balance",
+			PaidAt:      &now,
+		}
+		return tx.Create(&order).Error
 	})
 	if err != nil {
 		if err.Error() == "insufficient_balance" {
@@ -1567,46 +1969,93 @@ func (s *Server) handleRedeemCode(c *gin.Context) {
 		if err := tx.First(&user, uid).Error; err != nil {
 			return err
 		}
+
+		updates := map[string]any{}
+		quotaAdd := rc.QuotaBytes
+		durationAdd := rc.Duration
+
 		if rc.PlanID > 0 {
 			var plan model.Plan
 			if err := tx.First(&plan, rc.PlanID).Error; err == nil {
 				user.PlanID = plan.ID
+				updates["plan_id"] = plan.ID
+				updates["monthly_reset"] = plan.MonthlyReset
+				updates["last_reset_at"] = &now
 				if plan.RoleGroupID > 0 {
 					user.RoleGroupID = plan.RoleGroupID
+					updates["role_group_id"] = plan.RoleGroupID
 					var rg model.RoleGroup
 					if err := tx.First(&rg, plan.RoleGroupID).Error; err == nil && user.Role != "admin" {
 						user.AllowedTunnels = rg.AllowedTunnels
+						updates["allowed_tunnels"] = rg.AllowedTunnels
 					}
 				} else if plan.AllowedTunnels != "" && user.Role != "admin" {
 					user.AllowedTunnels = plan.AllowedTunnels
+					updates["allowed_tunnels"] = plan.AllowedTunnels
 				}
 				if plan.MaxRules > user.MaxRules {
 					user.MaxRules = plan.MaxRules
+					updates["max_rules"] = plan.MaxRules
 				}
 				if plan.SpeedMbps > user.SpeedMbps {
 					user.SpeedMbps = plan.SpeedMbps
+					updates["speed_mbps"] = plan.SpeedMbps
+				}
+				if quotaAdd <= 0 && plan.QuotaBytes > 0 {
+					quotaAdd = plan.QuotaBytes
+				}
+				if durationAdd <= 0 && plan.DurationDays > 0 {
+					durationAdd = plan.DurationDays
 				}
 			}
 		}
-		if user.ExpireAt.Before(now) {
-			user.ExpireAt = now.AddDate(0, 0, rc.Duration)
-		} else {
-			user.ExpireAt = user.ExpireAt.AddDate(0, 0, rc.Duration)
+
+		if durationAdd > 0 {
+			if user.ExpireAt.IsZero() || user.ExpireAt.Before(now) {
+				user.ExpireAt = now.AddDate(0, 0, durationAdd)
+			} else {
+				user.ExpireAt = user.ExpireAt.AddDate(0, 0, durationAdd)
+			}
+			updates["expire_at"] = user.ExpireAt
 		}
-		// Only write the columns changed by the code; balance / used_bytes may be modified concurrently by purchases
-		// and traffic reports and must never be overwritten with a stale snapshot.
-		if err := tx.Model(&model.User{}).Where("id = ?", uid).Updates(map[string]any{
-			"plan_id":         user.PlanID,
-			"role_group_id":   user.RoleGroupID,
-			"allowed_tunnels": user.AllowedTunnels,
-			"max_rules":       user.MaxRules,
-			"speed_mbps":      user.SpeedMbps,
-			"expire_at":       user.ExpireAt,
-			"quota_bytes":     gorm.Expr("quota_bytes + ?", rc.QuotaBytes),
-		}).Error; err != nil {
+		if quotaAdd > 0 {
+			updates["quota_bytes"] = gorm.Expr("quota_bytes + ?", quotaAdd)
+		}
+		if rc.BalanceCents > 0 {
+			updates["balance_cents"] = gorm.Expr("balance_cents + ?", rc.BalanceCents)
+		}
+
+		if len(updates) > 0 {
+			// Only write the columns changed by the code; balance / used_bytes may be modified concurrently by purchases
+			// and traffic reports and must never be overwritten with a stale snapshot.
+			if err := tx.Model(&model.User{}).Where("id = ?", uid).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.First(&updatedUser, uid).Error; err != nil {
 			return err
 		}
-		return tx.First(&updatedUser, uid).Error
+		planLabel := "卡密兑换 (" + rc.Code + ")"
+		if rc.PlanID > 0 {
+			var plan model.Plan
+			if tx.First(&plan, rc.PlanID).Error == nil {
+				planLabel = plan.Name + " [卡密激活]"
+			}
+		}
+		order := model.BillingOrder{
+			OrderNo:     newOrderNo(),
+			UserID:      uid,
+			UserEmail:   updatedUser.Email,
+			Type:        "redeem",
+			PlanID:      rc.PlanID,
+			PlanName:    planLabel,
+			AmountCents: rc.BalanceCents,
+			Status:      "paid",
+			Gateway:     "redeem",
+			TradeNo:     rc.Code,
+			PaidAt:      &now,
+		}
+		return tx.Create(&order).Error
 	})
 	if err != nil {
 		switch err.Error() {
@@ -1623,6 +2072,282 @@ func (s *Server) handleRedeemCode(c *gin.Context) {
 	s.enforceUserTunnelPermissions(&updatedUser)
 	s.resumeUserQuotaExceededRules(&updatedUser)
 	c.JSON(http.StatusOK, gin.H{"message": "兑换成功", "user": updatedUser})
+}
+
+func newOrderNo() string {
+	return fmt.Sprintf("ZP%s%s", time.Now().UTC().Format("20060102150405"), strings.ToUpper(utils.GenerateRandomToken(4)))
+}
+
+// computeEpaySign computes the standard Rainbow EPay MD5 signature over non-empty sorted query/form parameters.
+func computeEpaySign(params map[string]string, secretKey string) string {
+	keys := make([]string, 0, len(params))
+	for k, v := range params {
+		if k == "sign" || k == "sign_type" || v == "" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(params[k])
+	}
+	b.WriteString(strings.TrimSpace(secretKey))
+	sum := md5.Sum([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Server) handleListOrders(c *gin.Context) {
+	isAdmin := s.isAdmin(c)
+	uid := s.currentUserID(c)
+
+	query := s.db.Order("id desc")
+	if !(isAdmin && c.Query("all") == "1") {
+		query = query.Where("user_id = ?", uid)
+	}
+	if st := strings.TrimSpace(c.Query("status")); st != "" {
+		query = query.Where("status = ?", st)
+	}
+	if tp := strings.TrimSpace(c.Query("type")); tp != "" {
+		query = query.Where("type = ?", tp)
+	}
+	limit := 100
+	if isAdmin && c.Query("all") == "1" {
+		limit = 200
+	}
+	var orders []model.BillingOrder
+	query.Limit(limit).Find(&orders)
+	c.JSON(http.StatusOK, orders)
+}
+
+func (s *Server) handleCreateRechargeOrder(c *gin.Context) {
+	var req struct {
+		AmountCents int64  `json:"amount_cents" binding:"required"`
+		Gateway     string `json:"gateway"`  // "epay" | "usdt" | "manual"
+		PayType     string `json:"pay_type"` // "alipay" | "wxpay" | "qqpay" | "usdt"
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入有效的充值金额"})
+		return
+	}
+	if req.AmountCents < 100 || req.AmountCents > 10000000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "单笔充值金额需在 ¥1.00 - ¥100,000.00 之间"})
+		return
+	}
+
+	uid := s.currentUserID(c)
+	var user model.User
+	if err := s.db.First(&user, uid).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	cfg := s.getSystemConfig()
+	epayReady := cfg.PaymentEnabled &&
+		strings.TrimSpace(cfg.EpayURL) != "" &&
+		strings.TrimSpace(cfg.EpayPID) != "" &&
+		strings.TrimSpace(cfg.EpayKey) != ""
+
+	gateway := strings.ToLower(strings.TrimSpace(req.Gateway))
+	switch gateway {
+	case "epay", "usdt", "manual":
+	default:
+		if epayReady {
+			gateway = "epay"
+		} else if strings.TrimSpace(cfg.USDTAddress) != "" {
+			gateway = "usdt"
+		} else {
+			gateway = "manual"
+		}
+	}
+
+	payType := strings.ToLower(strings.TrimSpace(req.PayType))
+	switch payType {
+	case "alipay", "wxpay", "qqpay", "usdt":
+	default:
+		payType = "alipay"
+	}
+
+	orderNo := newOrderNo()
+	payURL := ""
+	if gateway == "epay" && epayReady {
+		base := s.panelBaseURL(c)
+		moneyStr := fmt.Sprintf("%.2f", float64(req.AmountCents)/100.0)
+		params := map[string]string{
+			"pid":          strings.TrimSpace(cfg.EpayPID),
+			"type":         payType,
+			"out_trade_no": orderNo,
+			"notify_url":   base + "/api/v1/pay/epay/notify",
+			"return_url":   base + "/",
+			"name":         fmt.Sprintf("%s 余额充值", cfg.SiteName),
+			"money":        moneyStr,
+		}
+		sign := computeEpaySign(params, cfg.EpayKey)
+		vals := url.Values{}
+		for k, v := range params {
+			vals.Set(k, v)
+		}
+		vals.Set("sign", sign)
+		vals.Set("sign_type", "MD5")
+		payURL = strings.TrimRight(strings.TrimSpace(cfg.EpayURL), "/") + "/submit.php?" + vals.Encode()
+	}
+
+	order := model.BillingOrder{
+		OrderNo:     orderNo,
+		UserID:      user.ID,
+		UserEmail:   user.Email,
+		Type:        "recharge",
+		PlanName:    "账户余额在线充值",
+		AmountCents: req.AmountCents,
+		Status:      "pending",
+		Gateway:     gateway,
+		PayURL:      payURL,
+	}
+	if err := s.db.Create(&order).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建充值订单失败"})
+		return
+	}
+	c.JSON(http.StatusCreated, order)
+}
+
+func (s *Server) handleEpayNotify(c *gin.Context) {
+	_ = c.Request.ParseForm()
+	params := make(map[string]string)
+	for k, vals := range c.Request.URL.Query() {
+		if len(vals) > 0 {
+			params[k] = vals[0]
+		}
+	}
+	for k, vals := range c.Request.PostForm {
+		if len(vals) > 0 {
+			params[k] = vals[0]
+		}
+	}
+
+	cfg := s.getSystemConfig()
+	if strings.TrimSpace(cfg.EpayKey) == "" {
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
+
+	givenSign := strings.ToLower(strings.TrimSpace(params["sign"]))
+	expectedSign := computeEpaySign(params, cfg.EpayKey)
+	if len(givenSign) == 0 || subtle.ConstantTimeCompare([]byte(givenSign), []byte(expectedSign)) != 1 {
+		c.String(http.StatusForbidden, "fail")
+		return
+	}
+
+	if strings.TrimSpace(cfg.EpayPID) != "" && strings.TrimSpace(params["pid"]) != strings.TrimSpace(cfg.EpayPID) {
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
+
+	if params["trade_status"] != "TRADE_SUCCESS" {
+		c.String(http.StatusOK, "ignore")
+		return
+	}
+
+	outTradeNo := strings.TrimSpace(params["out_trade_no"])
+	tradeNo := strings.TrimSpace(params["trade_no"])
+	if outTradeNo == "" {
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
+
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var order model.BillingOrder
+		if err := tx.Where("order_no = ? AND type = ?", outTradeNo, "recharge").First(&order).Error; err != nil {
+			return fmt.Errorf("not_found")
+		}
+		if order.Status == "paid" {
+			return nil
+		}
+		moneyStr := strings.TrimSpace(params["money"])
+		moneyFloat, perr := strconv.ParseFloat(moneyStr, 64)
+		if moneyStr == "" || perr != nil || int64(math.Round(moneyFloat*100)) != order.AmountCents {
+			return fmt.Errorf("amount_mismatch")
+		}
+		now := time.Now()
+		res := tx.Model(&model.BillingOrder{}).
+			Where("id = ? AND status = ?", order.ID, "pending").
+			Updates(map[string]any{
+				"status":   "paid",
+				"trade_no": tradeNo,
+				"paid_at":  &now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil
+		}
+		return tx.Model(&model.User{}).
+			Where("id = ?", order.UserID).
+			Update("balance_cents", gorm.Expr("balance_cents + ?", order.AmountCents)).Error
+	})
+	if err != nil {
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
+	c.String(http.StatusOK, "success")
+}
+
+func (s *Server) handleAdminConfirmOrder(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid order id"})
+		return
+	}
+	var confirmedOrder model.BillingOrder
+	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		var order model.BillingOrder
+		if err := tx.First(&order, id).Error; err != nil {
+			return fmt.Errorf("not_found")
+		}
+		if order.Type != "recharge" {
+			return fmt.Errorf("invalid_type")
+		}
+		if order.Status == "paid" {
+			return fmt.Errorf("already_paid")
+		}
+		now := time.Now()
+		res := tx.Model(&model.BillingOrder{}).
+			Where("id = ? AND status = ?", order.ID, "pending").
+			Updates(map[string]any{
+				"status":   "paid",
+				"trade_no": "ADMIN-MANUAL-" + strconv.FormatUint(s.currentUserID(c), 10),
+				"paid_at":  &now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return fmt.Errorf("already_paid")
+		}
+		if err := tx.Model(&model.User{}).
+			Where("id = ?", order.UserID).
+			Update("balance_cents", gorm.Expr("balance_cents + ?", order.AmountCents)).Error; err != nil {
+			return err
+		}
+		return tx.First(&confirmedOrder, order.ID).Error
+	})
+	if txErr != nil {
+		switch txErr.Error() {
+		case "not_found":
+			c.JSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
+		case "already_paid":
+			c.JSON(http.StatusConflict, gin.H{"error": "该订单已入账，请勿重复确认"})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "确认订单入账失败"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "订单已确认入账，用户余额已自动增加", "order": confirmedOrder})
 }
 
 // --- Admin Handlers ---
@@ -1656,6 +2381,9 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 	}
 	if node.QuotaBytes <= 0 {
 		node.QuotaBytes = 10 * 1024 * 1024 * 1024 * 1024 // 默认 10TB
+	}
+	if node.ResetDay < 0 || node.ResetDay > 28 {
+		node.ResetDay = 0
 	}
 	if node.DefaultEngine == "" {
 		node.DefaultEngine = protocol.EngineNative
@@ -1693,6 +2421,7 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		TrafficRate   float64             `json:"traffic_rate"`
 		QuotaBytes    *int64              `json:"quota_bytes"`
 		UsedBytes     *int64              `json:"used_bytes"`
+		ResetDay      *int                `json:"reset_day"`
 		DefaultEngine protocol.EngineType `json:"default_engine"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1746,6 +2475,11 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 	}
 	if req.QuotaBytes != nil && *req.QuotaBytes >= 0 {
 		node.QuotaBytes = *req.QuotaBytes
+	}
+	if req.ResetDay != nil {
+		if *req.ResetDay >= 0 && *req.ResetDay <= 28 {
+			node.ResetDay = *req.ResetDay
+		}
 	}
 	if req.DefaultEngine != "" {
 		node.DefaultEngine = req.DefaultEngine
@@ -1807,6 +2541,18 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, node)
+}
+
+func (s *Server) handleAdminResetNodeTraffic(c *gin.Context) {
+	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	var node model.Node
+	if err := s.db.First(&node, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "node not found"})
+		return
+	}
+	resumed := s.orch.ResetNodeTraffic(node.ID, time.Now())
+	_ = s.db.First(&node, node.ID).Error
+	c.JSON(http.StatusOK, gin.H{"node": node, "resumed_rules": resumed})
 }
 
 func (s *Server) handleAdminDeleteNode(c *gin.Context) {
@@ -2180,6 +2926,75 @@ func (s *Server) handleAdminResyncNode(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已向节点「%s」下发全量规则重同步/重启指令", node.Name)})
 }
 
+func (s *Server) buildUpgradeAgentPayload(c *gin.Context, targetVer string) protocol.UpgradeAgentPayload {
+	targetVer = strings.TrimSpace(targetVer)
+	if targetVer == "" {
+		targetVer = "1.2.0-sec"
+	}
+	if len(targetVer) > 32 {
+		targetVer = targetVer[:32]
+	}
+	shaByArch := make(map[string]string, 2)
+	for _, arch := range []string{"amd64", "arm64"} {
+		if sum := s.agentBinarySHA256(arch); sum != "" {
+			shaByArch[arch] = sum
+		}
+	}
+	return protocol.UpgradeAgentPayload{
+		TargetVersion: targetVer,
+		BaseURL:       s.panelBaseURL(c),
+		SHA256ByArch:  shaByArch,
+	}
+}
+
+func (s *Server) handleAdminUpgradeNode(c *gin.Context) {
+	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
+	var node model.Node
+	if err := s.db.First(&node, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "节点不存在"})
+		return
+	}
+	var req struct {
+		TargetVersion string `json:"target_version"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	payload := s.buildUpgradeAgentPayload(c, req.TargetVersion)
+	if err := s.hub.SendToNode(node.ID, protocol.MsgUpgradeAgent, payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("节点「%s」当前离线，无法下发远程升级指令", node.Name)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":        fmt.Sprintf("已向节点「%s」下发签名远程升级指令 (%s)", node.Name, payload.TargetVersion),
+		"node_id":        node.ID,
+		"target_version": payload.TargetVersion,
+	})
+}
+
+func (s *Server) handleAdminBatchUpgradeNodes(c *gin.Context) {
+	var req struct {
+		IDs           []uint64 `json:"ids"`
+		TargetVersion string   `json:"target_version"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	payload := s.buildUpgradeAgentPayload(c, req.TargetVersion)
+
+	targetIDs := req.IDs
+	if len(targetIDs) == 0 {
+		targetIDs = s.hub.OnlineNodeIDs()
+	}
+	upgraded := make([]uint64, 0, len(targetIDs))
+	for _, nid := range targetIDs {
+		if err := s.hub.SendToNode(nid, protocol.MsgUpgradeAgent, payload); err == nil {
+			upgraded = append(upgraded, nid)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":        fmt.Sprintf("已向 %d 个在线节点下发签名远程升级指令 (%s)", len(upgraded), payload.TargetVersion),
+		"upgraded_nodes": upgraded,
+		"target_version": payload.TargetVersion,
+	})
+}
+
 func (s *Server) handleAdminCreateLine(c *gin.Context) {
 	var line model.TunnelLine
 	if err := c.ShouldBindJSON(&line); err != nil {
@@ -2512,6 +3327,7 @@ func (s *Server) handleAdminUpdatePlan(c *gin.Context) {
 	if req.SpeedMbps > 0 {
 		plan.SpeedMbps = req.SpeedMbps
 	}
+	plan.MonthlyReset = req.MonthlyReset
 	plan.Active = req.Active
 	s.db.Save(&plan)
 	c.JSON(http.StatusOK, plan)
@@ -2525,7 +3341,57 @@ func (s *Server) handleAdminDeletePlan(c *gin.Context) {
 
 func (s *Server) handleAdminListUsers(c *gin.Context) {
 	var users []model.User
-	s.db.Order("id asc").Find(&users)
+	query := s.db.Order("id asc")
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		like := "%" + strings.ToLower(q) + "%"
+		if idNum, err := strconv.ParseUint(q, 10, 64); err == nil && idNum > 0 {
+			query = query.Where("(LOWER(email) LIKE ? OR id = ?)", like, idNum)
+		} else {
+			query = query.Where("LOWER(email) LIKE ?", like)
+		}
+	}
+	if planParam := strings.TrimSpace(c.Query("plan_id")); planParam != "" {
+		if pid, err := strconv.ParseUint(planParam, 10, 64); err == nil {
+			query = query.Where("plan_id = ?", pid)
+		}
+	}
+	if rgParam := strings.TrimSpace(c.Query("role_group_id")); rgParam != "" {
+		if rgid, err := strconv.ParseUint(rgParam, 10, 64); err == nil {
+			query = query.Where("role_group_id = ?", rgid)
+		}
+	}
+	query.Find(&users)
+
+	if status := strings.TrimSpace(c.Query("status")); status != "" {
+		now := time.Now()
+		filtered := make([]model.User, 0, len(users))
+		for _, u := range users {
+			isActive := u.Status == "active"
+			isExpired := u.Role != "admin" && !u.ExpireAt.IsZero() && now.After(u.ExpireAt)
+			isOverQuota := u.QuotaBytes > 0 && u.UsedBytes >= u.QuotaBytes
+			switch status {
+			case "banned":
+				if !isActive {
+					filtered = append(filtered, u)
+				}
+			case "expired":
+				if isActive && isExpired {
+					filtered = append(filtered, u)
+				}
+			case "over_quota":
+				if isActive && isOverQuota {
+					filtered = append(filtered, u)
+				}
+			case "active":
+				if isActive && !isExpired && !isOverQuota {
+					filtered = append(filtered, u)
+				}
+			default:
+				filtered = append(filtered, u)
+			}
+		}
+		users = filtered
+	}
 	c.JSON(http.StatusOK, users)
 }
 
@@ -2588,6 +3454,7 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 		QuotaBytes     int64  `json:"quota_bytes"`
 		MaxRules       int    `json:"max_rules"`
 		SpeedMbps      int    `json:"speed_mbps"`
+		MonthlyReset   *bool  `json:"monthly_reset"`
 		ExpireAt       string `json:"expire_at"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2618,8 +3485,10 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 	quota := req.QuotaBytes
 	maxRules := req.MaxRules
 	speed := req.SpeedMbps
+	monthlyReset := false
 	allowedTunnels := strings.TrimSpace(req.AllowedTunnels)
-	expireAt := time.Now().AddDate(1, 0, 0)
+	now := time.Now()
+	expireAt := now.AddDate(1, 0, 0)
 
 	// 若指定了套餐，优先继承套餐的角色与配额默认值
 	if req.PlanID > 0 {
@@ -2637,10 +3506,14 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 			if speed <= 0 {
 				speed = plan.SpeedMbps
 			}
+			monthlyReset = plan.MonthlyReset
 			if plan.DurationDays > 0 {
-				expireAt = time.Now().AddDate(0, 0, plan.DurationDays)
+				expireAt = now.AddDate(0, 0, plan.DurationDays)
 			}
 		}
+	}
+	if req.MonthlyReset != nil {
+		monthlyReset = *req.MonthlyReset
 	}
 	if strings.TrimSpace(req.ExpireAt) != "" {
 		parsed, err := parseFlexibleExpireTime(req.ExpireAt)
@@ -2686,6 +3559,8 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 		QuotaBytes:     quota,
 		MaxRules:       maxRules,
 		SpeedMbps:      speed,
+		MonthlyReset:   monthlyReset,
+		LastResetAt:    &now,
 		ExpireAt:       expireAt,
 	}
 	if err := s.db.Create(&u).Error; err != nil {
@@ -2730,6 +3605,7 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 		UsedBytes      *int64  `json:"used_bytes"`
 		MaxRules       int     `json:"max_rules"`
 		SpeedMbps      int     `json:"speed_mbps"`
+		MonthlyReset   *bool   `json:"monthly_reset"`
 		BalanceCents   *int64  `json:"balance_cents"`
 		ExpireAt       *string `json:"expire_at"`
 	}
@@ -2805,6 +3681,9 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 	if req.SpeedMbps > 0 {
 		u.SpeedMbps = req.SpeedMbps
 	}
+	if req.MonthlyReset != nil {
+		u.MonthlyReset = *req.MonthlyReset
+	}
 	// used_bytes / balance_cents / token_version / quota_bytes / expire_at / password_hash / sub_token change concurrently
 	// (traffic reports, purchases, redeems, password changes, sub token resets): save the profile without them and only
 	// write them explicitly when the admin actually set them.
@@ -2857,8 +3736,10 @@ func (s *Server) handleAdminResetUserTraffic(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	now := time.Now()
 	u.UsedBytes = 0
-	s.db.Model(&model.User{}).Where("id = ?", u.ID).Update("used_bytes", 0)
+	u.LastResetAt = &now
+	s.db.Model(&model.User{}).Where("id = ?", u.ID).Updates(map[string]any{"used_bytes": 0, "last_reset_at": &now})
 
 	// 自动恢复该用户因流量超额暂停的转发规则（封禁 / 已过期账号以及无隧道权限的规则不恢复）
 	s.resumeUserQuotaExceededRules(&u)
@@ -2885,9 +3766,11 @@ func (s *Server) handleAdminResetUserSubscription(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
 	durationDays := req.DurationDays
 	updates := map[string]any{
-		"used_bytes": 0,
+		"used_bytes":    0,
+		"last_reset_at": &now,
 	}
 	if u.PlanID > 0 {
 		var plan model.Plan
@@ -2904,6 +3787,7 @@ func (s *Server) handleAdminResetUserSubscription(c *gin.Context) {
 			if plan.SpeedMbps > 0 {
 				updates["speed_mbps"] = plan.SpeedMbps
 			}
+			updates["monthly_reset"] = plan.MonthlyReset
 			if plan.RoleGroupID > 0 {
 				updates["role_group_id"] = plan.RoleGroupID
 				if u.Role != "admin" {
@@ -2922,7 +3806,7 @@ func (s *Server) handleAdminResetUserSubscription(c *gin.Context) {
 	if durationDays <= 0 {
 		durationDays = 30
 	}
-	updates["expire_at"] = time.Now().AddDate(0, 0, durationDays)
+	updates["expire_at"] = now.AddDate(0, 0, durationDays)
 	if req.ResetSubToken || strings.TrimSpace(u.SubToken) == "" {
 		updates["sub_token"] = utils.GenerateRandomToken(16)
 	}
@@ -3016,35 +3900,265 @@ func (s *Server) handleAdminResetUserSubToken(c *gin.Context) {
 	})
 }
 
+func (s *Server) handleAdminListRedeemCodes(c *gin.Context) {
+	statusFilter := strings.TrimSpace(c.Query("status"))
+	keyword := strings.TrimSpace(c.Query("q"))
+
+	q := s.db.Model(&model.RedeemCode{})
+	switch statusFilter {
+	case "unused":
+		q = q.Where("used_by = 0")
+	case "used":
+		q = q.Where("used_by > 0")
+	}
+	if keyword != "" {
+		like := "%" + keyword + "%"
+		q = q.Where("code LIKE ? OR note LIKE ?", like, like)
+	}
+
+	var codes []model.RedeemCode
+	if err := q.Order("id desc").Limit(500).Find(&codes).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "加载兑换码列表失败"})
+		return
+	}
+
+	if len(codes) > 0 {
+		var plans []model.Plan
+		s.db.Select("id, name").Find(&plans)
+		planMap := make(map[uint64]string, len(plans))
+		for _, p := range plans {
+			planMap[p.ID] = p.Name
+		}
+
+		userIDs := make([]uint64, 0)
+		for _, rc := range codes {
+			if rc.UsedBy > 0 {
+				userIDs = append(userIDs, rc.UsedBy)
+			}
+		}
+		userMap := make(map[uint64]string)
+		if len(userIDs) > 0 {
+			var users []model.User
+			s.db.Select("id, email").Where("id IN ?", userIDs).Find(&users)
+			for _, u := range users {
+				userMap[u.ID] = u.Email
+			}
+		}
+
+		for i := range codes {
+			if codes[i].PlanID > 0 {
+				codes[i].PlanName = planMap[codes[i].PlanID]
+			}
+			if codes[i].UsedBy > 0 {
+				codes[i].UsedByEmail = userMap[codes[i].UsedBy]
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, codes)
+}
+
 func (s *Server) handleAdminGenerateRedeem(c *gin.Context) {
 	var req struct {
-		Count    int   `json:"count"`
-		QuotaGB  int64 `json:"quota_gb"`
-		Duration int   `json:"duration_days"`
+		Count        int    `json:"count"`
+		PlanID       uint64 `json:"plan_id"`
+		BalanceCents int64  `json:"balance_cents"`
+		QuotaGB      int64  `json:"quota_gb"`
+		Duration     int    `json:"duration_days"`
+		Prefix       string `json:"prefix"`
+		Note         string `json:"note"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if req.Count <= 0 || req.Count > 50 {
+	if req.Count <= 0 || req.Count > 100 {
 		req.Count = 5
 	}
-	if req.QuotaGB <= 0 {
-		req.QuotaGB = 100
+	if req.BalanceCents < 0 || req.BalanceCents > 100_000_000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "充值金额超出合理范围 (0 ~ 1,000,000 元)"})
+		return
 	}
-	if req.Duration <= 0 {
-		req.Duration = 30
+	if req.QuotaGB < 0 || req.QuotaGB > 1_048_576 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "流量配额超出合理范围"})
+		return
+	}
+	if req.Duration < 0 || req.Duration > 36500 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "有效天数超出合理范围 (0 ~ 36500 天)"})
+		return
+	}
+
+	var planName string
+	quotaBytes := req.QuotaGB * 1024 * 1024 * 1024
+	duration := req.Duration
+
+	if req.PlanID > 0 {
+		var plan model.Plan
+		if err := s.db.First(&plan, req.PlanID).Error; err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "所选绑定套餐不存在"})
+			return
+		}
+		planName = plan.Name
+		if req.QuotaGB == 0 && plan.QuotaBytes > 0 {
+			quotaBytes = plan.QuotaBytes
+		}
+		if req.Duration == 0 && plan.DurationDays > 0 {
+			duration = plan.DurationDays
+		}
+	} else if req.BalanceCents == 0 {
+		// Traditional quota + duration card defaults when neither plan_id nor balance_cents is set
+		if req.QuotaGB <= 0 {
+			quotaBytes = 100 * 1024 * 1024 * 1024
+		}
+		if req.Duration <= 0 {
+			duration = 30
+		}
+	}
+
+	prefix := strings.ToUpper(strings.TrimSpace(req.Prefix))
+	if prefix == "" {
+		prefix = "NX"
+	}
+	for _, r := range prefix {
+		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "卡密前缀仅允许字母、数字或连字符"})
+			return
+		}
+	}
+	if len(prefix) > 12 {
+		prefix = prefix[:12]
+	}
+
+	note := strings.TrimSpace(req.Note)
+	if len(note) > 128 {
+		note = note[:128]
 	}
 
 	var codes []model.RedeemCode
 	for i := 0; i < req.Count; i++ {
 		rc := model.RedeemCode{
-			Code:       "NX-" + strings.ToUpper(utils.GenerateRandomToken(6)),
-			QuotaBytes: req.QuotaGB * 1024 * 1024 * 1024,
-			Duration:   req.Duration,
+			Code:         prefix + "-" + strings.ToUpper(utils.GenerateRandomToken(8)),
+			PlanID:       req.PlanID,
+			BalanceCents: req.BalanceCents,
+			QuotaBytes:   quotaBytes,
+			Duration:     duration,
+			Note:         note,
 		}
-		s.db.Create(&rc)
+		if err := s.db.Create(&rc).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "生成兑换码失败"})
+			return
+		}
+		rc.PlanName = planName
 		codes = append(codes, rc)
 	}
+	s.recordAudit(c, "admin.generate_redeem", prefix, fmt.Sprintf("批量生成 %d 张卡密", len(codes)))
 	c.JSON(http.StatusCreated, codes)
 }
+
+func (s *Server) handleAdminDeleteRedeemCode(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil || id == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	res := s.db.Delete(&model.RedeemCode{}, id)
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除兑换码失败"})
+		return
+	}
+	if res.RowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "兑换码不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": true})
+}
+
+func (s *Server) handleAdminBatchDeleteRedeemCodes(c *gin.Context) {
+	var req struct {
+		IDs  []uint64 `json:"ids"`
+		Mode string   `json:"mode"` // "used" | "unused" | ""
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数格式错误"})
+		return
+	}
+	var res *gorm.DB
+	switch req.Mode {
+	case "used":
+		res = s.db.Where("used_by > 0").Delete(&model.RedeemCode{})
+	case "unused":
+		res = s.db.Where("used_by = 0").Delete(&model.RedeemCode{})
+	default:
+		if len(req.IDs) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请先选择要删除的兑换码"})
+			return
+		}
+		if len(req.IDs) > 500 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "单次最多批量删除 500 条兑换码"})
+			return
+		}
+		res = s.db.Where("id IN ?", req.IDs).Delete(&model.RedeemCode{})
+	}
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "批量删除兑换码失败"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": res.RowsAffected})
+}
+
+func (s *Server) handleAdminListAuditLogs(c *gin.Context) {
+	query := s.db.Model(&model.AuditLog{}).Order("id desc")
+	if act := strings.TrimSpace(c.Query("action")); act != "" {
+		query = query.Where("action = ?", act)
+	}
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		like := "%" + q + "%"
+		query = query.Where("(user_email LIKE ? OR target LIKE ? OR detail LIKE ? OR client_ip LIKE ?)", like, like, like, like)
+	}
+	var logs []model.AuditLog
+	if err := query.Limit(200).Find(&logs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询审计日志失败"})
+		return
+	}
+	c.JSON(http.StatusOK, logs)
+}
+
+func (s *Server) handleAdminBackupSQLite(c *gin.Context) {
+	tmpDir, err := os.MkdirTemp("", "zachary-panel-backup-*")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建临时备份目录失败"})
+		return
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	backupPath := filepath.Join(tmpDir, "backup.db")
+	if err := s.db.Exec("VACUUM INTO ?", backupPath).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "导出 SQLite 热备快照失败 (仅支持 SQLite 数据库): " + err.Error()})
+		return
+	}
+	_ = os.Chmod(backupPath, 0o600)
+
+	f, err := os.Open(backupPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取备份文件失败"})
+		return
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "生成的备份文件无效"})
+		return
+	}
+
+	filename := fmt.Sprintf("zachary-panel-backup-%s.db", time.Now().UTC().Format("20060102-150405"))
+	s.recordAudit(c, "admin.backup_sqlite", filename, fmt.Sprintf("导出 SQLite 热备快照 (%d bytes)", fi.Size()))
+
+	c.Header("Content-Description", "File Transfer")
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Length", strconv.FormatInt(fi.Size(), 10))
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, f)
+}
+

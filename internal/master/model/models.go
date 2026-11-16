@@ -31,7 +31,20 @@ type SystemConfig struct {
 	DefaultMaxRules    int       `gorm:"default:5" json:"default_max_rules"`
 	DefaultSpeedMbps   int       `gorm:"default:50" json:"default_speed_mbps"`
 	DefaultTunnels     string    `gorm:"size:512;default:'1'" json:"default_tunnels"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	PaymentEnabled     bool      `gorm:"default:false" json:"payment_enabled"`
+	EpayURL            string    `gorm:"size:255;default:''" json:"epay_url"`
+	EpayPID            string    `gorm:"size:64;default:''" json:"epay_pid"`
+	EpayKey                string    `gorm:"size:128;default:''" json:"epay_key"`
+	USDTAddress            string    `gorm:"size:128;default:''" json:"usdt_address"`
+	RechargeNotice         string    `gorm:"size:512;default:''" json:"recharge_notice"`
+	NotifyTelegramBotToken string    `gorm:"size:128;default:''" json:"notify_telegram_bot_token"`
+	NotifyTelegramChatID   string    `gorm:"size:64;default:''" json:"notify_telegram_chat_id"`
+	NotifyWebhookURL       string    `gorm:"size:512;default:''" json:"notify_webhook_url"`
+	NotifyOnNodeEvents     bool      `gorm:"default:true" json:"notify_on_node_events"`
+	NotifyOnQuotaEvents    bool      `gorm:"default:true" json:"notify_on_quota_events"`
+	AdminAPIKeyHash        string    `gorm:"size:128;default:''" json:"-"`
+	AdminAPIKeyPrefix      string    `gorm:"size:32;default:''" json:"admin_api_key_prefix"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 // RoleGroup defines a role / permission group (类似 Xboard 权限组):
@@ -47,24 +60,28 @@ type RoleGroup struct {
 
 // User represents a tenant or administrator account.
 type User struct {
-	ID             uint64    `gorm:"primaryKey" json:"id"`
-	Email          string    `gorm:"uniqueIndex;size:191;not null" json:"email"`
-	PasswordHash   string    `gorm:"not null" json:"-"`
-	Role           string    `gorm:"size:32;default:'user'" json:"role"`         // "admin" | "user"
-	Status         string    `gorm:"size:32;default:'active'" json:"status"`     // "active" | "banned"
-	RoleGroupID    uint64    `gorm:"default:1" json:"role_group_id"`             // 所属角色 ID (决定可用隧道)
-	PlanID         uint64    `gorm:"default:0" json:"plan_id"`                   // 绑定套餐 ID
-	AllowedTunnels string    `gorm:"size:512;default:''" json:"allowed_tunnels"` // 逗号分隔的授权隧道 ID (随角色同步，admin 默认 "*")
-	BalanceCents   int64     `gorm:"default:0" json:"balance_cents"`
-	QuotaBytes     int64     `gorm:"default:107374182400" json:"quota_bytes"` // 总配额字节 (默认 100GB)
-	UsedBytes      int64     `gorm:"default:0" json:"used_bytes"`             // 已用计费字节 (含倍率折算)
-	MaxRules       int       `gorm:"default:20" json:"max_rules"`             // 最大规则数
-	SpeedMbps      int       `gorm:"default:100" json:"speed_mbps"`           // 峰值带宽限制 Mbps
-	ExpireAt       time.Time `json:"expire_at"`
-	SubToken       string    `gorm:"size:64;index" json:"sub_token"` // 订阅链接专属 Token (可随时重置使旧链接失效)
-	TokenVersion   int       `gorm:"default:0" json:"-"`             // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             uint64     `gorm:"primaryKey" json:"id"`
+	Email          string     `gorm:"uniqueIndex;size:191;not null" json:"email"`
+	PasswordHash   string     `gorm:"not null" json:"-"`
+	Role           string     `gorm:"size:32;default:'user'" json:"role"`         // "admin" | "user"
+	Status         string     `gorm:"size:32;default:'active'" json:"status"`     // "active" | "banned"
+	RoleGroupID    uint64     `gorm:"default:1" json:"role_group_id"`             // 所属角色 ID (决定可用隧道)
+	PlanID         uint64     `gorm:"default:0" json:"plan_id"`                   // 绑定套餐 ID
+	AllowedTunnels string     `gorm:"size:512;default:''" json:"allowed_tunnels"` // 逗号分隔的授权隧道 ID (随角色同步，admin 默认 "*")
+	BalanceCents   int64      `gorm:"default:0" json:"balance_cents"`
+	QuotaBytes     int64      `gorm:"default:107374182400" json:"quota_bytes"` // 总配额字节 (默认 100GB)
+	UsedBytes      int64      `gorm:"default:0" json:"used_bytes"`             // 已用计费字节 (含倍率折算)
+	MaxRules       int        `gorm:"default:20" json:"max_rules"`             // 最大规则数
+	SpeedMbps      int        `gorm:"default:100" json:"speed_mbps"`           // 峰值带宽限制 Mbps
+	ExpireAt       time.Time  `json:"expire_at"`
+	MonthlyReset   bool       `gorm:"default:false" json:"monthly_reset"` // 长周期套餐是否每满 30 天自动重置已用流量
+	LastResetAt    *time.Time `json:"last_reset_at,omitempty"`            // 最近一次流量重置时间
+	SubToken       string     `gorm:"size:64;index" json:"sub_token"`     // 订阅链接专属 Token (可随时重置使旧链接失效)
+	TOTPSecret     string     `gorm:"size:64;default:''" json:"-"`        // TOTP 双因素认证密钥 (Base32)
+	TOTPEnabled    bool       `gorm:"default:false" json:"totp_enabled"`  // 是否已启用双因素认证 (2FA)
+	TokenVersion   int        `gorm:"default:0" json:"-"`                 // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 // BeforeCreate ensures every newly created user receives a unique random subscription token.
@@ -123,6 +140,7 @@ type Plan struct {
 	QuotaBytes     int64     `gorm:"not null" json:"quota_bytes"`
 	MaxRules       int       `gorm:"default:20" json:"max_rules"`
 	SpeedMbps      int       `gorm:"default:200" json:"speed_mbps"`
+	MonthlyReset   bool      `gorm:"default:false" json:"monthly_reset"` // 是否按月(每30天)自动清零已用流量
 	AllowedGroups  string    `gorm:"size:255;default:'*'" json:"allowed_groups"`
 	AllowedTunnels string    `gorm:"size:512;default:'1'" json:"allowed_tunnels"` // 继承自所绑定角色的隧道 ID 列表
 	Active         bool      `gorm:"default:true" json:"active"`
@@ -151,8 +169,11 @@ type Node struct {
 	TrafficRate      float64             `gorm:"default:1.0" json:"traffic_rate"`           // 节点倍率
 	QuotaBytes       int64               `gorm:"default:10995116277760" json:"quota_bytes"` // 节点月流量配额 (默认 10TB, 0表示不限)
 	UsedBytes        int64               `gorm:"default:0" json:"used_bytes"`               // 节点当前已用流量 (可手动设置校准)
+	ResetDay         int                 `gorm:"default:0" json:"reset_day"`                // 每月自动重置流量日 (0=不开启, 1..28=每月几号)
+	LastResetMonth   string              `gorm:"size:16;default:''" json:"last_reset_month"` // 最近一次自动重置月份 (YYYY-MM)
 	DefaultEngine    protocol.EngineType `gorm:"size:32;default:'native'" json:"default_engine"`
 	SupportedEngines string              `gorm:"size:255;default:'native'" json:"supported_engines"` // Agent上报的可用引擎列表
+	AgentVersion     string              `gorm:"size:32;default:'1.1.0-sec'" json:"agent_version"`   // Agent 上报的当前程序版本号
 	SecretToken      string              `gorm:"size:128;not null" json:"secret_token"`
 	TunnelCertPEM    string              `gorm:"type:text" json:"-"`                      // Agent 上报的隧道 TLS 证书 (入口节点据此做证书固定)
 	Status           string              `gorm:"size:32;default:'offline'" json:"status"` // "online" | "offline" | "maintenance"
@@ -214,6 +235,8 @@ type ForwardRule struct {
 	LoadBalance   string              `gorm:"size:32;default:'round_robin'" json:"load_balance"`
 	TargetsJSON   string              `gorm:"type:text;not null" json:"targets_json"` // JSON serialized []protocol.TargetEndpoint
 	SpeedMbps     int                 `gorm:"default:0" json:"speed_mbps"`            // 0 表示继承用户套餐限速
+	AccessMode    string              `gorm:"size:16;default:'off'" json:"access_mode"`   // "off" | "allow" | "deny"
+	AccessCIDRs   string              `gorm:"size:1024;default:''" json:"access_cidrs"`   // 逗号分隔的 IP 或 CIDR 列表
 	UploadBytes   int64               `gorm:"default:0" json:"upload_bytes"`
 	DownBytes     int64               `gorm:"default:0" json:"down_bytes"`
 	BilledBytes   int64               `gorm:"default:0" json:"billed_bytes"`
@@ -227,16 +250,38 @@ type ForwardRule struct {
 	EffectiveEngine protocol.EngineType `gorm:"-" json:"effective_engine,omitempty"`
 }
 
-// RedeemCode allows users to top-up balance or activate plans via gift codes.
+// RedeemCode allows users to top-up balance, add quota/duration, or activate plans via gift codes.
 type RedeemCode struct {
-	ID         uint64     `gorm:"primaryKey" json:"id"`
-	Code       string     `gorm:"uniqueIndex;size:64;not null" json:"code"`
-	PlanID     uint64     `gorm:"default:0" json:"plan_id"`
-	QuotaBytes int64      `gorm:"default:0" json:"quota_bytes"`
-	Duration   int        `gorm:"default:30" json:"duration_days"`
-	UsedBy     uint64     `gorm:"default:0" json:"used_by"`
-	UsedAt     *time.Time `json:"used_at,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID           uint64     `gorm:"primaryKey" json:"id"`
+	Code         string     `gorm:"uniqueIndex;size:64;not null" json:"code"`
+	PlanID       uint64     `gorm:"default:0" json:"plan_id"`
+	BalanceCents int64      `gorm:"default:0" json:"balance_cents"`
+	QuotaBytes   int64      `gorm:"default:0" json:"quota_bytes"`
+	Duration     int        `gorm:"default:0" json:"duration_days"`
+	Note         string     `gorm:"size:128;default:''" json:"note"`
+	UsedBy       uint64     `gorm:"default:0" json:"used_by"`
+	UsedAt       *time.Time `json:"used_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UsedByEmail  string     `gorm:"-" json:"used_by_email,omitempty"`
+	PlanName     string     `gorm:"-" json:"plan_name,omitempty"`
+}
+
+// BillingOrder records recharge orders, plan purchases, paid subscription resets, and redeem code redemptions.
+type BillingOrder struct {
+	ID          uint64     `gorm:"primaryKey" json:"id"`
+	OrderNo     string     `gorm:"uniqueIndex;size:64;not null" json:"order_no"`
+	UserID      uint64     `gorm:"index;not null" json:"user_id"`
+	UserEmail   string     `gorm:"size:191;default:''" json:"user_email"`
+	Type        string     `gorm:"size:32;not null" json:"type"`             // "recharge" | "plan_purchase" | "plan_reset" | "redeem"
+	PlanID      uint64     `gorm:"default:0" json:"plan_id"`
+	PlanName    string     `gorm:"size:128;default:''" json:"plan_name"`
+	AmountCents int64      `gorm:"default:0" json:"amount_cents"`
+	Status      string     `gorm:"size:32;default:'pending'" json:"status"`  // "pending" | "paid" | "cancelled"
+	Gateway     string     `gorm:"size:32;default:'balance'" json:"gateway"` // "balance" | "epay" | "usdt" | "manual" | "redeem"
+	TradeNo     string     `gorm:"size:128;default:''" json:"trade_no"`
+	PayURL      string     `gorm:"size:512;default:''" json:"pay_url,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	PaidAt      *time.Time `json:"paid_at,omitempty"`
 }
 
 // TrafficHourlyStat stores hourly aggregated traffic for dashboard charts.
@@ -250,6 +295,18 @@ type TrafficHourlyStat struct {
 	DownBytes   int64     `json:"down_bytes"`
 	BilledBytes int64     `json:"billed_bytes"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// AuditLog records security-sensitive and administrative operations on the panel.
+type AuditLog struct {
+	ID        uint64    `gorm:"primaryKey" json:"id"`
+	UserID    uint64    `gorm:"index" json:"user_id"`
+	UserEmail string    `gorm:"size:191;default:''" json:"user_email"`
+	Action    string    `gorm:"size:64;index;not null" json:"action"`
+	Target    string    `gorm:"size:191;default:''" json:"target"`
+	Detail    string    `gorm:"size:512;default:''" json:"detail"`
+	ClientIP  string    `gorm:"size:64;default:''" json:"client_ip"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // InitDB opens a GORM connection (SQLite by default, or Postgres/MySQL via driver & dsn),
@@ -291,7 +348,9 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 		&TunnelLine{},
 		&ForwardRule{},
 		&RedeemCode{},
+		&BillingOrder{},
 		&TrafficHourlyStat{},
+		&AuditLog{},
 	)
 	if err != nil {
 		return nil, fmt.Errorf("schema migration failed: %w", err)

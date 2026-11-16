@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,14 +26,78 @@ type CustomTunnelWrapper interface {
 }
 
 type nativeRuleInstance struct {
-	key         string
-	spec        protocol.RuleSpec
-	cancel      context.CancelFunc
-	tcpListener net.Listener
-	udpConn     *net.UDPConn
-	tracker     *limiter.RuleStatsTracker
-	rrIndex     uint64
-	clientTLS   *tls.Config // Ingress only: pinned Egress certificate
+	key            string
+	spec           protocol.RuleSpec
+	cancel         context.CancelFunc
+	tcpListener    net.Listener
+	udpConn        *net.UDPConn
+	tracker        *limiter.RuleStatsTracker
+	rrIndex        uint64
+	clientTLS      *tls.Config // Ingress only: pinned Egress certificate
+	aclMode        string      // "off" | "allow" | "deny"
+	aclNets        []*net.IPNet
+	unhealthyUntil []int64 // atomic UnixNano per target index
+}
+
+func parseACLCIDRs(raw string) []*net.IPNet {
+	var nets []*net.IPNet
+	for _, token := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	}) {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if strings.Contains(token, "/") {
+			if _, ipNet, err := net.ParseCIDR(token); err == nil && ipNet != nil {
+				nets = append(nets, ipNet)
+			}
+			continue
+		}
+		if ip := net.ParseIP(token); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				nets = append(nets, &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)})
+			} else {
+				nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+			}
+		}
+	}
+	return nets
+}
+
+func (inst *nativeRuleInstance) isAllowedRemoteAddr(addr net.Addr) bool {
+	if (inst.aclMode != "allow" && inst.aclMode != "deny") || len(inst.aclNets) == 0 {
+		return true
+	}
+	var ip net.IP
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		ip = a.IP
+	case *net.UDPAddr:
+		ip = a.IP
+	default:
+		if addr != nil {
+			if h, _, err := net.SplitHostPort(addr.String()); err == nil {
+				ip = net.ParseIP(h)
+			} else {
+				ip = net.ParseIP(addr.String())
+			}
+		}
+	}
+	if ip == nil {
+		return inst.aclMode != "allow"
+	}
+	matched := false
+	for _, n := range inst.aclNets {
+		if n.Contains(ip) {
+			matched = true
+			break
+		}
+	}
+	if inst.aclMode == "allow" {
+		return matched
+	}
+	return !matched
 }
 
 // NativeEngine implements EngineDriver in pure Go with zero external binary dependencies.
@@ -120,10 +185,16 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 		return fmt.Errorf("rule %s: tunnel secret key missing", key)
 	}
 
+	aclMode := strings.ToLower(strings.TrimSpace(spec.AccessMode))
+	aclNets := parseACLCIDRs(spec.AccessCIDRs)
+
 	inst := &nativeRuleInstance{
-		key:     key,
-		spec:    spec,
-		tracker: limiter.NewRuleStatsTracker(spec.SpeedLimitMbps),
+		key:            key,
+		spec:           spec,
+		tracker:        limiter.NewRuleStatsTracker(spec.SpeedLimitMbps),
+		aclMode:        aclMode,
+		aclNets:        aclNets,
+		unhealthyUntil: make([]int64, len(spec.Targets)),
 	}
 	if isTunnelIngress(spec) {
 		clientTLS, err := security.TunnelClientTLSConfig(spec.Tunnel.CertPEM)
@@ -184,12 +255,17 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 		go e.serveUDP(ruleCtx, inst)
 	}
 
+	// Background active health probe for multi-target TCP rules
+	if !isTunnelIngress(spec) && len(spec.Targets) > 1 && wantsTCP(spec) {
+		go e.healthProbeLoop(ruleCtx, inst)
+	}
+
 	e.mu.Lock()
 	e.rules[key] = inst
 	e.mu.Unlock()
 
-	log.Printf("[NativeEngine] Applied rule %s (%s) listening on %s -> %d targets (limit=%d Mbps)",
-		key, spec.Name, bindAddr, len(spec.Targets), spec.SpeedLimitMbps)
+	log.Printf("[NativeEngine] Applied rule %s (%s) listening on %s -> %d targets (limit=%d Mbps, acl=%s)",
+		key, spec.Name, bindAddr, len(spec.Targets), spec.SpeedLimitMbps, aclMode)
 	return nil
 }
 
@@ -204,6 +280,11 @@ func (e *NativeEngine) serveTCP(ctx context.Context, inst *nativeRuleInstance) {
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
+		}
+
+		if !isTunnelEgress(inst.spec) && !inst.isAllowedRemoteAddr(conn.RemoteAddr()) {
+			_ = conn.Close()
+			continue
 		}
 
 		if inst.spec.MaxConns > 0 && atomic.LoadInt64(&inst.tracker.ActiveConns) >= int64(inst.spec.MaxConns) {
@@ -302,6 +383,32 @@ func closeWrite(c net.Conn) {
 	}
 }
 
+func (e *NativeEngine) healthProbeLoop(ctx context.Context, inst *nativeRuleInstance) {
+	allowPrivate := e.policy.AllowPrivateTargets || (inst.spec.Role == protocol.RoleIngress)
+	probeOnce := func() {
+		for idx, t := range inst.spec.Targets {
+			c, err := security.SafeDialTCP(ctx, t.Address, 1500*time.Millisecond, allowPrivate)
+			if err != nil {
+				atomic.StoreInt64(&inst.unhealthyUntil[idx], time.Now().Add(15*time.Second).UnixNano())
+			} else {
+				_ = c.Close()
+				atomic.StoreInt64(&inst.unhealthyUntil[idx], 0)
+			}
+		}
+	}
+	probeOnce()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			probeOnce()
+		}
+	}
+}
+
 // dialUpstream connects to the next target. For Ingress tunnel rules it establishes the pinned TLS tunnel to the
 // Egress node and authenticates with the given stream mode.
 func (e *NativeEngine) dialUpstream(ctx context.Context, inst *nativeRuleInstance, mode byte) (net.Conn, error) {
@@ -317,17 +424,38 @@ func (e *NativeEngine) dialUpstream(ctx context.Context, inst *nativeRuleInstanc
 	}
 
 	allowPrivate := e.policy.AllowPrivateTargets || (inst.spec.Role == protocol.RoleIngress)
+	nowNano := time.Now().UnixNano()
 
-	var lastErr error
+	// Order candidates: healthy targets first (starting from startIdx), then unhealthy targets as fallback
+	candidates := make([]int, 0, n)
 	for i := 0; i < n; i++ {
 		idx := (startIdx + i) % n
+		if idx < len(inst.unhealthyUntil) && atomic.LoadInt64(&inst.unhealthyUntil[idx]) <= nowNano {
+			candidates = append(candidates, idx)
+		}
+	}
+	for i := 0; i < n; i++ {
+		idx := (startIdx + i) % n
+		if idx < len(inst.unhealthyUntil) && atomic.LoadInt64(&inst.unhealthyUntil[idx]) > nowNano {
+			candidates = append(candidates, idx)
+		}
+	}
+
+	var lastErr error
+	for _, idx := range candidates {
 		addr := targets[idx].Address
 
 		// Use Anti-SSRF & Anti-DNS-Rebinding safe dialer
 		rawConn, err := security.SafeDialTCP(ctx, addr, 5*time.Second, allowPrivate)
 		if err != nil {
+			if idx < len(inst.unhealthyUntil) {
+				atomic.StoreInt64(&inst.unhealthyUntil[idx], time.Now().Add(12*time.Second).UnixNano())
+			}
 			lastErr = err
 			continue
+		}
+		if idx < len(inst.unhealthyUntil) {
+			atomic.StoreInt64(&inst.unhealthyUntil[idx], 0)
 		}
 		if !isTunnelIngress(inst.spec) {
 			return rawConn, nil
@@ -488,6 +616,10 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 			default:
 				continue
 			}
+		}
+
+		if !inst.isAllowedRemoteAddr(clientAddr) {
+			continue
 		}
 
 		inst.tracker.AddUpload(int64(n))

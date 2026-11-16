@@ -35,6 +35,7 @@ const (
 	MsgApplyRule    MessageType = "master.apply"    // Master -> Agent: 新增或热更新单条规则
 	MsgRemoveRule   MessageType = "master.remove"   // Master -> Agent: 停止并移除单条规则
 	MsgProbeTask    MessageType = "master.probe"    // Master -> Agent: 触发目标/出口端到端探测
+	MsgUpgradeAgent MessageType = "master.upgrade"  // Master -> Agent: 远程平滑自升级指令
 )
 
 // Envelope wraps all Master <-> Agent messages with anti-replay Nonce and HMAC-SHA256 Signature.
@@ -64,6 +65,7 @@ type AgentRegisterPayload struct {
 // AgentHeartbeatPayload reports live node probe metrics (CPU, Memory, Disk, Load, Network, Connections) to the Master.
 type AgentHeartbeatPayload struct {
 	NodeID           uint64       `json:"node_id"`
+	AgentVersion     string       `json:"agent_version,omitempty"`
 	CPUCores         int          `json:"cpu_cores"`
 	CPUUsagePercent  float64      `json:"cpu_usage_percent"`
 	Load1            float64      `json:"load_1"`
@@ -113,9 +115,11 @@ type RuleSpec struct {
 	ListenPort     int              `json:"listen_port"`      // 本地监听端口
 	LoadBalance    string           `json:"load_balance"`     // round_robin | random | failover
 	Targets        []TargetEndpoint `json:"targets"`          // 转发目标列表 (Ingress 角色下为出口节点的隧道地址)
-	Tunnel         *TunnelConfig    `json:"tunnel,omitempty"` // 隧道参数
-	SpeedLimitMbps int              `json:"speed_limit_mbps"` // 单规则/用户带宽上限 (Mbps, 0 表示不限速)
-	MaxConns       int              `json:"max_conns"`        // 最大并发连接数限制
+	Tunnel         *TunnelConfig    `json:"tunnel,omitempty"`       // 隧道参数
+	SpeedLimitMbps int              `json:"speed_limit_mbps"`       // 单规则/用户带宽上限 (Mbps, 0 表示不限速)
+	AccessMode     string           `json:"access_mode,omitempty"`  // "off" | "allow" | "deny"
+	AccessCIDRs    string           `json:"access_cidrs,omitempty"` // 逗号分隔的 IP 或 CIDR 列表
+	MaxConns       int              `json:"max_conns"`              // 最大并发连接数限制
 	UpdatedAt      time.Time        `json:"updated_at"`
 }
 
@@ -169,3 +173,11 @@ type ProbeResultPayload struct {
 	RuleID    uint64         `json:"rule_id"`
 	Latencies map[string]int `json:"latencies"`
 }
+
+// UpgradeAgentPayload instructs an Agent to verify and upgrade its binary from the Master release URL.
+type UpgradeAgentPayload struct {
+	TargetVersion string            `json:"target_version"`
+	BaseURL       string            `json:"base_url"`
+	SHA256ByArch  map[string]string `json:"sha256_by_arch,omitempty"`
+}
+

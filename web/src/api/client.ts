@@ -18,6 +18,19 @@ export interface SystemConfig {
   default_max_rules?: number
   default_speed_mbps?: number
   default_tunnels?: string
+  payment_enabled?: boolean
+  epay_enabled?: boolean
+  epay_url?: string
+  epay_pid?: string
+  epay_key?: string
+  usdt_address?: string
+  recharge_notice?: string
+  notify_telegram_bot_token?: string
+  notify_telegram_chat_id?: string
+  notify_webhook_url?: string
+  notify_on_node_events?: boolean
+  notify_on_quota_events?: boolean
+  admin_api_key_prefix?: string
 }
 
 export interface RoleGroup {
@@ -41,7 +54,10 @@ export interface User {
   max_rules: number
   speed_mbps: number
   expire_at: string
+  monthly_reset?: boolean
+  last_reset_at?: string
   sub_token?: string
+  totp_enabled?: boolean
 }
 
 export interface NodeItem {
@@ -57,8 +73,11 @@ export interface NodeItem {
   traffic_rate: number
   quota_bytes: number
   used_bytes: number
+  reset_day?: number
+  last_reset_month?: string
   default_engine: EngineType
   supported_engines: string
+  agent_version?: string
   secret_token?: string
   status: 'online' | 'offline' | 'maintenance'
   cpu_cores: number
@@ -110,6 +129,8 @@ export interface ForwardRule {
   load_balance: 'round_robin' | 'failover'
   targets_json: string
   speed_mbps: number
+  access_mode?: 'off' | 'allow' | 'deny'
+  access_cidrs?: string
   upload_bytes: number
   down_bytes: number
   billed_bytes: number
@@ -128,8 +149,24 @@ export interface Plan {
   quota_bytes: number
   max_rules: number
   speed_mbps: number
+  monthly_reset?: boolean
   allowed_tunnels?: string
   active?: boolean
+}
+
+export interface RedeemCodeItem {
+  id: number
+  code: string
+  plan_id: number
+  plan_name?: string
+  balance_cents: number
+  quota_bytes: number
+  duration_days: number
+  note: string
+  used_by: number
+  used_by_email?: string
+  used_at?: string
+  created_at: string
 }
 
 const API_BASE = '/api/v1'
@@ -159,7 +196,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     window.dispatchEvent(new CustomEvent('nexus-unauthorized'))
   }
   if (!res.ok) {
-    throw new Error(data.error || `HTTP ${res.status}`)
+    const err = new Error(data.error || `HTTP ${res.status}`) as Error & { totp_required?: boolean }
+    if (data.totp_required) {
+      err.totp_required = true
+    }
+    throw err
   }
   return data as T
 }
@@ -167,10 +208,37 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   getSiteConfig: () => request<SystemConfig>('/site-config'),
 
-  login: (email: string, password: string) =>
+  login: (email: string, password: string, totpCode?: string) =>
     request<{ token: string; user: User }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, totp_code: totpCode || '' }),
+    }),
+
+  setupTOTP: () =>
+    request<{ secret: string; otpauth_url: string }>('/user/totp/setup', {
+      method: 'POST',
+    }),
+
+  enableTOTP: (code: string) =>
+    request<{ message: string; totp_enabled: boolean }>('/user/totp/enable', {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
+
+  disableTOTP: (payload: { password?: string; code?: string }) =>
+    request<{ message: string; totp_enabled: boolean }>('/user/totp/disable', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  adminGenerateAPIKey: () =>
+    request<{ api_key: string; admin_api_key_prefix: string; message: string }>('/admin/settings/api-key', {
+      method: 'POST',
+    }),
+
+  adminRevokeAPIKey: () =>
+    request<{ message: string }>('/admin/settings/api-key', {
+      method: 'DELETE',
     }),
 
   changePassword: (oldPassword: string, newPassword: string) =>
@@ -207,6 +275,26 @@ export const api = {
         upload_bytes: number
         down_bytes: number
         billed_bytes: number
+      }>
+      global_hourly_stats?: Array<{
+        hour_bucket: string
+        upload_bytes: number
+        down_bytes: number
+        billed_bytes: number
+      }>
+      top_users?: Array<{
+        id: number
+        email: string
+        used_bytes: number
+        quota_bytes: number
+        plan_id: number
+      }>
+      top_nodes?: Array<{
+        id: number
+        name: string
+        used_bytes: number
+        quota_bytes: number
+        status: string
       }>
       engines: Array<{ id: EngineType; name: string; desc: string }>
     }>('/dashboard'),
@@ -252,6 +340,8 @@ export const api = {
     load_balance: 'round_robin' | 'failover'
     targets: TargetEndpoint[]
     speed_mbps: number
+    access_mode?: 'off' | 'allow' | 'deny'
+    access_cidrs?: string
   }) =>
     request<ForwardRule>('/rules', {
       method: 'POST',
@@ -264,6 +354,7 @@ export const api = {
     items: Array<{
       name: string
       listen_port: number
+      port_range?: string
       targets: TargetEndpoint[]
       protocol?: 'tcp' | 'udp' | 'both'
       load_balance?: 'round_robin' | 'failover'
@@ -369,6 +460,20 @@ export const api = {
     request<{ status: string; node_id: number }>(`/admin/nodes/${id}/resync`, {
       method: 'POST',
     }),
+  adminResetNodeTraffic: (id: number) =>
+    request<{ node: NodeItem; resumed_rules: number }>(`/admin/nodes/${id}/reset-traffic`, {
+      method: 'POST',
+    }),
+  adminUpgradeNode: (id: number, target_version?: string) =>
+    request<{ message: string; node_id: number; target_version: string }>(`/admin/nodes/${id}/upgrade`, {
+      method: 'POST',
+      body: JSON.stringify({ target_version: target_version || '' }),
+    }),
+  adminBatchUpgradeNodes: (ids?: number[], target_version?: string) =>
+    request<{ message: string; upgraded_nodes: number[]; target_version: string }>('/admin/nodes/batch-upgrade', {
+      method: 'POST',
+      body: JSON.stringify({ ids: ids || [], target_version: target_version || '' }),
+    }),
   adminCreateLine: (line: Partial<TunnelLine>) =>
     request<TunnelLine>('/admin/lines', {
       method: 'POST',
@@ -426,6 +531,123 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
+  adminTestNotify: () =>
+    request<{ message: string }>('/admin/settings/test-notify', {
+      method: 'POST',
+    }),
+  adminListRedeemCodes: (params?: { status?: string; q?: string }) => {
+    const qs = new URLSearchParams()
+    if (params?.status) qs.set('status', params.status)
+    if (params?.q) qs.set('q', params.q)
+    const query = qs.toString()
+    return request<RedeemCodeItem[]>(`/admin/redeem${query ? '?' + query : ''}`)
+  },
+  adminGenerateRedeemCodes: (payload: {
+    count: number
+    plan_id?: number
+    balance_cents?: number
+    quota_gb?: number
+    duration_days?: number
+    prefix?: string
+    note?: string
+  }) =>
+    request<RedeemCodeItem[]>('/admin/redeem/generate', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  adminDeleteRedeemCode: (id: number) =>
+    request<{ deleted: boolean }>(`/admin/redeem/${id}`, { method: 'DELETE' }),
+  adminBatchDeleteRedeemCodes: (payload: { ids?: number[]; mode?: 'used' | 'unused' }) =>
+    request<{ deleted: number }>('/admin/redeem/batch-delete', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getOrders: (params?: { all?: boolean; status?: string; type?: string }) => {
+    const qs = new URLSearchParams()
+    if (params?.all) qs.set('all', '1')
+    if (params?.status) qs.set('status', params.status)
+    if (params?.type) qs.set('type', params.type)
+    const query = qs.toString()
+    return request<BillingOrder[]>(`/orders${query ? '?' + query : ''}`)
+  },
+  createRechargeOrder: (payload: {
+    amount_cents: number
+    gateway?: 'epay' | 'usdt' | 'manual'
+    pay_type?: 'alipay' | 'wxpay' | 'qqpay' | 'usdt'
+  }) =>
+    request<BillingOrder>('/orders/recharge', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  adminConfirmOrder: (id: number) =>
+    request<{ message: string; order: BillingOrder }>(`/admin/orders/${id}/confirm`, {
+      method: 'POST',
+    }),
+  adminListAuditLogs: (params?: { action?: string; q?: string }) => {
+    const qs = new URLSearchParams()
+    if (params?.action && params.action !== 'all') qs.set('action', params.action)
+    if (params?.q) qs.set('q', params.q)
+    const query = qs.toString()
+    return request<AuditLogItem[]>(`/admin/audit-logs${query ? '?' + query : ''}`)
+  },
+  adminDownloadSQLiteBackup: async () => {
+    const token = localStorage.getItem('nexus_token')
+    const res = await fetch(`${API_BASE}/admin/backup/sqlite`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) {
+      let errMsg = `导出失败 (${res.status})`
+      try {
+        const data = await res.json()
+        if (data?.error) errMsg = data.error
+      } catch {
+        // ignore
+      }
+      throw new Error(errMsg)
+    }
+    const blob = await res.blob()
+    const disposition = res.headers.get('Content-Disposition') || ''
+    const match = disposition.match(/filename="?([^"]+)"?/)
+    const filename = match?.[1] || `zachary-panel-backup-${Date.now()}.db`
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    return filename
+  },
+}
+
+export interface AuditLogItem {
+  id: number
+  user_id: number
+  user_email: string
+  action: string
+  target: string
+  detail: string
+  client_ip: string
+  ip?: string
+  created_at: string
+}
+
+export interface BillingOrder {
+  id: number
+  order_no: string
+  user_id: number
+  user_email: string
+  type: 'recharge' | 'plan_purchase' | 'plan_reset' | 'redeem'
+  plan_id: number
+  plan_name: string
+  amount_cents: number
+  status: 'pending' | 'paid' | 'cancelled'
+  gateway: 'balance' | 'epay' | 'usdt' | 'manual' | 'redeem'
+  trade_no: string
+  pay_url?: string
+  created_at: string
+  paid_at?: string
 }
 
 export function formatBytes(bytes: number): string {

@@ -46,6 +46,7 @@ type AgentSession struct {
 	ReplayGuard      *protocol.ReplayGuard
 	Conn             *websocket.Conn
 	WriteMu          sync.Mutex
+	AgentVersion     string
 	SupportedEngines []protocol.EngineType
 	CPUCores         int
 	CPUUsage         float64
@@ -88,6 +89,7 @@ type AgentHub struct {
 	probeWaiters   map[string]chan protocol.ProbeResultPayload // "nodeID:ruleID" -> channel
 	onTraffic      TrafficHandlerFunc
 	onNodeOnline   SyncNodeCallback
+	onNodeOffline  SyncNodeCallback
 	onCertChanged  SyncNodeCallback
 	ackScope       AckScopeFunc
 
@@ -107,6 +109,11 @@ func NewAgentHub(db *gorm.DB) *AgentHub {
 func (h *AgentHub) SetCallbacks(onTraffic TrafficHandlerFunc, onNodeOnline SyncNodeCallback) {
 	h.onTraffic = onTraffic
 	h.onNodeOnline = onNodeOnline
+}
+
+// SetOfflineCallback registers a callback fired when a connected Agent disconnects.
+func (h *AgentHub) SetOfflineCallback(cb SyncNodeCallback) {
+	h.onNodeOffline = cb
 }
 
 // SetCertChangedCallback registers a callback fired when an Agent reports a new tunnel certificate.
@@ -207,13 +214,18 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 
 	defer func() {
 		_ = conn.Close()
+		disconnected := false
 		h.mu.Lock()
 		if cur, ok := h.sessions[nodeID]; ok && cur == sess {
 			delete(h.sessions, nodeID)
 			h.db.Model(&model.Node{}).Where("id = ?", nodeID).Update("status", "offline")
 			log.Printf("[AgentHub] Node #%d (%s) disconnected", node.ID, node.Name)
+			disconnected = true
 		}
 		h.mu.Unlock()
+		if disconnected && h.onNodeOffline != nil {
+			go h.onNodeOffline(nodeID)
+		}
 	}()
 
 	h.handleRegister(sess, firstPayload)
@@ -225,6 +237,14 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 		}
 		h.processAgentMessage(sess, raw)
 	}
+}
+
+func sanitizeVersionString(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) > 32 {
+		v = v[:32]
+	}
+	return v
 }
 
 func (h *AgentHub) handleRegister(sess *AgentSession, payloadBytes []byte) {
@@ -239,8 +259,12 @@ func (h *AgentHub) handleRegister(sess *AgentSession, payloadBytes []byte) {
 			engStrs = append(engStrs, string(e))
 		}
 	}
+	ver := sanitizeVersionString(reg.AgentVersion)
 	h.mu.Lock()
 	sess.SupportedEngines = reg.SupportedEngines
+	if ver != "" {
+		sess.AgentVersion = ver
+	}
 	h.mu.Unlock()
 
 	now := time.Now()
@@ -248,6 +272,9 @@ func (h *AgentHub) handleRegister(sess *AgentSession, payloadBytes []byte) {
 		"supported_engines": strings.Join(engStrs, ","),
 		"status":            "online",
 		"last_seen_at":      &now,
+	}
+	if ver != "" {
+		updates["agent_version"] = ver
 	}
 	certChanged := false
 	if reg.TunnelCertPEM != "" {
@@ -285,7 +312,11 @@ func (h *AgentHub) processAgentMessage(sess *AgentSession, raw []byte) {
 	case protocol.MsgAgentHeartbeat:
 		var hb protocol.AgentHeartbeatPayload
 		if err := json.Unmarshal(payloadBytes, &hb); err == nil {
+			ver := sanitizeVersionString(hb.AgentVersion)
 			h.mu.Lock()
+			if ver != "" {
+				sess.AgentVersion = ver
+			}
 			sess.CPUCores = hb.CPUCores
 			sess.CPUUsage = hb.CPUUsagePercent
 			sess.Load1 = hb.Load1
@@ -309,10 +340,14 @@ func (h *AgentHub) processAgentMessage(sess *AgentSession, raw []byte) {
 			h.mu.Unlock()
 
 			now := time.Now()
-			h.db.Model(&model.Node{}).Where("id = ?", sess.NodeID).Updates(map[string]any{
+			hbUpdates := map[string]any{
 				"status":       "online",
 				"last_seen_at": &now,
-			})
+			}
+			if ver != "" {
+				hbUpdates["agent_version"] = ver
+			}
+			h.db.Model(&model.Node{}).Where("id = ?", sess.NodeID).Updates(hbUpdates)
 		}
 
 	case protocol.MsgTrafficReport:
@@ -367,6 +402,9 @@ func (h *AgentHub) EnrichNodeMetrics(n *model.Node) {
 	defer h.mu.RUnlock()
 	if sess, ok := h.sessions[n.ID]; ok {
 		n.Status = "online"
+		if sess.AgentVersion != "" {
+			n.AgentVersion = sess.AgentVersion
+		}
 		n.CPUCores = sess.CPUCores
 		n.CPUUsage = sess.CPUUsage
 		n.Load1 = sess.Load1

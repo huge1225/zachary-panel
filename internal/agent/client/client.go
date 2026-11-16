@@ -8,11 +8,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -31,6 +36,7 @@ type Config struct {
 	MasterPinSHA256  string // Optional SHA-256 hex fingerprint of Master TLS certificate
 	AllowPrivateSSRF bool
 	ReportInterval   time.Duration // Probe & traffic delta sync frequency (default 3s)
+	OnUpgrade        func(protocol.UpgradeAgentPayload)
 }
 
 // AgentClient maintains the persistent, HMAC-signed WebSocket connection to the Master server,
@@ -41,6 +47,7 @@ type AgentClient struct {
 	replayGuard *protocol.ReplayGuard
 	writeMu     sync.Mutex
 	conn        *websocket.Conn
+	upgrading   atomic.Bool
 }
 
 func NewAgentClient(cfg Config, engMgr *engine.Manager) *AgentClient {
@@ -49,6 +56,27 @@ func NewAgentClient(cfg Config, engMgr *engine.Manager) *AgentClient {
 		engMgr:      engMgr,
 		replayGuard: protocol.NewReplayGuard(),
 	}
+}
+
+func (c *AgentClient) tlsConfig() *tls.Config {
+	cfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if c.cfg.MasterPinSHA256 != "" {
+		expectedPin := strings.ToLower(strings.TrimSpace(c.cfg.MasterPinSHA256))
+		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no server TLS certificate presented")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			actualPin := hex.EncodeToString(sum[:])
+			if actualPin != expectedPin {
+				return fmt.Errorf("TLS certificate pin mismatch: got %s, expected %s", actualPin, expectedPin)
+			}
+			return nil
+		}
+	}
+	return cfg
 }
 
 // Run loops indefinitely, reconnecting with backoff whenever the connection drops.
@@ -86,21 +114,7 @@ func (c *AgentClient) connectAndServe(ctx context.Context) error {
 
 	dialer := *websocket.DefaultDialer
 	if c.cfg.MasterPinSHA256 != "" {
-		expectedPin := strings.ToLower(strings.TrimSpace(c.cfg.MasterPinSHA256))
-		dialer.TLSClientConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				if len(rawCerts) == 0 {
-					return fmt.Errorf("no server TLS certificate presented")
-				}
-				sum := sha256.Sum256(rawCerts[0])
-				actualPin := hex.EncodeToString(sum[:])
-				if actualPin != expectedPin {
-					return fmt.Errorf("TLS certificate pin mismatch: got %s, expected %s", actualPin, expectedPin)
-				}
-				return nil
-			},
-		}
+		dialer.TLSClientConfig = c.tlsConfig()
 	}
 
 	conn, _, err := dialer.DialContext(ctx, c.cfg.MasterURL, headers)
@@ -176,6 +190,7 @@ func (c *AgentClient) reportLoop(ctx context.Context) {
 			metrics := monitor.CollectMetrics()
 			_ = c.sendEnvelope(protocol.MsgAgentHeartbeat, protocol.AgentHeartbeatPayload{
 				NodeID:           c.cfg.NodeID,
+				AgentVersion:     AgentVersion,
 				CPUCores:         metrics.CPUCores,
 				CPUUsagePercent:  metrics.CPUUsagePercent,
 				Load1:            metrics.Load1,
@@ -262,7 +277,116 @@ func (c *AgentClient) handleMessage(ctx context.Context, raw []byte) {
 				})
 			}()
 		}
+
+	case protocol.MsgUpgradeAgent:
+		var p protocol.UpgradeAgentPayload
+		if err := json.Unmarshal(payloadBytes, &p); err == nil {
+			if c.cfg.OnUpgrade != nil {
+				c.cfg.OnUpgrade(p)
+				return
+			}
+			go c.performSelfUpgrade(p)
+		}
 	}
+}
+
+func (c *AgentClient) performSelfUpgrade(p protocol.UpgradeAgentPayload) {
+	if !c.upgrading.CompareAndSwap(false, true) {
+		log.Printf("[AgentClient] Upgrade already in progress, ignoring duplicate instruction")
+		return
+	}
+	defer c.upgrading.Store(false)
+
+	arch := runtime.GOARCH
+	expectedHash := strings.ToLower(strings.TrimSpace(p.SHA256ByArch[arch]))
+	if len(expectedHash) != 64 {
+		log.Printf("[AgentClient] Ignored upgrade instruction: missing 64-char SHA-256 for arch %s", arch)
+		return
+	}
+	if _, err := hex.DecodeString(expectedHash); err != nil {
+		log.Printf("[AgentClient] Ignored upgrade instruction: non-hex SHA-256 for arch %s", arch)
+		return
+	}
+
+	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	u, err := url.Parse(baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		log.Printf("[AgentClient] Ignored upgrade instruction: invalid base_url %q", baseURL)
+		return
+	}
+	masterU, mErr := url.Parse(c.cfg.MasterURL)
+	if mErr != nil || !strings.EqualFold(u.Hostname(), masterU.Hostname()) {
+		log.Printf("[AgentClient] SECURITY ALERT — Rejected upgrade base_url host %q (does not match Master host %q)", u.Hostname(), masterU.Hostname())
+		return
+	}
+	if strings.EqualFold(masterU.Scheme, "wss") && u.Scheme != "https" {
+		log.Printf("[AgentClient] SECURITY ALERT — Rejected non-HTTPS upgrade base_url %q when Master uses wss://", baseURL)
+		return
+	}
+
+	relPrefix := "/deploy/releases"
+	if strings.HasSuffix(u.Path, "/deploy") {
+		relPrefix = "/releases"
+	}
+	binURL := fmt.Sprintf("%s%s/nexus-agent-linux-%s", baseURL, relPrefix, arch)
+	log.Printf("[AgentClient] Starting verified self-upgrade to %s from %s (sha256=%s)", p.TargetVersion, binURL, expectedHash)
+
+	httpClient := &http.Client{
+		Timeout: 60 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			TLSClientConfig: c.tlsConfig(),
+		},
+	}
+	resp, err := httpClient.Get(binURL)
+	if err != nil {
+		log.Printf("[AgentClient] Upgrade download failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[AgentClient] Upgrade download returned status %d", resp.StatusCode)
+		return
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Printf("[AgentClient] Cannot resolve executable path: %v", err)
+		return
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(exePath), ".nexus-agent-upgrade-*")
+	if err != nil {
+		log.Printf("[AgentClient] Cannot create temp binary file: %v", err)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmpFile, hasher), io.LimitReader(resp.Body, 128*1024*1024)); err != nil {
+		_ = tmpFile.Close()
+		log.Printf("[AgentClient] Failed writing upgrade binary: %v", err)
+		return
+	}
+	_ = tmpFile.Close()
+
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if actualHash != expectedHash {
+		log.Printf("[AgentClient] SECURITY ALERT — Upgrade binary SHA-256 mismatch: expected %s, got %s", expectedHash, actualHash)
+		return
+	}
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		log.Printf("[AgentClient] Chmod upgrade binary failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, exePath); err != nil {
+		log.Printf("[AgentClient] Atomic binary replacement failed: %v", err)
+		return
+	}
+	log.Printf("[AgentClient] Binary upgraded to %s successfully; exiting for service manager restart", p.TargetVersion)
+	os.Exit(0)
 }
 
 func (c *AgentClient) sendEnvelope(msgType protocol.MessageType, payload any) error {
