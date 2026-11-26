@@ -17,13 +17,21 @@ type RuleStatsTracker struct {
 	Limiter     *rate.Limiter
 }
 
+const maxLimiterBurstBytes = 64 * 1024 * 1024 // 64 MiB max token burst
+
 // NewRuleStatsTracker creates a tracker with an optional bandwidth limit in Mbps.
 func NewRuleStatsTracker(speedLimitMbps int) *RuleStatsTracker {
 	var lim *rate.Limiter
 	if speedLimitMbps > 0 {
+		if speedLimitMbps > 100000 {
+			speedLimitMbps = 100000
+		}
 		// Convert Mbps to Bytes per second: 1 Mbps = 125,000 Bytes/s
 		bytesPerSec := float64(speedLimitMbps) * 125000.0
-		burst := int(bytesPerSec)
+		burst := maxLimiterBurstBytes
+		if bytesPerSec < float64(maxLimiterBurstBytes) {
+			burst = int(bytesPerSec)
+		}
 		if burst < 64*1024 {
 			burst = 64 * 1024
 		}
@@ -36,19 +44,32 @@ func NewRuleStatsTracker(speedLimitMbps int) *RuleStatsTracker {
 
 // AddUpload atomically adds uploaded bytes.
 func (t *RuleStatsTracker) AddUpload(n int64) {
-	atomic.AddInt64(&t.UploadBytes, n)
+	if n > 0 {
+		atomic.AddInt64(&t.UploadBytes, n)
+	}
 }
 
 // AddDownload atomically adds downloaded bytes.
 func (t *RuleStatsTracker) AddDownload(n int64) {
-	atomic.AddInt64(&t.DownBytes, n)
+	if n > 0 {
+		atomic.AddInt64(&t.DownBytes, n)
+	}
 }
 
 // SwapDeltas atomically reads and resets the upload/download counters while preserving active conns.
 func (t *RuleStatsTracker) SwapDeltas() (up int64, down int64, active int64) {
 	up = atomic.SwapInt64(&t.UploadBytes, 0)
+	if up < 0 {
+		up = 0
+	}
 	down = atomic.SwapInt64(&t.DownBytes, 0)
+	if down < 0 {
+		down = 0
+	}
 	active = atomic.LoadInt64(&t.ActiveConns)
+	if active < 0 {
+		active = 0
+	}
 	return
 }
 

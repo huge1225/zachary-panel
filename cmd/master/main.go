@@ -56,17 +56,22 @@ func main() {
 	agentHub := hub.NewAgentHub(db)
 	orch := service.NewOrchestrator(db, agentHub)
 
-	// Start periodic 60s background quota cutoff & full state reconciliation scheduler
+	// Start periodic 60s background quota cutoff, expired order cleanup & full state reconciliation scheduler
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now()
+			orch.CloseExpiredOrders(now)
 			orch.ProcessPeriodicResets(now)
-			var expiredUsers []model.User
-			db.Where("used_bytes >= quota_bytes OR expire_at < ?", now).Find(&expiredUsers)
-			for _, u := range expiredUsers {
-				orch.EnforceUserQuotaCutoff(u.ID)
+			var activeUserIDs []uint64
+			db.Model(&model.ForwardRule{}).Where("enabled = ?", true).Distinct("user_id").Pluck("user_id", &activeUserIDs)
+			if len(activeUserIDs) > 0 {
+				var expiredUsers []model.User
+				db.Select("id").Where("id IN ? AND (status <> 'active' OR used_bytes >= quota_bytes OR (role <> 'admin' AND expire_at < ?))", activeUserIDs, now).Find(&expiredUsers)
+				for _, u := range expiredUsers {
+					orch.EnforceUserQuotaCutoff(u.ID)
+				}
 			}
 			orch.PruneOldTrafficStats(now)
 			orch.ReconcileAllOnlineNodes()
@@ -107,6 +112,7 @@ func main() {
 		Addr:              *listenAddr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

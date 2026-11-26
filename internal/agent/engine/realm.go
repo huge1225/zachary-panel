@@ -23,6 +23,7 @@ type RealmEngine struct {
 	rules      map[string]protocol.RuleSpec
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
+	procDone   chan struct{}
 }
 
 // NewRealmEngine creates the realm driver. workDir must be a private (0700) directory owned by the agent.
@@ -63,7 +64,7 @@ func (r *RealmEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) err
 	err := r.reloadLocked()
 	r.mu.Unlock()
 	if err == nil {
-		sharedPortCounter.TrackPort(key, spec.ListenPort)
+		sharedPortCounter.TrackPort(key, spec.ListenPort, spec.Protocol)
 	}
 	return err
 }
@@ -83,16 +84,22 @@ func (r *RealmEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol.Ru
 }
 
 func (r *RealmEngine) reloadLocked() error {
-	// Stop current realm process if running
+	// Stop current realm process if running (superviseRealm owns cmd.Wait() and closes procDone)
 	if r.cancel != nil {
 		r.cancel()
 		r.cancel = nil
 	}
 	if r.cmd != nil && r.cmd.Process != nil {
 		_ = r.cmd.Process.Kill()
-		_ = r.cmd.Wait()
-		r.cmd = nil
 	}
+	if r.procDone != nil {
+		select {
+		case <-r.procDone:
+		case <-time.After(3 * time.Second):
+		}
+		r.procDone = nil
+	}
+	r.cmd = nil
 
 	if len(r.rules) == 0 {
 		return nil
@@ -118,8 +125,9 @@ func (r *RealmEngine) reloadLocked() error {
 			"listen": listenAddr,
 			"remote": spec.Targets[0].Address,
 			"network": map[string]any{
-				"no_tcp":  spec.Protocol == "udp",
-				"use_udp": spec.Protocol == "udp" || spec.Protocol == "both",
+				"no_tcp":      spec.Protocol == "udp",
+				"use_udp":     spec.Protocol == "udp" || spec.Protocol == "both",
+				"udp_timeout": 30,
 			},
 		}
 		if len(extraRemotes) > 0 {
@@ -152,18 +160,21 @@ func (r *RealmEngine) reloadLocked() error {
 		return fmt.Errorf("failed to start realm: %w", err)
 	}
 
+	done := make(chan struct{})
 	r.cmd = cmd
 	r.cancel = cancel
-	go r.superviseRealm(ctx, cmd)
+	r.procDone = done
+	go r.superviseRealm(ctx, cmd, done)
 	log.Printf("[RealmEngine] Reloaded realm (PID %d) with %d active rules", cmd.Process.Pid, len(r.rules))
 	return nil
 }
 
 // superviseRealm monitors the active realm process and automatically restarts it if it crashes unexpectedly.
-func (r *RealmEngine) superviseRealm(ctx context.Context, watchedCmd *exec.Cmd) {
+func (r *RealmEngine) superviseRealm(ctx context.Context, watchedCmd *exec.Cmd, done chan struct{}) {
 	if watchedCmd != nil {
 		_ = watchedCmd.Wait()
 	}
+	close(done)
 	select {
 	case <-ctx.Done():
 		return

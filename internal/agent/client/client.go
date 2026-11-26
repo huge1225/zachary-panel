@@ -113,7 +113,7 @@ func (c *AgentClient) connectAndServe(ctx context.Context) error {
 	headers.Set("X-Auth-Signature", sig)
 
 	dialer := *websocket.DefaultDialer
-	if c.cfg.MasterPinSHA256 != "" {
+	if strings.HasPrefix(strings.ToLower(c.cfg.MasterURL), "wss://") || c.cfg.MasterPinSHA256 != "" {
 		dialer.TLSClientConfig = c.tlsConfig()
 	}
 
@@ -181,10 +181,14 @@ func (c *AgentClient) reportLoop(ctx context.Context) {
 		case <-ticker.C:
 			deltas, activeRules, activeConns := c.engMgr.CollectAllDeltas()
 
-			var windowUp, windowDown int64
+			var windowUp, windowDown uint64
 			for _, d := range deltas {
-				windowUp += d.UploadBytes
-				windowDown += d.DownBytes
+				if d.UploadBytes > 0 {
+					windowUp += uint64(d.UploadBytes)
+				}
+				if d.DownBytes > 0 {
+					windowDown += uint64(d.DownBytes)
+				}
 			}
 
 			metrics := monitor.CollectMetrics()
@@ -202,8 +206,8 @@ func (c *AgentClient) reportLoop(ctx context.Context) {
 				DiskUsedBytes:    metrics.DiskUsedBytes,
 				DiskTotalBytes:   metrics.DiskTotalBytes,
 				DiskUsagePercent: metrics.DiskUsagePercent,
-				NetRxBytesPerS:   uint64(windowDown) / intervalSec,
-				NetTxBytesPerS:   uint64(windowUp) / intervalSec,
+				NetRxBytesPerS:   windowDown / intervalSec,
+				NetTxBytesPerS:   windowUp / intervalSec,
 				ActiveRules:      activeRules,
 				ActiveConns:      activeConns,
 				SupportedEngines: c.engMgr.SupportedEngines(),

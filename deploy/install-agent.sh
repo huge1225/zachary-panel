@@ -39,7 +39,7 @@ if [[ "${ACTION}" == "uninstall" ]]; then
   nft delete table inet nexus_forward 2>/dev/null || true
   nft delete table inet nexus_acct 2>/dev/null || true
 
-  rm -rf /etc/nexus-agent /var/lib/nexus-agent
+  rm -rf /etc/nexus-agent /var/lib/nexus-agent /opt/nexus-agent
   rm -f /usr/local/bin/nexus-agent
   echo "==> [Nexus Agent] Uninstalled cleanly!"
   exit 0
@@ -74,13 +74,15 @@ curl -fsSL --proto '=https,http' --retry 3 -o "${TMP_BIN}" "${PANEL_URL}/deploy/
   || die "failed to download agent binary"
 ACTUAL_SHA="$(sha256sum "${TMP_BIN}" | awk '{print $1}')"
 [[ "${ACTUAL_SHA}" == "${EXPECTED_SHA}" ]] || die "SHA-256 mismatch (expected ${EXPECTED_SHA}, got ${ACTUAL_SHA}); aborting"
-install -m 0755 -o root -g root "${TMP_BIN}" /usr/local/bin/nexus-agent
 
 # Enable IPv4 forwarding for nftables / kernel relay
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
 # Create dedicated unprivileged system user and restricted environment file (0600) so secrets do not leak in `ps aux`
 id -u nexus-agent &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin nexus-agent
+install -d -m 0755 -o nexus-agent -g nexus-agent /opt/nexus-agent
+install -m 0755 -o nexus-agent -g nexus-agent "${TMP_BIN}" /opt/nexus-agent/nexus-agent
+install -m 0755 -o root -g root "${TMP_BIN}" /usr/local/bin/nexus-agent
 install -d -m 0700 -o root -g root /etc/nexus-agent
 
 umask 077
@@ -105,7 +107,7 @@ Type=simple
 User=nexus-agent
 Group=nexus-agent
 EnvironmentFile=/etc/nexus-agent/agent.env
-ExecStart=/usr/local/bin/nexus-agent -report-interval 3s
+ExecStart=/opt/nexus-agent/nexus-agent -report-interval 3s
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -113,6 +115,7 @@ LimitNOFILE=1048576
 # Private state directory (/var/lib/nexus-agent, 0700, owned by nexus-agent)
 StateDirectory=nexus-agent
 StateDirectoryMode=0700
+ReadWritePaths=/opt/nexus-agent
 
 # Systemd Security Hardening & Least Privilege Capabilities
 NoNewPrivileges=true

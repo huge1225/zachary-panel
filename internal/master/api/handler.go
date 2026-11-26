@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -36,12 +38,106 @@ import (
 	"nexus-panel/pkg/utils"
 )
 
+const (
+	// MaxRequestBodyBytes bounds all incoming HTTP request bodies (1 MiB) to prevent memory exhaustion DoS.
+	MaxRequestBodyBytes     int64 = 1 << 20
+	maskedSecretPlaceholder       = "********"
+)
+
+type maxBytesBodyReader struct {
+	rc       io.ReadCloser
+	exceeded *bool
+}
+
+func (m *maxBytesBodyReader) Read(p []byte) (int, error) {
+	n, err := m.rc.Read(p)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			*m.exceeded = true
+		}
+	}
+	return n, err
+}
+
+func (m *maxBytesBodyReader) Close() error {
+	return m.rc.Close()
+}
+
+type maxBytesResponseWriter struct {
+	gin.ResponseWriter
+	exceeded *bool
+	code     int
+}
+
+func (w *maxBytesResponseWriter) WriteHeader(code int) {
+	if *w.exceeded && code < http.StatusInternalServerError {
+		code = http.StatusRequestEntityTooLarge
+	}
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *maxBytesResponseWriter) WriteHeaderNow() {
+	if *w.exceeded && (w.code < http.StatusInternalServerError && w.ResponseWriter.Status() < http.StatusInternalServerError) {
+		w.ResponseWriter.WriteHeader(http.StatusRequestEntityTooLarge)
+	}
+	w.ResponseWriter.WriteHeaderNow()
+}
+
+func (w *maxBytesResponseWriter) Write(data []byte) (int, error) {
+	if *w.exceeded && (w.code < http.StatusInternalServerError && w.ResponseWriter.Status() < http.StatusInternalServerError) {
+		w.ResponseWriter.WriteHeader(http.StatusRequestEntityTooLarge)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+// payNotifyMu serializes webhook order settlement across orders in-process alongside idx_orders_gateway_trade_no.
+var payNotifyMu sync.Mutex
+
+// bindOptionalJSON binds an optional JSON body into dst: empty/EOF bodies succeed as no-ops, bodies exceeding
+// MaxRequestBodyBytes abort with 413, and malformed JSON bodies abort with 400 instead of silently executing defaults.
+func bindOptionalJSON(c *gin.Context, dst any) bool {
+	if c.Request == nil || c.Request.Body == nil || c.Request.Body == http.NoBody {
+		return true
+	}
+	err := c.ShouldBindJSON(dst)
+	if err == nil || errors.Is(err, io.EOF) {
+		return true
+	}
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "请求体超过大小限制 (最大 1MB)"})
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": "请求参数 JSON 格式错误"})
+	return false
+}
+
+// buildSafeLike caps search keywords to 128 UTF-8 bytes and escapes '!', '%', and '_' for portable SQL LIKE ... ESCAPE '!'.
+func buildSafeLike(raw string) string {
+	trimmed := truncateUTF8(strings.TrimSpace(raw), 128)
+	var b strings.Builder
+	b.Grow(len(trimmed) + 6)
+	b.WriteByte('%')
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch == '!' || ch == '%' || ch == '_' {
+			b.WriteByte('!')
+		}
+		b.WriteByte(ch)
+	}
+	b.WriteByte('%')
+	return b.String()
+}
+
 type Server struct {
-	db        *gorm.DB
-	hub       *hub.AgentHub
-	orch      *service.Orchestrator
-	staticDir string // directory containing install-agent.sh and releases/ (agent binaries)
-	publicURL string // externally reachable panel base URL, e.g. https://panel.example.com
+	db                *gorm.DB
+	hub               *hub.AgentHub
+	orch              *service.Orchestrator
+	staticDir         string // directory containing install-agent.sh and releases/ (agent binaries)
+	publicURL         string // externally reachable panel base URL, e.g. https://panel.example.com
+	hasTrustedProxies bool
 
 	hashMu    sync.Mutex
 	hashCache map[string]cachedHash
@@ -82,6 +178,9 @@ func (s *Server) SetupRouter() *gin.Engine {
 	if err := r.SetTrustedProxies(trusted); err != nil {
 		log.Printf("[API] Invalid NEXUS_TRUSTED_PROXIES (%v); trusting no proxies", err)
 		_ = r.SetTrustedProxies(nil)
+		s.hasTrustedProxies = false
+	} else {
+		s.hasTrustedProxies = len(trusted) > 0
 	}
 
 	// The SPA is served same-origin; cross-origin access is only enabled for explicitly listed origins.
@@ -95,8 +194,8 @@ func (s *Server) SetupRouter() *gin.Engine {
 		r.Use(cors.New(cors.Config{
 			AllowOrigins:     list,
 			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-			ExposeHeaders:    []string{"Content-Length", "Subscription-Userinfo", "Profile-Update-Interval", "X-Renewed-Token"},
+			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-API-Key"},
+			ExposeHeaders:    []string{"Content-Length", "Subscription-Userinfo", "Profile-Update-Interval", "X-Renewed-Token", "X-Total-Count", "X-Page", "X-Page-Size"},
 			AllowCredentials: false,
 			MaxAge:           12 * time.Hour,
 		}))
@@ -108,8 +207,22 @@ func (s *Server) SetupRouter() *gin.Engine {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
-		if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
+		if c.Request.TLS != nil || (s.hasTrustedProxies && strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")) {
 			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
+
+		// Enforce global request body limit across all routes (covers both Content-Length and chunked transfers).
+		if c.Request.ContentLength > MaxRequestBodyBytes {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "请求体超过大小限制 (最大 1MB)"})
+			return
+		}
+		if c.Request.Body != nil && c.Request.Body != http.NoBody {
+			exceeded := false
+			c.Writer = &maxBytesResponseWriter{ResponseWriter: c.Writer, exceeded: &exceeded}
+			c.Request.Body = &maxBytesBodyReader{
+				rc:       http.MaxBytesReader(c.Writer, c.Request.Body, MaxRequestBodyBytes),
+				exceeded: &exceeded,
+			}
 		}
 		c.Next()
 	})
@@ -126,6 +239,10 @@ func (s *Server) SetupRouter() *gin.Engine {
 		v1.GET("/sub/:token", subRateLimit(), s.handleGetSubscription)
 		v1.GET("/pay/epay/notify", s.handleEpayNotify)
 		v1.POST("/pay/epay/notify", s.handleEpayNotify)
+		v1.GET("/payment/epay/notify", s.handleEpayNotify)
+		v1.POST("/payment/epay/notify", s.handleEpayNotify)
+		v1.POST("/pay/usdt/notify", s.handleUSDTNotify)
+		v1.POST("/payment/usdt/notify", s.handleUSDTNotify)
 
 		// Authenticated user endpoints
 		auth := v1.Group("")
@@ -155,13 +272,26 @@ func (s *Server) SetupRouter() *gin.Engine {
 			auth.DELETE("/rules/:id", ruleMutationLimit(), s.handleDeleteRule)
 			auth.POST("/rules/batch-delete", ruleMutationLimit(), s.handleBatchDeleteRules)
 
-			// Roles, Plans, Orders & Redeem Codes
+			// Roles, Plans, Coupons, Orders & Redeem Codes
 			auth.GET("/roles", s.handleListRoleGroups)
 			auth.GET("/plans", s.handleListPlans)
 			auth.POST("/plans/:id/purchase", userRateLimit(), s.handlePurchasePlan)
+			auth.POST("/coupons/preview", userRateLimit(), s.handlePreviewCoupon)
 			auth.POST("/redeem", userRateLimit(), s.handleRedeemCode)
 			auth.GET("/orders", s.handleListOrders)
 			auth.POST("/orders/recharge", userRateLimit(), s.handleCreateRechargeOrder)
+
+			// Affiliate / Referral System
+			auth.GET("/affiliate/overview", s.handleAffiliateOverview)
+			auth.POST("/affiliate/transfer", userRateLimit(), s.handleAffiliateTransfer)
+			auth.POST("/affiliate/withdraw", userRateLimit(), s.handleAffiliateWithdraw)
+
+			// Customer Support Tickets
+			auth.GET("/tickets", s.handleListTickets)
+			auth.POST("/tickets", userRateLimit(), s.handleCreateTicket)
+			auth.GET("/tickets/:id", s.handleGetTicketDetail)
+			auth.POST("/tickets/:id/reply", userRateLimit(), s.handleReplyTicket)
+			auth.POST("/tickets/:id/close", userRateLimit(), s.handleCloseTicket)
 
 			// Admin-only management endpoints
 			admin := auth.Group("/admin")
@@ -193,6 +323,17 @@ func (s *Server) SetupRouter() *gin.Engine {
 				admin.POST("/plans", s.handleAdminCreatePlan)
 				admin.PUT("/plans/:id", s.handleAdminUpdatePlan)
 				admin.DELETE("/plans/:id", s.handleAdminDeletePlan)
+
+				admin.GET("/coupons", s.handleAdminListCoupons)
+				admin.POST("/coupons", s.handleAdminCreateCoupon)
+				admin.PUT("/coupons/:id", s.handleAdminUpdateCoupon)
+				admin.DELETE("/coupons/:id", s.handleAdminDeleteCoupon)
+
+				admin.GET("/affiliate/withdrawals", s.handleAdminListWithdrawals)
+				admin.POST("/affiliate/withdrawals/:id/review", s.handleAdminReviewWithdrawal)
+
+				admin.GET("/tickets", s.handleAdminListTickets)
+				admin.POST("/tickets/:id/status", s.handleAdminUpdateTicketStatus)
 
 				admin.GET("/users", s.handleAdminListUsers)
 				admin.POST("/users", s.handleAdminCreateUser)
@@ -317,7 +458,7 @@ func (s *Server) handleDashboard(c *gin.Context) {
 	s.db.Model(&model.ForwardRule{}).Where("user_id = ? AND enabled = ?", uid, true).Count(&runningRules)
 
 	var nodes []model.Node
-	s.db.Find(&nodes)
+	s.db.Select("id, status").Find(&nodes)
 	onlineNodes := 0
 	for i := range nodes {
 		s.hub.EnrichNodeMetrics(&nodes[i])
@@ -330,7 +471,11 @@ func (s *Server) handleDashboard(c *gin.Context) {
 	startBucket := now.Truncate(time.Hour).Add(-23 * time.Hour).Format("2006-01-02 15:00")
 
 	var userRows []model.TrafficHourlyStat
-	s.db.Where("user_id = ? AND hour_bucket >= ?", uid, startBucket).Find(&userRows)
+	s.db.Model(&model.TrafficHourlyStat{}).
+		Select("hour_bucket, COALESCE(SUM(upload_bytes), 0) AS upload_bytes, COALESCE(SUM(down_bytes), 0) AS down_bytes, COALESCE(SUM(billed_bytes), 0) AS billed_bytes").
+		Where("user_id = ? AND hour_bucket >= ?", uid, startBucket).
+		Group("hour_bucket").
+		Scan(&userRows)
 	hourlySeries := build24HourSeries(now, userRows)
 
 	resp := gin.H{
@@ -350,7 +495,11 @@ func (s *Server) handleDashboard(c *gin.Context) {
 
 	if s.isAdmin(c) {
 		var globalRows []model.TrafficHourlyStat
-		s.db.Where("hour_bucket >= ?", startBucket).Find(&globalRows)
+		s.db.Model(&model.TrafficHourlyStat{}).
+			Select("hour_bucket, COALESCE(SUM(upload_bytes), 0) AS upload_bytes, COALESCE(SUM(down_bytes), 0) AS down_bytes, COALESCE(SUM(billed_bytes), 0) AS billed_bytes").
+			Where("hour_bucket >= ?", startBucket).
+			Group("hour_bucket").
+			Scan(&globalRows)
 		resp["global_hourly_stats"] = build24HourSeries(now, globalRows)
 
 		type topUserItem struct {
@@ -391,19 +540,53 @@ func (s *Server) getSystemConfig() model.SystemConfig {
 	var cfg model.SystemConfig
 	if err := s.db.First(&cfg, 1).Error; err != nil {
 		cfg = model.SystemConfig{
-			ID:               1,
-			SiteName:         "Zachary Panel",
-			SiteLogo:         "ZP",
-			Announcement:     "",
-			AllowRegister:    false,
-			DefaultQuotaGB:   10,
-			DefaultMaxRules:  5,
-			DefaultSpeedMbps: 50,
-			DefaultTunnels:   "1",
+			ID:                        1,
+			SiteName:                  "Zachary Panel",
+			SiteLogo:                  "ZP",
+			Announcement:              "",
+			AllowRegister:             false,
+			DefaultQuotaGB:            10,
+			DefaultMaxRules:           5,
+			DefaultSpeedMbps:          50,
+			DefaultTunnels:            "1",
+			NotifyOnNodeEvents:        true,
+			NotifyOnQuotaEvents:       true,
+			NotifyOnTicketEvents:      true,
+			AffiliateEnabled:          true,
+			AffiliateCommissionRate:   10,
+			AffiliateMinWithdrawCents: 1000,
 		}
 		s.db.Create(&cfg)
 	}
 	return cfg
+}
+
+func maskSystemConfig(cfg model.SystemConfig) model.SystemConfig {
+	if strings.TrimSpace(cfg.EpayKey) != "" {
+		cfg.EpayKey = maskedSecretPlaceholder
+	}
+	if strings.TrimSpace(cfg.USDTWebhookSecret) != "" {
+		cfg.USDTWebhookSecret = maskedSecretPlaceholder
+	}
+	if strings.TrimSpace(cfg.NotifyTelegramBotToken) != "" {
+		cfg.NotifyTelegramBotToken = maskedSecretPlaceholder
+	}
+	return cfg
+}
+
+func validateExternalGatewayURL(raw string) (string, error) {
+	uStr := strings.TrimSpace(raw)
+	if uStr == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(uStr)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return "", fmt.Errorf("易支付接口地址需为有效的 http:// 或 https:// 地址")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("易支付接口地址不能包含账号凭据、查询参数或锚点")
+	}
+	return strings.TrimRight(uStr, "/"), nil
 }
 
 func (s *Server) handleGetSiteConfig(c *gin.Context) {
@@ -412,60 +595,70 @@ func (s *Server) handleGetSiteConfig(c *gin.Context) {
 		strings.TrimSpace(cfg.EpayURL) != "" &&
 		strings.TrimSpace(cfg.EpayPID) != "" &&
 		strings.TrimSpace(cfg.EpayKey) != ""
+	usdtEnabled := cfg.PaymentEnabled && strings.TrimSpace(cfg.USDTAddress) != ""
 	c.JSON(http.StatusOK, gin.H{
-		"site_name":       cfg.SiteName,
-		"site_logo":       cfg.SiteLogo,
-		"announcement":    cfg.Announcement,
-		"allow_register":  cfg.AllowRegister,
-		"payment_enabled": cfg.PaymentEnabled,
-		"epay_enabled":    epayEnabled,
-		"usdt_address":    cfg.USDTAddress,
-		"recharge_notice": cfg.RechargeNotice,
+		"site_name":                   cfg.SiteName,
+		"site_logo":                   cfg.SiteLogo,
+		"announcement":                cfg.Announcement,
+		"allow_register":              cfg.AllowRegister,
+		"payment_enabled":             cfg.PaymentEnabled,
+		"epay_enabled":                epayEnabled,
+		"usdt_enabled":                usdtEnabled,
+		"usdt_address":                cfg.USDTAddress,
+		"recharge_notice":             cfg.RechargeNotice,
+		"affiliate_enabled":           cfg.AffiliateEnabled,
+		"affiliate_commission_rate":   sanitizeAffiliateRate(cfg.AffiliateCommissionRate),
+		"affiliate_min_withdraw_cents": cfg.AffiliateMinWithdrawCents,
 	})
 }
 
 func (s *Server) handleAdminGetSettings(c *gin.Context) {
 	cfg := s.getSystemConfig()
-	c.JSON(http.StatusOK, cfg)
+	c.JSON(http.StatusOK, maskSystemConfig(cfg))
 }
 
 func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 	cfg := s.getSystemConfig()
 	var req struct {
-		SiteName           *string `json:"site_name"`
-		SiteLogo           *string `json:"site_logo"`
-		Announcement       *string `json:"announcement"`
-		AllowRegister      *bool   `json:"allow_register"`
-		DefaultRoleGroupID *uint64 `json:"default_role_group_id"`
-		DefaultPlanID      *uint64 `json:"default_plan_id"`
-		DefaultQuotaGB     *int64  `json:"default_quota_gb"`
-		DefaultMaxRules    *int    `json:"default_max_rules"`
-		DefaultSpeedMbps   *int    `json:"default_speed_mbps"`
-		DefaultTunnels     *string `json:"default_tunnels"`
-		PaymentEnabled         *bool   `json:"payment_enabled"`
-		EpayURL                *string `json:"epay_url"`
-		EpayPID                *string `json:"epay_pid"`
-		EpayKey                *string `json:"epay_key"`
-		USDTAddress            *string `json:"usdt_address"`
-		RechargeNotice         *string `json:"recharge_notice"`
-		NotifyTelegramBotToken *string `json:"notify_telegram_bot_token"`
-		NotifyTelegramChatID   *string `json:"notify_telegram_chat_id"`
-		NotifyWebhookURL       *string `json:"notify_webhook_url"`
-		NotifyOnNodeEvents     *bool   `json:"notify_on_node_events"`
-		NotifyOnQuotaEvents    *bool   `json:"notify_on_quota_events"`
+		SiteName                  *string  `json:"site_name"`
+		SiteLogo                  *string  `json:"site_logo"`
+		Announcement              *string  `json:"announcement"`
+		AllowRegister             *bool    `json:"allow_register"`
+		DefaultRoleGroupID        *uint64  `json:"default_role_group_id"`
+		DefaultPlanID             *uint64  `json:"default_plan_id"`
+		DefaultQuotaGB            *int64   `json:"default_quota_gb"`
+		DefaultMaxRules           *int     `json:"default_max_rules"`
+		DefaultSpeedMbps          *int     `json:"default_speed_mbps"`
+		DefaultTunnels            *string  `json:"default_tunnels"`
+		PaymentEnabled            *bool    `json:"payment_enabled"`
+		EpayURL                   *string  `json:"epay_url"`
+		EpayPID                   *string  `json:"epay_pid"`
+		EpayKey                   *string  `json:"epay_key"`
+		USDTAddress               *string  `json:"usdt_address"`
+		USDTWebhookSecret         *string  `json:"usdt_webhook_secret"`
+		RechargeNotice            *string  `json:"recharge_notice"`
+		NotifyTelegramBotToken    *string  `json:"notify_telegram_bot_token"`
+		NotifyTelegramChatID      *string  `json:"notify_telegram_chat_id"`
+		NotifyWebhookURL          *string  `json:"notify_webhook_url"`
+		NotifyOnNodeEvents        *bool    `json:"notify_on_node_events"`
+		NotifyOnQuotaEvents       *bool    `json:"notify_on_quota_events"`
+		NotifyOnTicketEvents      *bool    `json:"notify_on_ticket_events"`
+		AffiliateEnabled          *bool    `json:"affiliate_enabled"`
+		AffiliateCommissionRate   *float64 `json:"affiliate_commission_rate"`
+		AffiliateMinWithdrawCents *int64   `json:"affiliate_min_withdraw_cents"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if req.SiteName != nil && strings.TrimSpace(*req.SiteName) != "" {
-		cfg.SiteName = strings.TrimSpace(*req.SiteName)
+		cfg.SiteName = truncateUTF8(strings.TrimSpace(*req.SiteName), 64)
 	}
 	if req.SiteLogo != nil && strings.TrimSpace(*req.SiteLogo) != "" {
-		cfg.SiteLogo = strings.TrimSpace(*req.SiteLogo)
+		cfg.SiteLogo = truncateUTF8(strings.TrimSpace(*req.SiteLogo), 16)
 	}
 	if req.Announcement != nil {
-		cfg.Announcement = strings.TrimSpace(*req.Announcement)
+		cfg.Announcement = truncateUTF8(strings.TrimSpace(*req.Announcement), 2048)
 	}
 	if req.AllowRegister != nil {
 		cfg.AllowRegister = *req.AllowRegister
@@ -480,13 +673,13 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 	if req.DefaultPlanID != nil {
 		cfg.DefaultPlanID = *req.DefaultPlanID
 	}
-	if req.DefaultQuotaGB != nil && *req.DefaultQuotaGB > 0 {
+	if req.DefaultQuotaGB != nil && *req.DefaultQuotaGB > 0 && *req.DefaultQuotaGB <= 1048576 {
 		cfg.DefaultQuotaGB = *req.DefaultQuotaGB
 	}
-	if req.DefaultMaxRules != nil && *req.DefaultMaxRules > 0 {
+	if req.DefaultMaxRules != nil && *req.DefaultMaxRules > 0 && *req.DefaultMaxRules <= 10000 {
 		cfg.DefaultMaxRules = *req.DefaultMaxRules
 	}
-	if req.DefaultSpeedMbps != nil && *req.DefaultSpeedMbps > 0 {
+	if req.DefaultSpeedMbps != nil && *req.DefaultSpeedMbps > 0 && *req.DefaultSpeedMbps <= 100000 {
 		cfg.DefaultSpeedMbps = *req.DefaultSpeedMbps
 	}
 	if req.DefaultTunnels != nil && req.DefaultRoleGroupID == nil {
@@ -496,30 +689,39 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 		cfg.PaymentEnabled = *req.PaymentEnabled
 	}
 	if req.EpayURL != nil {
-		u := strings.TrimSpace(*req.EpayURL)
-		if u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "易支付接口地址需以 http:// 或 https:// 开头"})
+		cleanURL, err := validateExternalGatewayURL(*req.EpayURL)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		cfg.EpayURL = strings.TrimRight(u, "/")
+		cfg.EpayURL = cleanURL
 	}
 	if req.EpayPID != nil {
-		cfg.EpayPID = strings.TrimSpace(*req.EpayPID)
+		cfg.EpayPID = truncateUTF8(strings.TrimSpace(*req.EpayPID), 64)
 	}
 	if req.EpayKey != nil {
-		cfg.EpayKey = strings.TrimSpace(*req.EpayKey)
+		if v := strings.TrimSpace(*req.EpayKey); v != maskedSecretPlaceholder {
+			cfg.EpayKey = truncateUTF8(v, 128)
+		}
 	}
 	if req.USDTAddress != nil {
-		cfg.USDTAddress = strings.TrimSpace(*req.USDTAddress)
+		cfg.USDTAddress = truncateUTF8(strings.TrimSpace(*req.USDTAddress), 128)
+	}
+	if req.USDTWebhookSecret != nil {
+		if v := strings.TrimSpace(*req.USDTWebhookSecret); v != maskedSecretPlaceholder {
+			cfg.USDTWebhookSecret = truncateUTF8(v, 128)
+		}
 	}
 	if req.RechargeNotice != nil {
-		cfg.RechargeNotice = strings.TrimSpace(*req.RechargeNotice)
+		cfg.RechargeNotice = truncateUTF8(strings.TrimSpace(*req.RechargeNotice), 512)
 	}
 	if req.NotifyTelegramBotToken != nil {
-		cfg.NotifyTelegramBotToken = strings.TrimSpace(*req.NotifyTelegramBotToken)
+		if v := strings.TrimSpace(*req.NotifyTelegramBotToken); v != maskedSecretPlaceholder {
+			cfg.NotifyTelegramBotToken = truncateUTF8(v, 128)
+		}
 	}
 	if req.NotifyTelegramChatID != nil {
-		cfg.NotifyTelegramChatID = strings.TrimSpace(*req.NotifyTelegramChatID)
+		cfg.NotifyTelegramChatID = truncateUTF8(strings.TrimSpace(*req.NotifyTelegramChatID), 64)
 	}
 	if req.NotifyWebhookURL != nil {
 		wurl := strings.TrimSpace(*req.NotifyWebhookURL)
@@ -537,9 +739,29 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 	if req.NotifyOnQuotaEvents != nil {
 		cfg.NotifyOnQuotaEvents = *req.NotifyOnQuotaEvents
 	}
+	if req.NotifyOnTicketEvents != nil {
+		cfg.NotifyOnTicketEvents = *req.NotifyOnTicketEvents
+	}
+	if req.AffiliateEnabled != nil {
+		cfg.AffiliateEnabled = *req.AffiliateEnabled
+	}
+	if req.AffiliateCommissionRate != nil {
+		if math.IsNaN(*req.AffiliateCommissionRate) || math.IsInf(*req.AffiliateCommissionRate, 0) || *req.AffiliateCommissionRate < 0 || *req.AffiliateCommissionRate > 50 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "返利佣金比例需在 0% - 50% 之间"})
+			return
+		}
+		cfg.AffiliateCommissionRate = sanitizeAffiliateRate(*req.AffiliateCommissionRate)
+	}
+	if req.AffiliateMinWithdrawCents != nil {
+		if *req.AffiliateMinWithdrawCents < 100 || *req.AffiliateMinWithdrawCents > maxWithdrawAmountCent {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "最低提现门槛需在 ¥1.00 - ¥1,000,000.00 之间"})
+			return
+		}
+		cfg.AffiliateMinWithdrawCents = *req.AffiliateMinWithdrawCents
+	}
 	s.db.Save(&cfg)
-	s.recordAudit(c, "admin.update_settings", cfg.SiteName, "更新系统设置、支付网关或告警配置")
-	c.JSON(http.StatusOK, cfg)
+	s.recordAudit(c, "admin.update_settings", cfg.SiteName, "更新系统设置、推广返利、支付网关或告警配置")
+	c.JSON(http.StatusOK, maskSystemConfig(cfg))
 }
 
 func (s *Server) handleAdminTestNotify(c *gin.Context) {
@@ -564,6 +786,7 @@ func (s *Server) handleListNodes(c *gin.Context) {
 		s.db.Order("id asc").Find(&nodes)
 		for i := range nodes {
 			s.hub.EnrichNodeMetrics(&nodes[i])
+			nodes[i].SecretToken = ""
 		}
 		c.JSON(http.StatusOK, nodes)
 		return
@@ -604,19 +827,20 @@ func (s *Server) handleListNodes(c *gin.Context) {
 func (s *Server) handleTelemetry(c *gin.Context) {
 	uid := s.currentUserID(c)
 	var user struct {
-		ID             uint64    `json:"id"`
-		RoleGroupID    uint64    `json:"role_group_id"`
-		PlanID         uint64    `json:"plan_id"`
-		BalanceCents   int64     `json:"balance_cents"`
-		QuotaBytes     int64     `json:"quota_bytes"`
-		UsedBytes      int64     `json:"used_bytes"`
-		MaxRules       int       `json:"max_rules"`
-		SpeedMbps      int       `json:"speed_mbps"`
-		ExpireAt       time.Time `json:"expire_at"`
-		Status         string    `json:"status"`
-		AllowedTunnels string    `json:"allowed_tunnels"`
+		ID                     uint64    `json:"id"`
+		RoleGroupID            uint64    `json:"role_group_id"`
+		PlanID                 uint64    `json:"plan_id"`
+		BalanceCents           int64     `json:"balance_cents"`
+		CommissionBalanceCents int64     `json:"commission_balance_cents"`
+		QuotaBytes             int64     `json:"quota_bytes"`
+		UsedBytes              int64     `json:"used_bytes"`
+		MaxRules               int       `json:"max_rules"`
+		SpeedMbps              int       `json:"speed_mbps"`
+		ExpireAt               time.Time `json:"expire_at"`
+		Status                 string    `json:"status"`
+		AllowedTunnels         string    `json:"allowed_tunnels"`
 	}
-	s.db.Model(&model.User{}).Select("id, role_group_id, plan_id, balance_cents, quota_bytes, used_bytes, max_rules, speed_mbps, expire_at, status, allowed_tunnels").Where("id = ?", uid).Scan(&user)
+	s.db.Model(&model.User{}).Select("id, role_group_id, plan_id, balance_cents, commission_balance_cents, quota_bytes, used_bytes, max_rules, speed_mbps, expire_at, status, allowed_tunnels").Where("id = ?", uid).Scan(&user)
 
 	nodes := make([]model.Node, 0)
 	if s.isAdmin(c) {
@@ -671,10 +895,52 @@ func (s *Server) handleListLines(c *gin.Context) {
 	c.JSON(http.StatusOK, authorized)
 }
 
+// parseListPagination extracts bounded page & page_size query parameters.
+// When paged=1 is passed, respondListPayload wraps the result in {items, total, page, page_size};
+// otherwise it returns the bare array while always setting X-Total-Count / X-Page / X-Page-Size headers.
+func parseListPagination(c *gin.Context, defaultSize, maxSize int) (page, pageSize int, pagedEnvelope bool) {
+	page = 1
+	if pStr := strings.TrimSpace(c.Query("page")); pStr != "" {
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+			page = p
+		}
+	}
+	pageSize = defaultSize
+	if psStr := strings.TrimSpace(c.Query("page_size")); psStr != "" {
+		if ps, err := strconv.Atoi(psStr); err == nil && ps > 0 {
+			pageSize = ps
+		}
+	}
+	if pageSize > maxSize {
+		pageSize = maxSize
+	}
+	if page > 100000 {
+		page = 100000
+	}
+	pagedEnvelope = c.Query("paged") == "1"
+	return page, pageSize, pagedEnvelope
+}
+
+func respondListPayload(c *gin.Context, items any, total int64, page, pageSize int, pagedEnvelope bool) {
+	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
+	c.Header("X-Page", strconv.Itoa(page))
+	c.Header("X-Page-Size", strconv.Itoa(pageSize))
+	if pagedEnvelope {
+		c.JSON(http.StatusOK, gin.H{
+			"items":     items,
+			"total":     total,
+			"page":      page,
+			"page_size": pageSize,
+		})
+		return
+	}
+	c.JSON(http.StatusOK, items)
+}
+
 func (s *Server) handleListRules(c *gin.Context) {
 	uid := s.currentUserID(c)
 	var rules []model.ForwardRule
-	query := s.db.Order("id desc")
+	query := s.db.Model(&model.ForwardRule{})
 	if !s.isAdmin(c) || c.Query("all") != "1" {
 		query = query.Where("user_id = ?", uid)
 	} else if uidParam := strings.TrimSpace(c.Query("user_id")); uidParam != "" {
@@ -694,31 +960,48 @@ func (s *Server) handleListRules(c *gin.Context) {
 		query = query.Where("protocol = ?", proto)
 	}
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
-		like := "%" + q + "%"
+		like := buildSafeLike(q)
 		if portNum, err := strconv.Atoi(q); err == nil && portNum > 0 {
-			query = query.Where("(name LIKE ? OR targets_json LIKE ? OR listen_port = ?)", like, like, portNum)
+			query = query.Where(`(name LIKE ? ESCAPE '!' OR targets_json LIKE ? ESCAPE '!' OR listen_port = ?)`, like, like, portNum)
 		} else {
-			query = query.Where("(name LIKE ? OR targets_json LIKE ?)", like, like)
+			query = query.Where(`(name LIKE ? ESCAPE '!' OR targets_json LIKE ? ESCAPE '!')`, like, like)
 		}
 	}
-	query.Find(&rules)
+	var total int64
+	query.Count(&total)
+
+	page, pageSize, pagedEnvelope := parseListPagination(c, 500, 1000)
+	query.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&rules)
 	s.fillEffectiveEngines(rules)
-	c.JSON(http.StatusOK, rules)
+	respondListPayload(c, rules, total, page, pageSize, pagedEnvelope)
 }
 
 // fillEffectiveEngines sets the read-only EffectiveEngine field so the UI shows the engine actually running.
+// Batch-fetches rule owners in a single WHERE id IN (?) query to eliminate N+1 round-trips.
 func (s *Server) fillEffectiveEngines(rules []model.ForwardRule) {
-	users := map[uint64]*model.User{}
+	if len(rules) == 0 {
+		return
+	}
+	uidSet := make(map[uint64]struct{}, len(rules))
 	for i := range rules {
-		u, ok := users[rules[i].UserID]
-		if !ok {
-			var fetched model.User
-			if s.db.Select("id", "role", "speed_mbps").First(&fetched, rules[i].UserID).Error == nil {
-				u = &fetched
-			}
-			users[rules[i].UserID] = u
+		if rules[i].UserID > 0 {
+			uidSet[rules[i].UserID] = struct{}{}
 		}
-		rules[i].EffectiveEngine = service.EffectiveEngine(&rules[i], u)
+	}
+	users := make(map[uint64]*model.User, len(uidSet))
+	if len(uidSet) > 0 {
+		uids := make([]uint64, 0, len(uidSet))
+		for id := range uidSet {
+			uids = append(uids, id)
+		}
+		var fetched []model.User
+		s.db.Select("id, role, speed_mbps").Where("id IN ?", uids).Find(&fetched)
+		for i := range fetched {
+			users[fetched[i].ID] = &fetched[i]
+		}
+	}
+	for i := range rules {
+		rules[i].EffectiveEngine = service.EffectiveEngine(&rules[i], users[rules[i].UserID])
 	}
 }
 
@@ -1012,13 +1295,7 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": aclErr.Error()})
 		return
 	}
-	speedLimit := req.SpeedMbps
-	if !s.isAdmin(c) && (speedLimit <= 0 || speedLimit > user.SpeedMbps) {
-		speedLimit = user.SpeedMbps
-	}
-	if speedLimit < 0 {
-		speedLimit = 0
-	}
+	speedLimit := clampRuleSpeedMbps(req.SpeedMbps, user.SpeedMbps, s.isAdmin(c))
 	rule := model.ForwardRule{
 		UserID:        uid,
 		Name:          req.Name,
@@ -1075,6 +1352,28 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 	s.orch.DispatchRule(&rule)
 	rule.EffectiveEngine = service.EffectiveEngine(&rule, &user)
 	c.JSON(http.StatusCreated, rule)
+}
+
+func clampRuleSpeedMbps(requested, ownerMax int, isAdmin bool) int {
+	if isAdmin {
+		if requested < 0 {
+			return 0
+		}
+		if requested > 100000 {
+			return 100000
+		}
+		return requested
+	}
+	if requested <= 0 || requested > ownerMax {
+		requested = ownerMax
+	}
+	if requested < 0 {
+		return 0
+	}
+	if requested > 100000 {
+		return 100000
+	}
+	return requested
 }
 
 func validEngine(e protocol.EngineType) bool {
@@ -1199,13 +1498,7 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 			if lb == "" {
 				lb = "round_robin"
 			}
-			speedLimit := item.SpeedMbps
-			if !s.isAdmin(c) && (speedLimit <= 0 || speedLimit > user.SpeedMbps) {
-				speedLimit = user.SpeedMbps
-			}
-			if speedLimit < 0 {
-				speedLimit = 0
-			}
+			speedLimit := clampRuleSpeedMbps(item.SpeedMbps, user.SpeedMbps, s.isAdmin(c))
 			targetsBytes, _ := json.Marshal(item.Targets)
 			rule := model.ForwardRule{
 				UserID:        uid,
@@ -1329,14 +1622,10 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 	rule.TargetsJSON = string(targetsBytes)
 	if s.isAdmin(c) {
 		if req.SpeedMbps >= 0 {
-			rule.SpeedMbps = req.SpeedMbps
+			rule.SpeedMbps = clampRuleSpeedMbps(req.SpeedMbps, owner.SpeedMbps, true)
 		}
 	} else {
-		if req.SpeedMbps <= 0 || req.SpeedMbps > owner.SpeedMbps {
-			rule.SpeedMbps = owner.SpeedMbps
-		} else {
-			rule.SpeedMbps = req.SpeedMbps
-		}
+		rule.SpeedMbps = clampRuleSpeedMbps(req.SpeedMbps, owner.SpeedMbps, false)
 	}
 
 	status, err := 0, error(nil)
@@ -1444,14 +1733,21 @@ func (s *Server) handleToggleRule(c *gin.Context) {
 	}
 
 	if !rule.Enabled {
+		if rule.TunnelLineID > 0 {
+			var line model.TunnelLine
+			if err := s.db.First(&line, rule.TunnelLineID).Error; err != nil || !line.Enabled {
+				c.JSON(http.StatusForbidden, gin.H{"error": "所属隧道不存在或已停用，无法启用转发"})
+				return
+			}
+		}
 		var user model.User
 		if err := s.db.First(&user, rule.UserID).Error; err == nil {
 			if !s.isAdmin(c) && !user.HasTunnelPermission(rule.TunnelLineID) {
 				c.JSON(http.StatusForbidden, gin.H{"error": "该隧道权限未授权或已收回，无法启用转发"})
 				return
 			}
-			if user.UsedBytes >= user.QuotaBytes || (!user.ExpireAt.IsZero() && time.Now().After(user.ExpireAt)) {
-				c.JSON(http.StatusForbidden, gin.H{"error": "账户流量已用尽或套餐已到期，无法启用规则"})
+			if !user.CanForward(time.Now()) {
+				c.JSON(http.StatusForbidden, gin.H{"error": "账户状态异常、流量已用尽或套餐已到期，无法启用规则"})
 				return
 			}
 		}
@@ -1634,6 +1930,12 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 		return
 	}
 
+	couponCode, statusCode, bodyErr := readOptionalCouponCode(c)
+	if bodyErr != nil {
+		c.JSON(statusCode, gin.H{"error": bodyErr.Error()})
+		return
+	}
+
 	allowedTunnels := strings.TrimSpace(plan.AllowedTunnels)
 	if plan.RoleGroupID > 0 {
 		var rg model.RoleGroup
@@ -1648,11 +1950,38 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 	if durationDays <= 0 {
 		durationDays = 30
 	}
+	cfg := s.getSystemConfig()
 	var updatedUser model.User
+	var discountApplied int64
+	var payableApplied int64
 	now := time.Now()
+
+	if couponCode != "" {
+		couponClaimMu.Lock()
+		defer couponClaimMu.Unlock()
+	}
+
 	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var u model.User
+		if err := tx.Select("id, email").First(&u, uid).Error; err != nil {
+			return err
+		}
+		orderNo := newOrderNo()
+		payable := plan.PriceCents
+		var discount int64
+		var appliedCode string
+		if couponCode != "" {
+			quote, cerr := claimCouponInTx(tx, uid, u.Email, couponCode, "plan_purchase", orderNo, &plan, now)
+			if cerr != nil {
+				return cerr
+			}
+			payable = quote.PayableCents
+			discount = quote.DiscountCents
+			appliedCode = quote.Coupon.Code
+		}
+
 		updates := map[string]any{
-			"balance_cents": gorm.Expr("balance_cents - ?", plan.PriceCents),
+			"balance_cents": gorm.Expr("balance_cents - ?", payable),
 			"plan_id":       plan.ID,
 			"quota_bytes":   plan.QuotaBytes,
 			"max_rules":     plan.MaxRules,
@@ -1673,7 +2002,7 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 		}
 		// Atomic balance deduction to prevent concurrent double-spending
 		res := tx.Model(&model.User{}).
-			Where("id = ? AND balance_cents >= ?", uid, plan.PriceCents).
+			Where("id = ? AND balance_cents >= ?", uid, payable).
 			Updates(updates)
 		if res.Error != nil {
 			return res.Error
@@ -1684,21 +2013,37 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 		if err := tx.First(&updatedUser, uid).Error; err != nil {
 			return err
 		}
-		order := model.BillingOrder{
-			OrderNo:     newOrderNo(),
-			UserID:      uid,
-			UserEmail:   updatedUser.Email,
-			Type:        "plan_purchase",
-			PlanID:      plan.ID,
-			PlanName:    plan.Name,
-			AmountCents: plan.PriceCents,
-			Status:      "paid",
-			Gateway:     "balance",
-			PaidAt:      &now,
+		planLabel := plan.Name
+		if appliedCode != "" && discount > 0 {
+			planLabel = fmt.Sprintf("%s [优惠券 %s -¥%.2f]", plan.Name, appliedCode, float64(discount)/100.0)
 		}
-		return tx.Create(&order).Error
+		order := model.BillingOrder{
+			OrderNo:       orderNo,
+			UserID:        uid,
+			UserEmail:     updatedUser.Email,
+			Type:          "plan_purchase",
+			PlanID:        plan.ID,
+			PlanName:      truncateUTF8(planLabel, 128),
+			OriginalCents: plan.PriceCents,
+			DiscountCents: discount,
+			CouponCode:    appliedCode,
+			AmountCents:   payable,
+			Status:        "paid",
+			Gateway:       "balance",
+			PaidAt:        &now,
+		}
+		if err := tx.Create(&order).Error; err != nil {
+			return err
+		}
+		discountApplied = discount
+		payableApplied = payable
+		return settleAffiliateOnSpendTx(tx, cfg, &order, payable)
 	})
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "coupon_invalid:") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": strings.TrimPrefix(err.Error(), "coupon_invalid:")})
+			return
+		}
 		if err.Error() == "insufficient_balance" {
 			c.JSON(http.StatusPaymentRequired, gin.H{"error": "账户余额不足，请先充值或使用兑换码"})
 			return
@@ -1709,12 +2054,27 @@ func (s *Server) handlePurchasePlan(c *gin.Context) {
 
 	s.enforceUserTunnelPermissions(&updatedUser)
 	s.resumeUserQuotaExceededRules(&updatedUser)
-	c.JSON(http.StatusOK, gin.H{"message": "套餐购买并激活成功，已自动同步对应角色与隧道权限", "user": updatedUser})
+	msg := "套餐购买并激活成功，已自动同步对应角色与隧道权限"
+	if discountApplied > 0 {
+		msg = fmt.Sprintf("套餐购买成功（优惠券已抵扣 ¥%.2f，实付 ¥%.2f）", float64(discountApplied)/100.0, float64(payableApplied)/100.0)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":        msg,
+		"user":           updatedUser,
+		"discount_cents": discountApplied,
+		"payable_cents":  payableApplied,
+	})
 }
 
 // handleUserResetSubscription lets a user pay their bound plan's price to reset used traffic to 0 and refresh the
 // subscription cycle early when they run out of monthly traffic.
 func (s *Server) handleUserResetSubscription(c *gin.Context) {
+	couponCode, statusCode, bodyErr := readOptionalCouponCode(c)
+	if bodyErr != nil {
+		c.JSON(statusCode, gin.H{"error": bodyErr.Error()})
+		return
+	}
+
 	uid := s.currentUserID(c)
 	var u model.User
 	if err := s.db.First(&u, uid).Error; err != nil {
@@ -1746,12 +2106,35 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 	if durationDays <= 0 {
 		durationDays = 30
 	}
+	cfg := s.getSystemConfig()
 
 	var updatedUser model.User
+	var discountApplied int64
+	var payableApplied int64
 	now := time.Now()
+
+	if couponCode != "" {
+		couponClaimMu.Lock()
+		defer couponClaimMu.Unlock()
+	}
+
 	err := s.db.Transaction(func(tx *gorm.DB) error {
+		orderNo := newOrderNo()
+		payable := plan.PriceCents
+		var discount int64
+		var appliedCode string
+		if couponCode != "" {
+			quote, cerr := claimCouponInTx(tx, uid, u.Email, couponCode, "plan_reset", orderNo, &plan, now)
+			if cerr != nil {
+				return cerr
+			}
+			payable = quote.PayableCents
+			discount = quote.DiscountCents
+			appliedCode = quote.Coupon.Code
+		}
+
 		updates := map[string]any{
-			"balance_cents": gorm.Expr("balance_cents - ?", plan.PriceCents),
+			"balance_cents": gorm.Expr("balance_cents - ?", payable),
 			"used_bytes":    0,
 			"quota_bytes":   plan.QuotaBytes,
 			"max_rules":     plan.MaxRules,
@@ -1767,7 +2150,7 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 			updates["allowed_tunnels"] = allowedTunnels
 		}
 		res := tx.Model(&model.User{}).
-			Where("id = ? AND balance_cents >= ?", uid, plan.PriceCents).
+			Where("id = ? AND balance_cents >= ?", uid, payable).
 			Updates(updates)
 		if res.Error != nil {
 			return res.Error
@@ -1778,21 +2161,37 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 		if err := tx.First(&updatedUser, uid).Error; err != nil {
 			return err
 		}
-		order := model.BillingOrder{
-			OrderNo:     newOrderNo(),
-			UserID:      uid,
-			UserEmail:   updatedUser.Email,
-			Type:        "plan_reset",
-			PlanID:      plan.ID,
-			PlanName:    plan.Name + " (重置流量周期)",
-			AmountCents: plan.PriceCents,
-			Status:      "paid",
-			Gateway:     "balance",
-			PaidAt:      &now,
+		planLabel := plan.Name + " (重置流量周期)"
+		if appliedCode != "" && discount > 0 {
+			planLabel = fmt.Sprintf("%s (重置周期 · 优惠券 %s -¥%.2f)", plan.Name, appliedCode, float64(discount)/100.0)
 		}
-		return tx.Create(&order).Error
+		order := model.BillingOrder{
+			OrderNo:       orderNo,
+			UserID:        uid,
+			UserEmail:     updatedUser.Email,
+			Type:          "plan_reset",
+			PlanID:        plan.ID,
+			PlanName:      truncateUTF8(planLabel, 128),
+			OriginalCents: plan.PriceCents,
+			DiscountCents: discount,
+			CouponCode:    appliedCode,
+			AmountCents:   payable,
+			Status:        "paid",
+			Gateway:       "balance",
+			PaidAt:        &now,
+		}
+		if err := tx.Create(&order).Error; err != nil {
+			return err
+		}
+		discountApplied = discount
+		payableApplied = payable
+		return settleAffiliateOnSpendTx(tx, cfg, &order, payable)
 	})
 	if err != nil {
+		if strings.HasPrefix(err.Error(), "coupon_invalid:") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": strings.TrimPrefix(err.Error(), "coupon_invalid:")})
+			return
+		}
 		if err.Error() == "insufficient_balance" {
 			c.JSON(http.StatusPaymentRequired, gin.H{"error": "账户余额不足，无法重置当前套餐周期，请先充值或使用兑换码"})
 			return
@@ -1803,7 +2202,16 @@ func (s *Server) handleUserResetSubscription(c *gin.Context) {
 
 	s.enforceUserTunnelPermissions(&updatedUser)
 	s.resumeUserQuotaExceededRules(&updatedUser)
-	c.JSON(http.StatusOK, gin.H{"message": "订阅周期与当月流量已重置，因超额暂停的转发规则已自动恢复", "user": updatedUser})
+	msg := "订阅周期与当月流量已重置，因超额暂停的转发规则已自动恢复"
+	if discountApplied > 0 {
+		msg = fmt.Sprintf("订阅周期与流量已重置（优惠券抵扣 ¥%.2f，实付 ¥%.2f）", float64(discountApplied)/100.0, float64(payableApplied)/100.0)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":        msg,
+		"user":           updatedUser,
+		"discount_cents": discountApplied,
+		"payable_cents":  payableApplied,
+	})
 }
 
 // handleUserResetSubToken rotates the current user's subscription token so any leaked subscription URL is revoked.
@@ -1912,7 +2320,7 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 		cfg := s.getSystemConfig()
 		c.JSON(http.StatusOK, gin.H{
 			"site_name":   cfg.SiteName,
-			"email":       u.Email,
+			"email":       maskEmail(u.Email),
 			"status":      u.Status,
 			"used_bytes":  u.UsedBytes,
 			"quota_bytes": u.QuotaBytes,
@@ -1930,6 +2338,20 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	}
 	encoded := base64.StdEncoding.EncodeToString([]byte(plain))
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(encoded))
+}
+
+func maskEmail(email string) string {
+	email = strings.TrimSpace(email)
+	at := strings.IndexByte(email, '@')
+	if at <= 0 || at >= len(email)-1 {
+		return "***"
+	}
+	local := email[:at]
+	domain := email[at:]
+	if len(local) <= 1 {
+		return local + "***" + domain
+	}
+	return local[:1] + "***" + domain
 }
 
 func (s *Server) handleRedeemCode(c *gin.Context) {
@@ -2102,11 +2524,34 @@ func computeEpaySign(params map[string]string, secretKey string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ComputeUSDTWebhookSign computes the HMAC-SHA256 hex digest over "<timestamp>.<rawBody>" using secret.
+func ComputeUSDTWebhookSign(timestamp int64, rawBody []byte, secret string) string {
+	mac := hmac.New(sha256.New, []byte(strings.TrimSpace(secret)))
+	_, _ = fmt.Fprintf(mac, "%d.", timestamp)
+	_, _ = mac.Write(rawBody)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func isValidTradeRef(ref string) bool {
+	if len(ref) == 0 || len(ref) > 128 {
+		return false
+	}
+	for _, r := range ref {
+		if r <= 0x20 || r >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) handleListOrders(c *gin.Context) {
+	if s.orch != nil {
+		s.orch.CloseExpiredOrders(time.Now())
+	}
 	isAdmin := s.isAdmin(c)
 	uid := s.currentUserID(c)
 
-	query := s.db.Order("id desc")
+	query := s.db.Model(&model.BillingOrder{})
 	if !(isAdmin && c.Query("all") == "1") {
 		query = query.Where("user_id = ?", uid)
 	}
@@ -2116,13 +2561,21 @@ func (s *Server) handleListOrders(c *gin.Context) {
 	if tp := strings.TrimSpace(c.Query("type")); tp != "" {
 		query = query.Where("type = ?", tp)
 	}
-	limit := 100
-	if isAdmin && c.Query("all") == "1" {
-		limit = 200
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		like := buildSafeLike(q)
+		query = query.Where(`(order_no LIKE ? ESCAPE '!' OR user_email LIKE ? ESCAPE '!' OR plan_name LIKE ? ESCAPE '!' OR trade_no LIKE ? ESCAPE '!')`, like, like, like, like)
 	}
+	var total int64
+	query.Count(&total)
+
+	defaultLimit := 100
+	if isAdmin && c.Query("all") == "1" {
+		defaultLimit = 200
+	}
+	page, pageSize, pagedEnvelope := parseListPagination(c, defaultLimit, 500)
 	var orders []model.BillingOrder
-	query.Limit(limit).Find(&orders)
-	c.JSON(http.StatusOK, orders)
+	query.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&orders)
+	respondListPayload(c, orders, total, page, pageSize, pagedEnvelope)
 }
 
 func (s *Server) handleCreateRechargeOrder(c *gin.Context) {
@@ -2216,7 +2669,21 @@ func (s *Server) handleCreateRechargeOrder(c *gin.Context) {
 }
 
 func (s *Server) handleEpayNotify(c *gin.Context) {
-	_ = c.Request.ParseForm()
+	clientIP := c.ClientIP()
+	if payNotifyGuard.isBlocked(clientIP) {
+		c.String(http.StatusTooManyRequests, "fail")
+		return
+	}
+
+	if err := c.Request.ParseForm(); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.String(http.StatusRequestEntityTooLarge, "fail")
+			return
+		}
+		c.String(http.StatusBadRequest, "fail")
+		return
+	}
 	params := make(map[string]string)
 	for k, vals := range c.Request.URL.Query() {
 		if len(vals) > 0 {
@@ -2230,7 +2697,7 @@ func (s *Server) handleEpayNotify(c *gin.Context) {
 	}
 
 	cfg := s.getSystemConfig()
-	if strings.TrimSpace(cfg.EpayKey) == "" {
+	if !cfg.PaymentEnabled || strings.TrimSpace(cfg.EpayKey) == "" {
 		c.String(http.StatusBadRequest, "fail")
 		return
 	}
@@ -2238,9 +2705,14 @@ func (s *Server) handleEpayNotify(c *gin.Context) {
 	givenSign := strings.ToLower(strings.TrimSpace(params["sign"]))
 	expectedSign := computeEpaySign(params, cfg.EpayKey)
 	if len(givenSign) == 0 || subtle.ConstantTimeCompare([]byte(givenSign), []byte(expectedSign)) != 1 {
+		if payNotifyGuard.recordFailure(clientIP) {
+			c.String(http.StatusTooManyRequests, "fail")
+			return
+		}
 		c.String(http.StatusForbidden, "fail")
 		return
 	}
+	payNotifyGuard.recordSuccess(clientIP)
 
 	if strings.TrimSpace(cfg.EpayPID) != "" && strings.TrimSpace(params["pid"]) != strings.TrimSpace(cfg.EpayPID) {
 		c.String(http.StatusBadRequest, "fail")
@@ -2254,25 +2726,49 @@ func (s *Server) handleEpayNotify(c *gin.Context) {
 
 	outTradeNo := strings.TrimSpace(params["out_trade_no"])
 	tradeNo := strings.TrimSpace(params["trade_no"])
-	if outTradeNo == "" {
+	if outTradeNo == "" || !isValidTradeRef(tradeNo) {
 		c.String(http.StatusBadRequest, "fail")
 		return
 	}
 
+	now := time.Now()
+	var creditedOrder *model.BillingOrder
+	var expiredOrderID uint64
+
+	payNotifyMu.Lock()
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var order model.BillingOrder
 		if err := tx.Where("order_no = ? AND type = ?", outTradeNo, "recharge").First(&order).Error; err != nil {
 			return fmt.Errorf("not_found")
 		}
+		if order.Gateway != "epay" {
+			return fmt.Errorf("gateway_mismatch")
+		}
 		if order.Status == "paid" {
+			if order.TradeNo != "" && order.TradeNo != tradeNo {
+				return fmt.Errorf("trade_no_conflict")
+			}
 			return nil
+		}
+		if order.Status != "pending" {
+			return fmt.Errorf("order_closed")
+		}
+		if !order.CreatedAt.IsZero() && now.Sub(order.CreatedAt) > service.OrderExpireTimeout {
+			expiredOrderID = order.ID
+			return fmt.Errorf("order_expired")
+		}
+		var dupCount int64
+		tx.Model(&model.BillingOrder{}).
+			Where("gateway = ? AND trade_no = ? AND status = ? AND id <> ?", "epay", tradeNo, "paid", order.ID).
+			Count(&dupCount)
+		if dupCount > 0 {
+			return fmt.Errorf("duplicate_trade_no")
 		}
 		moneyStr := strings.TrimSpace(params["money"])
 		moneyFloat, perr := strconv.ParseFloat(moneyStr, 64)
-		if moneyStr == "" || perr != nil || int64(math.Round(moneyFloat*100)) != order.AmountCents {
+		if moneyStr == "" || perr != nil || math.IsNaN(moneyFloat) || math.IsInf(moneyFloat, 0) || int64(math.Round(moneyFloat*100)) != order.AmountCents {
 			return fmt.Errorf("amount_mismatch")
 		}
-		now := time.Now()
 		res := tx.Model(&model.BillingOrder{}).
 			Where("id = ? AND status = ?", order.ID, "pending").
 			Updates(map[string]any{
@@ -2286,15 +2782,253 @@ func (s *Server) handleEpayNotify(c *gin.Context) {
 		if res.RowsAffected == 0 {
 			return nil
 		}
-		return tx.Model(&model.User{}).
+		if err := tx.Model(&model.User{}).
 			Where("id = ?", order.UserID).
-			Update("balance_cents", gorm.Expr("balance_cents + ?", order.AmountCents)).Error
+			Update("balance_cents", gorm.Expr("balance_cents + ?", order.AmountCents)).Error; err != nil {
+			return err
+		}
+		if err := settleAffiliateOnRechargeTx(tx, cfg, &order); err != nil {
+			return err
+		}
+		orderCopy := order
+		creditedOrder = &orderCopy
+		return nil
 	})
+	payNotifyMu.Unlock()
+	if expiredOrderID > 0 {
+		s.db.Model(&model.BillingOrder{}).
+			Where("id = ? AND status = ?", expiredOrderID, "pending").
+			Update("status", "cancelled")
+	}
 	if err != nil {
 		c.String(http.StatusBadRequest, "fail")
 		return
 	}
+	if creditedOrder != nil {
+		s.recordAuditForUser(c, creditedOrder.UserID, creditedOrder.UserEmail, "payment.epay_notify", creditedOrder.OrderNo,
+			fmt.Sprintf("易支付回调入账 %.2f 元 (流水号: %s)", float64(creditedOrder.AmountCents)/100.0, tradeNo))
+	}
 	c.String(http.StatusOK, "success")
+}
+
+// handleUSDTNotify processes HMAC-SHA256 authenticated USDT payment gateway webhooks.
+// Expected headers:
+//   - X-USDT-Timestamp (or X-Webhook-Timestamp): Unix seconds within ±300s
+//   - X-USDT-Signature (or X-Webhook-Signature): hex HMAC-SHA256(usdt_webhook_secret, "<timestamp>.<raw_body>")
+func (s *Server) handleUSDTNotify(c *gin.Context) {
+	clientIP := c.ClientIP()
+	if payNotifyGuard.isBlocked(clientIP) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "回调鉴权失败过于频繁，请稍后再试"})
+		return
+	}
+
+	cfg := s.getSystemConfig()
+	secret := strings.TrimSpace(cfg.USDTWebhookSecret)
+	if !cfg.PaymentEnabled || secret == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "USDT 自动回调未启用或未配置签名密钥"})
+		return
+	}
+
+	if c.Request.Body == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "空的回调请求体"})
+		return
+	}
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "请求体超过大小限制"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "读取回调请求体失败"})
+		return
+	}
+	if len(rawBody) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "空的回调请求体"})
+		return
+	}
+
+	var payload struct {
+		OrderNo     string  `json:"order_no"`
+		OutTradeNo  string  `json:"out_trade_no"`
+		TradeNo     string  `json:"trade_no"`
+		TxHash      string  `json:"tx_hash"`
+		AmountCents int64   `json:"amount_cents"`
+		Amount      float64 `json:"amount"`
+		Status      string  `json:"status"`
+		Timestamp   int64   `json:"timestamp"`
+	}
+	if err := json.Unmarshal(rawBody, &payload); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的 JSON 回调数据"})
+		return
+	}
+
+	tsHeader := strings.TrimSpace(c.GetHeader("X-USDT-Timestamp"))
+	if tsHeader == "" {
+		tsHeader = strings.TrimSpace(c.GetHeader("X-Webhook-Timestamp"))
+	}
+	var ts int64
+	if tsHeader != "" {
+		parsedTS, perr := strconv.ParseInt(tsHeader, 10, 64)
+		if perr != nil {
+			if payNotifyGuard.recordFailure(clientIP) {
+				c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁"})
+				return
+			}
+			c.JSON(http.StatusForbidden, gin.H{"error": "无效的回调时间戳"})
+			return
+		}
+		ts = parsedTS
+	} else {
+		ts = payload.Timestamp
+	}
+
+	now := time.Now()
+	diff := now.Unix() - ts
+	if ts <= 0 || diff < -300 || diff > 300 {
+		if payNotifyGuard.recordFailure(clientIP) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁"})
+			return
+		}
+		c.JSON(http.StatusForbidden, gin.H{"error": "回调时间戳已过期或偏差过大 (±300s)"})
+		return
+	}
+
+	sigHeader := strings.TrimSpace(c.GetHeader("X-USDT-Signature"))
+	if sigHeader == "" {
+		sigHeader = strings.TrimSpace(c.GetHeader("X-Webhook-Signature"))
+	}
+	sigHeader = strings.TrimPrefix(strings.ToLower(sigHeader), "sha256=")
+	expectedSig := ComputeUSDTWebhookSign(ts, rawBody, secret)
+	if len(sigHeader) != 64 || subtle.ConstantTimeCompare([]byte(sigHeader), []byte(expectedSig)) != 1 {
+		if payNotifyGuard.recordFailure(clientIP) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁"})
+			return
+		}
+		c.JSON(http.StatusForbidden, gin.H{"error": "USDT Webhook 签名校验失败"})
+		return
+	}
+	payNotifyGuard.recordSuccess(clientIP)
+
+	st := strings.ToLower(strings.TrimSpace(payload.Status))
+	if st != "" && st != "paid" && st != "success" && st != "confirmed" && st != "completed" && st != "trade_success" {
+		c.JSON(http.StatusOK, gin.H{"status": "ignored"})
+		return
+	}
+
+	orderNo := strings.TrimSpace(payload.OrderNo)
+	if orderNo == "" {
+		orderNo = strings.TrimSpace(payload.OutTradeNo)
+	}
+	txHash := strings.TrimSpace(payload.TxHash)
+	if txHash == "" {
+		txHash = strings.TrimSpace(payload.TradeNo)
+	}
+	if orderNo == "" || !isValidTradeRef(txHash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少订单号或有效的链上交易哈希 (tx_hash)"})
+		return
+	}
+
+	paidCents := payload.AmountCents
+	if paidCents <= 0 && payload.Amount > 0 && !math.IsNaN(payload.Amount) && !math.IsInf(payload.Amount, 0) {
+		paidCents = int64(math.Round(payload.Amount * 100))
+	}
+	if paidCents <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的回调入账金额"})
+		return
+	}
+
+	var creditedOrder *model.BillingOrder
+	var idempotentHit bool
+	var expiredOrderID uint64
+
+	payNotifyMu.Lock()
+	txErr := s.db.Transaction(func(tx *gorm.DB) error {
+		var order model.BillingOrder
+		if err := tx.Where("order_no = ? AND type = ?", orderNo, "recharge").First(&order).Error; err != nil {
+			return fmt.Errorf("not_found")
+		}
+		if order.Gateway != "usdt" {
+			return fmt.Errorf("gateway_mismatch")
+		}
+		if order.Status == "paid" {
+			if order.TradeNo != "" && order.TradeNo != txHash {
+				return fmt.Errorf("tx_hash_conflict")
+			}
+			idempotentHit = true
+			return nil
+		}
+		if order.Status != "pending" {
+			return fmt.Errorf("order_closed")
+		}
+		if !order.CreatedAt.IsZero() && now.Sub(order.CreatedAt) > service.OrderExpireTimeout {
+			expiredOrderID = order.ID
+			return fmt.Errorf("order_expired")
+		}
+		if paidCents != order.AmountCents {
+			return fmt.Errorf("amount_mismatch")
+		}
+
+		var dupCount int64
+		tx.Model(&model.BillingOrder{}).
+			Where("gateway = ? AND trade_no = ? AND status = ? AND id <> ?", "usdt", txHash, "paid", order.ID).
+			Count(&dupCount)
+		if dupCount > 0 {
+			return fmt.Errorf("duplicate_tx_hash")
+		}
+
+		res := tx.Model(&model.BillingOrder{}).
+			Where("id = ? AND status = ?", order.ID, "pending").
+			Updates(map[string]any{
+				"status":   "paid",
+				"trade_no": txHash,
+				"paid_at":  &now,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			idempotentHit = true
+			return nil
+		}
+		if err := tx.Model(&model.User{}).
+			Where("id = ?", order.UserID).
+			Update("balance_cents", gorm.Expr("balance_cents + ?", order.AmountCents)).Error; err != nil {
+			return err
+		}
+		if err := settleAffiliateOnRechargeTx(tx, cfg, &order); err != nil {
+			return err
+		}
+		orderCopy := order
+		creditedOrder = &orderCopy
+		return nil
+	})
+	payNotifyMu.Unlock()
+	if expiredOrderID > 0 {
+		s.db.Model(&model.BillingOrder{}).
+			Where("id = ? AND status = ?", expiredOrderID, "pending").
+			Update("status", "cancelled")
+	}
+	if txErr != nil {
+		switch txErr.Error() {
+		case "not_found":
+			c.JSON(http.StatusNotFound, gin.H{"error": "充值订单不存在"})
+		case "duplicate_tx_hash", "tx_hash_conflict":
+			c.JSON(http.StatusConflict, gin.H{"error": "链上交易哈希已被使用或与原记录冲突"})
+		case "order_expired", "order_closed":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "订单已超时关闭或状态不可入账"})
+		case "amount_mismatch":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "回调金额与订单金额不一致"})
+		default:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "USDT 回调入账失败"})
+		}
+		return
+	}
+	if creditedOrder != nil {
+		s.recordAuditForUser(c, creditedOrder.UserID, creditedOrder.UserEmail, "payment.usdt_notify", creditedOrder.OrderNo,
+			fmt.Sprintf("USDT Webhook 验签入账 %.2f 元 (TxHash: %s)", float64(creditedOrder.AmountCents)/100.0, txHash))
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "idempotent": idempotentHit})
 }
 
 func (s *Server) handleAdminConfirmOrder(c *gin.Context) {
@@ -2303,7 +3037,10 @@ func (s *Server) handleAdminConfirmOrder(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid order id"})
 		return
 	}
+	now := time.Now()
 	var confirmedOrder model.BillingOrder
+	var expiredOrderID uint64
+	payNotifyMu.Lock()
 	txErr := s.db.Transaction(func(tx *gorm.DB) error {
 		var order model.BillingOrder
 		if err := tx.First(&order, id).Error; err != nil {
@@ -2315,12 +3052,18 @@ func (s *Server) handleAdminConfirmOrder(c *gin.Context) {
 		if order.Status == "paid" {
 			return fmt.Errorf("already_paid")
 		}
-		now := time.Now()
+		if order.Status != "pending" {
+			return fmt.Errorf("order_closed")
+		}
+		if !order.CreatedAt.IsZero() && now.Sub(order.CreatedAt) > service.OrderExpireTimeout {
+			expiredOrderID = order.ID
+			return fmt.Errorf("order_expired")
+		}
 		res := tx.Model(&model.BillingOrder{}).
 			Where("id = ? AND status = ?", order.ID, "pending").
 			Updates(map[string]any{
 				"status":   "paid",
-				"trade_no": "ADMIN-MANUAL-" + strconv.FormatUint(s.currentUserID(c), 10),
+				"trade_no": fmt.Sprintf("ADMIN-MANUAL-%d-%s", s.currentUserID(c), order.OrderNo),
 				"paid_at":  &now,
 			})
 		if res.Error != nil {
@@ -2334,19 +3077,32 @@ func (s *Server) handleAdminConfirmOrder(c *gin.Context) {
 			Update("balance_cents", gorm.Expr("balance_cents + ?", order.AmountCents)).Error; err != nil {
 			return err
 		}
-		return tx.First(&confirmedOrder, order.ID).Error
+		if err := tx.First(&confirmedOrder, order.ID).Error; err != nil {
+			return err
+		}
+		return settleAffiliateOnRechargeTx(tx, s.getSystemConfig(), &confirmedOrder)
 	})
+	if expiredOrderID > 0 {
+		s.db.Model(&model.BillingOrder{}).
+			Where("id = ? AND status = ?", expiredOrderID, "pending").
+			Update("status", "cancelled")
+	}
+	payNotifyMu.Unlock()
 	if txErr != nil {
 		switch txErr.Error() {
 		case "not_found":
 			c.JSON(http.StatusNotFound, gin.H{"error": "订单不存在"})
 		case "already_paid":
 			c.JSON(http.StatusConflict, gin.H{"error": "该订单已入账，请勿重复确认"})
+		case "order_expired", "order_closed":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "该订单已超时关闭，无法继续入账"})
 		default:
 			c.JSON(http.StatusBadRequest, gin.H{"error": "确认订单入账失败"})
 		}
 		return
 	}
+	s.recordAudit(c, "admin.confirm_order", confirmedOrder.OrderNo,
+		fmt.Sprintf("人工确认充值订单入账 %.2f 元 (用户: %s)", float64(confirmedOrder.AmountCents)/100.0, confirmedOrder.UserEmail))
 	c.JSON(http.StatusOK, gin.H{"message": "订单已确认入账，用户余额已自动增加", "order": confirmedOrder})
 }
 
@@ -2356,6 +3112,11 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 	var node model.Node
 	if err := c.ShouldBindJSON(&node); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	node.Name = strings.TrimSpace(node.Name)
+	if node.Name == "" || utf8.RuneCountInString(node.Name) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "节点名称不能为空且不超过 64 个字符"})
 		return
 	}
 	if node.ConnectIP == "" && node.PublicHost != "" {
@@ -2375,6 +3136,17 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 	}
 	if node.PortRange == "" {
 		node.PortRange = "10000-50000"
+	} else {
+		nmin, nmax, perr := utils.ParsePortRange(node.PortRange)
+		if perr != nil || nmin < security.DefaultPolicy.MinListenPort {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("端口范围格式应为 起始-结束，且起始端口不小于 %d", security.DefaultPolicy.MinListenPort)})
+			return
+		}
+		node.PortRange = fmt.Sprintf("%d-%d", nmin, nmax)
+	}
+	if math.IsNaN(node.TrafficRate) || math.IsInf(node.TrafficRate, 0) || node.TrafficRate > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "节点流量倍率需在 0.01 - 1000 之间"})
+		return
 	}
 	if node.TrafficRate <= 0 {
 		node.TrafficRate = 1.0
@@ -2388,6 +3160,10 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 	if node.DefaultEngine == "" {
 		node.DefaultEngine = protocol.EngineNative
 	}
+	if !validEngine(node.DefaultEngine) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的默认转发引擎"})
+		return
+	}
 	node.Status = "offline"
 	node.ID = 0
 	node.UsedBytes = 0
@@ -2396,6 +3172,7 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建节点失败，请检查参数"})
 		return
 	}
+	s.recordAudit(c, "admin.create_node", node.Name, fmt.Sprintf("创建节点 #%d (%s)", node.ID, node.ConnectIP))
 	c.JSON(http.StatusCreated, node)
 }
 
@@ -2431,26 +3208,30 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 	oldServerIP := node.ServerIP
 	oldPortRange := node.PortRange
 	portRangeChanged := false
-	if req.Name != "" {
-		node.Name = req.Name
+	if strings.TrimSpace(req.Name) != "" {
+		if utf8.RuneCountInString(strings.TrimSpace(req.Name)) > 64 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "节点名称不能超过 64 个字符"})
+			return
+		}
+		node.Name = strings.TrimSpace(req.Name)
 	}
 	if req.Role != "" {
 		node.Role = req.Role
 	}
 	if req.ConnectIP != "" {
-		node.ConnectIP = req.ConnectIP
-		node.PublicHost = req.ConnectIP
+		node.ConnectIP = strings.TrimSpace(req.ConnectIP)
+		node.PublicHost = node.ConnectIP
 	} else if req.PublicHost != "" {
-		node.ConnectIP = req.PublicHost
-		node.PublicHost = req.PublicHost
+		node.ConnectIP = strings.TrimSpace(req.PublicHost)
+		node.PublicHost = node.ConnectIP
 	}
 	if req.ServerIP != "" {
-		node.ServerIP = req.ServerIP
+		node.ServerIP = strings.TrimSpace(req.ServerIP)
 	} else if node.ServerIP == "" {
 		node.ServerIP = node.ConnectIP
 	}
 	if req.InternalHost != "" {
-		node.InternalHost = req.InternalHost
+		node.InternalHost = strings.TrimSpace(req.InternalHost)
 	}
 	if req.PortRange != "" && req.PortRange != node.PortRange {
 		nmin, nmax, perr := utils.ParsePortRange(req.PortRange)
@@ -2470,6 +3251,10 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		node.PortRange = fmt.Sprintf("%d-%d", nmin, nmax)
 		portRangeChanged = node.PortRange != oldPortRange
 	}
+	if math.IsNaN(req.TrafficRate) || math.IsInf(req.TrafficRate, 0) || req.TrafficRate < 0 || req.TrafficRate > 1000 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "节点流量倍率需在 0.01 - 1000 之间"})
+		return
+	}
 	if req.TrafficRate > 0 {
 		node.TrafficRate = req.TrafficRate
 	}
@@ -2482,6 +3267,10 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		}
 	}
 	if req.DefaultEngine != "" {
+		if !validEngine(req.DefaultEngine) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的默认转发引擎"})
+			return
+		}
 		node.DefaultEngine = req.DefaultEngine
 	}
 	// Never write back fields owned by the agent / traffic accounting from a stale snapshot.
@@ -2513,7 +3302,8 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		for i := range pausedRules {
 			var owner model.User
 			if s.db.First(&owner, pausedRules[i].UserID).Error != nil || !owner.CanForward(now) ||
-				!owner.HasTunnelPermission(pausedRules[i].TunnelLineID) || s.resumeBlockedByPort(&pausedRules[i]) {
+				!owner.HasTunnelPermission(pausedRules[i].TunnelLineID) || !s.tunnelLineEnabled(pausedRules[i].TunnelLineID) ||
+				s.resumeBlockedByPort(&pausedRules[i]) {
 				continue
 			}
 			pausedRules[i].Enabled = true
@@ -2540,6 +3330,8 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 			}
 		}
 	}
+	s.recordAudit(c, "admin.update_node", node.Name, fmt.Sprintf("更新节点 #%d 配置", node.ID))
+	node.SecretToken = ""
 	c.JSON(http.StatusOK, node)
 }
 
@@ -2552,6 +3344,8 @@ func (s *Server) handleAdminResetNodeTraffic(c *gin.Context) {
 	}
 	resumed := s.orch.ResetNodeTraffic(node.ID, time.Now())
 	_ = s.db.First(&node, node.ID).Error
+	node.SecretToken = ""
+	s.recordAudit(c, "admin.reset_node_traffic", node.Name, fmt.Sprintf("重置节点 #%d 流量并恢复 %d 条规则", node.ID, resumed))
 	c.JSON(http.StatusOK, gin.H{"node": node, "resumed_rules": resumed})
 }
 
@@ -2564,6 +3358,7 @@ func (s *Server) handleAdminDeleteNode(c *gin.Context) {
 		return
 	}
 	s.db.Delete(&model.Node{}, id)
+	s.recordAudit(c, "admin.delete_node", strconv.FormatUint(id, 10), fmt.Sprintf("删除节点 #%d", id))
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 
@@ -2796,8 +3591,11 @@ func validateLine(line *model.TunnelLine) error {
 	if line.BillingMode != "one_way" && line.BillingMode != "two_way" {
 		return fmt.Errorf("无效的计费模式")
 	}
-	if line.RateMultiplier < 0 || line.MaxPortCount < 0 {
-		return fmt.Errorf("倍率与端口上限不能为负数")
+	if math.IsNaN(line.RateMultiplier) || math.IsInf(line.RateMultiplier, 0) || line.RateMultiplier < 0 || line.RateMultiplier > 1000 {
+		return fmt.Errorf("隧道计费倍率需在 0 - 1000 之间")
+	}
+	if line.MaxPortCount < 0 || line.MaxPortCount > 65535 {
+		return fmt.Errorf("端口上限需在 0 - 65535 之间")
 	}
 	return nil
 }
@@ -2834,16 +3632,44 @@ func (s *Server) agentBinarySHA256(arch string) string {
 	return sum
 }
 
+// sanitizeRequestHost strictly validates an HTTP Host header value against injection characters.
+func sanitizeRequestHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 255 {
+		return "127.0.0.1:8080"
+	}
+	for _, r := range raw {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == ':' || r == '[' || r == ']') {
+			return "127.0.0.1:8080"
+		}
+	}
+	if h, p, err := net.SplitHostPort(raw); err == nil {
+		if h == "" {
+			return "127.0.0.1:8080"
+		}
+		if portNum, perr := strconv.Atoi(p); perr != nil || portNum < 1 || portNum > 65535 {
+			return "127.0.0.1:8080"
+		}
+		return raw
+	}
+	// Bare host without port
+	if strings.Contains(raw, ":") && !(strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]")) {
+		return "127.0.0.1:8080"
+	}
+	return raw
+}
+
 // panelBaseURL returns the externally reachable base URL (configured NEXUS_PUBLIC_URL preferred).
 func (s *Server) panelBaseURL(c *gin.Context) string {
 	if s.publicURL != "" {
 		return s.publicURL
 	}
 	scheme := "http"
-	if c.Request.TLS != nil {
+	if c.Request.TLS != nil || (s.hasTrustedProxies && strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")) {
 		scheme = "https"
 	}
-	return scheme + "://" + c.Request.Host
+	return scheme + "://" + sanitizeRequestHost(c.Request.Host)
 }
 
 // shellQuote single-quotes a value for safe inclusion in a POSIX shell command line.
@@ -2923,6 +3749,7 @@ func (s *Server) handleAdminResyncNode(c *gin.Context) {
 		return
 	}
 	s.orch.SyncNodeRules(node.ID, true)
+	s.recordAudit(c, "admin.resync_node", node.Name, fmt.Sprintf("向节点 #%d 下发全量规则重同步指令", node.ID))
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已向节点「%s」下发全量规则重同步/重启指令", node.Name)})
 }
 
@@ -2957,12 +3784,15 @@ func (s *Server) handleAdminUpgradeNode(c *gin.Context) {
 	var req struct {
 		TargetVersion string `json:"target_version"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
 	payload := s.buildUpgradeAgentPayload(c, req.TargetVersion)
 	if err := s.hub.SendToNode(node.ID, protocol.MsgUpgradeAgent, payload); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("节点「%s」当前离线，无法下发远程升级指令", node.Name)})
 		return
 	}
+	s.recordAudit(c, "admin.upgrade_node", node.Name, fmt.Sprintf("下发远程升级指令 (%s)", payload.TargetVersion))
 	c.JSON(http.StatusOK, gin.H{
 		"message":        fmt.Sprintf("已向节点「%s」下发签名远程升级指令 (%s)", node.Name, payload.TargetVersion),
 		"node_id":        node.ID,
@@ -2975,7 +3805,9 @@ func (s *Server) handleAdminBatchUpgradeNodes(c *gin.Context) {
 		IDs           []uint64 `json:"ids"`
 		TargetVersion string   `json:"target_version"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
 	payload := s.buildUpgradeAgentPayload(c, req.TargetVersion)
 
 	targetIDs := req.IDs
@@ -2988,6 +3820,7 @@ func (s *Server) handleAdminBatchUpgradeNodes(c *gin.Context) {
 			upgraded = append(upgraded, nid)
 		}
 	}
+	s.recordAudit(c, "admin.batch_upgrade_nodes", payload.TargetVersion, fmt.Sprintf("向 %d 个在线节点下发批量升级指令", len(upgraded)))
 	c.JSON(http.StatusOK, gin.H{
 		"message":        fmt.Sprintf("已向 %d 个在线节点下发签名远程升级指令 (%s)", len(upgraded), payload.TargetVersion),
 		"upgraded_nodes": upgraded,
@@ -3042,7 +3875,20 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "tunnel not found"})
 		return
 	}
-	var req model.TunnelLine
+	var req struct {
+		Name           string              `json:"name"`
+		Type           string              `json:"type"`
+		Description    *string             `json:"description"`
+		IngressNodeID  uint64              `json:"ingress_node_id"`
+		EgressNodeID   uint64              `json:"egress_node_id"`
+		Transport      string              `json:"transport"`
+		Engine         protocol.EngineType `json:"engine"`
+		BillingMode    string              `json:"billing_mode"`
+		RateMultiplier float64             `json:"rate_multiplier"`
+		MaxPortCount   int                 `json:"max_port_count"`
+		PortRange      string              `json:"port_range"`
+		Enabled        *bool               `json:"enabled"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -3051,9 +3897,16 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	oldEgressID := line.EgressNodeID
 	oldType := line.Type
 	oldPortRange := line.PortRange
+	oldEnabled := line.Enabled
 
 	line.Name = req.Name
 	line.Type = req.Type
+	if req.Description != nil {
+		line.Description = sanitizeSingleLine(*req.Description, 255)
+	}
+	if req.Enabled != nil {
+		line.Enabled = *req.Enabled
+	}
 	line.IngressNodeID = req.IngressNodeID
 	if line.Type == "encrypt" {
 		line.EgressNodeID = req.EgressNodeID
@@ -3083,7 +3936,7 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	}
 	s.db.Save(&line)
 
-	topologyChanged := oldIngressID != line.IngressNodeID || oldEgressID != line.EgressNodeID || oldType != line.Type
+	topologyChanged := oldIngressID != line.IngressNodeID || oldEgressID != line.EgressNodeID || oldType != line.Type || (oldEnabled && !line.Enabled)
 
 	// 隧道固化转发方式或拓扑变更后，先清理旧节点上的残留实例，再同步更新该隧道下所有转发规则并重新下发
 	ruleGone := fmt.Errorf("rule deleted concurrently")
@@ -3091,7 +3944,7 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	s.db.Where("tunnel_line_id = ?", line.ID).Find(&rules)
 	for i := range rules {
 		oldRule := rules[i]
-		if topologyChanged {
+		if topologyChanged || !line.Enabled {
 			s.orch.RemoveRuleFromAgents(&oldRule)
 		}
 		saveErr := s.orch.WithAllocLock(func() error {
@@ -3275,7 +4128,10 @@ func (s *Server) handleAdminCreatePlan(c *gin.Context) {
 	}
 	plan.ID = 0
 	plan.Active = true
-	if strings.TrimSpace(plan.Name) == "" || plan.PriceCents < 0 || plan.QuotaBytes < 0 {
+	plan.Name = strings.TrimSpace(plan.Name)
+	plan.Description = strings.TrimSpace(plan.Description)
+	if plan.Name == "" || utf8.RuneCountInString(plan.Name) > 64 || plan.PriceCents < 0 || plan.QuotaBytes < 0 ||
+		plan.SpeedMbps < 0 || plan.SpeedMbps > 100000 || plan.MaxRules < 0 || plan.MaxRules > 100000 || plan.DurationDays < 0 || plan.DurationDays > 36500 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的套餐参数"})
 		return
 	}
@@ -3284,6 +4140,7 @@ func (s *Server) handleAdminCreatePlan(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建套餐失败，请检查参数"})
 		return
 	}
+	s.recordAudit(c, "admin.create_plan", plan.Name, fmt.Sprintf("创建套餐 #%d (¥%.2f)", plan.ID, float64(plan.PriceCents)/100.0))
 	c.JSON(http.StatusCreated, plan)
 }
 
@@ -3294,15 +4151,33 @@ func (s *Server) handleAdminUpdatePlan(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "套餐不存在"})
 		return
 	}
-	var req model.Plan
+	var req struct {
+		Name           string  `json:"name"`
+		Description    *string `json:"description"`
+		RoleGroupID    uint64  `json:"role_group_id"`
+		AllowedTunnels string  `json:"allowed_tunnels"`
+		PriceCents     *int64  `json:"price_cents"`
+		DurationDays   int     `json:"duration_days"`
+		QuotaBytes     int64   `json:"quota_bytes"`
+		MaxRules       int     `json:"max_rules"`
+		SpeedMbps      int     `json:"speed_mbps"`
+		MonthlyReset   *bool   `json:"monthly_reset"`
+		Active         *bool   `json:"active"`
+	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if strings.TrimSpace(req.Name) != "" {
+		if utf8.RuneCountInString(strings.TrimSpace(req.Name)) > 64 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "套餐名称不能超过 64 个字符"})
+			return
+		}
 		plan.Name = strings.TrimSpace(req.Name)
 	}
-	plan.Description = strings.TrimSpace(req.Description)
+	if req.Description != nil {
+		plan.Description = strings.TrimSpace(*req.Description)
+	}
 	if req.RoleGroupID > 0 {
 		plan.RoleGroupID = req.RoleGroupID
 		var rg model.RoleGroup
@@ -3312,42 +4187,48 @@ func (s *Server) handleAdminUpdatePlan(c *gin.Context) {
 	} else if req.AllowedTunnels != "" {
 		plan.AllowedTunnels = strings.TrimSpace(req.AllowedTunnels)
 	}
-	if req.PriceCents >= 0 {
-		plan.PriceCents = req.PriceCents
+	if req.PriceCents != nil && *req.PriceCents >= 0 {
+		plan.PriceCents = *req.PriceCents
 	}
-	if req.DurationDays > 0 {
+	if req.DurationDays > 0 && req.DurationDays <= 36500 {
 		plan.DurationDays = req.DurationDays
 	}
 	if req.QuotaBytes > 0 {
 		plan.QuotaBytes = req.QuotaBytes
 	}
-	if req.MaxRules > 0 {
+	if req.MaxRules > 0 && req.MaxRules <= 100000 {
 		plan.MaxRules = req.MaxRules
 	}
-	if req.SpeedMbps > 0 {
+	if req.SpeedMbps > 0 && req.SpeedMbps <= 100000 {
 		plan.SpeedMbps = req.SpeedMbps
 	}
-	plan.MonthlyReset = req.MonthlyReset
-	plan.Active = req.Active
+	if req.MonthlyReset != nil {
+		plan.MonthlyReset = *req.MonthlyReset
+	}
+	if req.Active != nil {
+		plan.Active = *req.Active
+	}
 	s.db.Save(&plan)
+	s.recordAudit(c, "admin.update_plan", plan.Name, fmt.Sprintf("更新套餐 #%d 配置", plan.ID))
 	c.JSON(http.StatusOK, plan)
 }
 
 func (s *Server) handleAdminDeletePlan(c *gin.Context) {
 	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
 	s.db.Delete(&model.Plan{}, id)
+	s.recordAudit(c, "admin.delete_plan", strconv.FormatUint(id, 10), fmt.Sprintf("删除套餐 #%d", id))
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 
 func (s *Server) handleAdminListUsers(c *gin.Context) {
 	var users []model.User
-	query := s.db.Order("id asc")
+	query := s.db.Model(&model.User{}).Order("id asc")
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
-		like := "%" + strings.ToLower(q) + "%"
+		like := buildSafeLike(strings.ToLower(q))
 		if idNum, err := strconv.ParseUint(q, 10, 64); err == nil && idNum > 0 {
-			query = query.Where("(LOWER(email) LIKE ? OR id = ?)", like, idNum)
+			query = query.Where(`(LOWER(email) LIKE ? ESCAPE '!' OR id = ?)`, like, idNum)
 		} else {
-			query = query.Where("LOWER(email) LIKE ?", like)
+			query = query.Where(`LOWER(email) LIKE ? ESCAPE '!'`, like)
 		}
 	}
 	if planParam := strings.TrimSpace(c.Query("plan_id")); planParam != "" {
@@ -3360,39 +4241,57 @@ func (s *Server) handleAdminListUsers(c *gin.Context) {
 			query = query.Where("role_group_id = ?", rgid)
 		}
 	}
-	query.Find(&users)
 
-	if status := strings.TrimSpace(c.Query("status")); status != "" {
-		now := time.Now()
-		filtered := make([]model.User, 0, len(users))
-		for _, u := range users {
-			isActive := u.Status == "active"
-			isExpired := u.Role != "admin" && !u.ExpireAt.IsZero() && now.After(u.ExpireAt)
-			isOverQuota := u.QuotaBytes > 0 && u.UsedBytes >= u.QuotaBytes
-			switch status {
-			case "banned":
-				if !isActive {
-					filtered = append(filtered, u)
-				}
-			case "expired":
-				if isActive && isExpired {
-					filtered = append(filtered, u)
-				}
-			case "over_quota":
-				if isActive && isOverQuota {
-					filtered = append(filtered, u)
-				}
-			case "active":
-				if isActive && !isExpired && !isOverQuota {
-					filtered = append(filtered, u)
-				}
-			default:
+	status := strings.TrimSpace(c.Query("status"))
+	page, pageSize, pagedEnvelope := parseListPagination(c, 500, 1000)
+	if status == "" {
+		var total int64
+		query.Count(&total)
+		query.Offset((page - 1) * pageSize).Limit(pageSize).Find(&users)
+		respondListPayload(c, users, total, page, pageSize, pagedEnvelope)
+		return
+	}
+
+	query.Find(&users)
+	now := time.Now()
+	filtered := make([]model.User, 0, len(users))
+	for _, u := range users {
+		isActive := u.Status == "active"
+		isExpired := u.Role != "admin" && !u.ExpireAt.IsZero() && now.After(u.ExpireAt)
+		isOverQuota := u.QuotaBytes > 0 && u.UsedBytes >= u.QuotaBytes
+		switch status {
+		case "banned":
+			if !isActive {
 				filtered = append(filtered, u)
 			}
+		case "expired":
+			if isActive && isExpired {
+				filtered = append(filtered, u)
+			}
+		case "over_quota":
+			if isActive && isOverQuota {
+				filtered = append(filtered, u)
+			}
+		case "active":
+			if isActive && !isExpired && !isOverQuota {
+				filtered = append(filtered, u)
+			}
+		default:
+			filtered = append(filtered, u)
 		}
-		users = filtered
 	}
-	c.JSON(http.StatusOK, users)
+	total := int64(len(filtered))
+	start := (page - 1) * pageSize
+	if start >= len(filtered) {
+		users = []model.User{}
+	} else {
+		end := start + pageSize
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		users = filtered[start:end]
+	}
+	respondListPayload(c, users, total, page, pageSize, pagedEnvelope)
 }
 
 // parseFlexibleExpireTime parses RFC3339, datetime-local ("2006-01-02T15:04"), "2006-01-02 15:04:05",
@@ -3420,8 +4319,19 @@ func parseFlexibleExpireTime(raw string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid expire time format")
 }
 
+func (s *Server) tunnelLineEnabled(lineID uint64) bool {
+	if lineID == 0 {
+		return true
+	}
+	var line model.TunnelLine
+	if err := s.db.Select("id, enabled").First(&line, lineID).Error; err != nil {
+		return false
+	}
+	return line.Enabled
+}
+
 // resumeUserQuotaExceededRules automatically resumes any `quota_exceeded` rules of the user when the user's account
-// is active, not expired, under quota, and permitted on the rule's tunnel and port range.
+// is active, not expired, under quota, and permitted on an enabled tunnel and valid port range.
 func (s *Server) resumeUserQuotaExceededRules(u *model.User) {
 	if !u.CanForward(time.Now()) {
 		return
@@ -3429,7 +4339,7 @@ func (s *Server) resumeUserQuotaExceededRules(u *model.User) {
 	var rules []model.ForwardRule
 	s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
 	for i := range rules {
-		if !u.HasTunnelPermission(rules[i].TunnelLineID) || s.resumeBlockedByPort(&rules[i]) {
+		if !u.HasTunnelPermission(rules[i].TunnelLineID) || !s.tunnelLineEnabled(rules[i].TunnelLineID) || s.resumeBlockedByPort(&rules[i]) {
 			continue
 		}
 		rules[i].Enabled = true
@@ -3540,8 +4450,14 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 	if maxRules <= 0 {
 		maxRules = 20
 	}
+	if maxRules > 100000 {
+		maxRules = 100000
+	}
 	if speed <= 0 {
 		speed = 100
+	}
+	if speed > 100000 {
+		speed = 100000
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -3568,6 +4484,7 @@ func (s *Server) handleAdminCreateUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建用户失败，请检查参数"})
 		return
 	}
+	s.recordAudit(c, "admin.create_user", u.Email, fmt.Sprintf("创建用户 #%d (role=%s)", u.ID, u.Role))
 	c.JSON(http.StatusCreated, u)
 }
 
@@ -3577,6 +4494,15 @@ func (s *Server) handleAdminDeleteUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除当前登录的管理员账号"})
 		return
 	}
+	var target model.User
+	if err := s.db.First(&target, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	if target.Role == "admin" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不能直接删除管理员账号，请先降级为普通用户"})
+		return
+	}
 	var rules []model.ForwardRule
 	s.db.Where("user_id = ?", id).Find(&rules)
 	for i := range rules {
@@ -3584,6 +4510,7 @@ func (s *Server) handleAdminDeleteUser(c *gin.Context) {
 	}
 	s.db.Where("user_id = ?", id).Delete(&model.ForwardRule{})
 	s.db.Delete(&model.User{}, id)
+	s.recordAudit(c, "admin.delete_user", target.Email, fmt.Sprintf("删除用户 #%d 及其 %d 条转发规则", target.ID, len(rules)))
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 
@@ -3676,18 +4603,28 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 		u.QuotaBytes = req.QuotaBytes
 	}
 	if req.MaxRules > 0 {
+		if req.MaxRules > 100000 {
+			req.MaxRules = 100000
+		}
 		u.MaxRules = req.MaxRules
 	}
 	if req.SpeedMbps > 0 {
+		if req.SpeedMbps > 100000 {
+			req.SpeedMbps = 100000
+		}
 		u.SpeedMbps = req.SpeedMbps
 	}
 	if req.MonthlyReset != nil {
 		u.MonthlyReset = *req.MonthlyReset
 	}
-	// used_bytes / balance_cents / token_version / quota_bytes / expire_at / password_hash / sub_token change concurrently
-	// (traffic reports, purchases, redeems, password changes, sub token resets): save the profile without them and only
+	// used_bytes / balance_cents / token_version / quota_bytes / expire_at / password_hash / sub_token / totp_* change concurrently
+	// (traffic reports, purchases, redeems, password changes, 2FA setup, sub token resets): save the profile without them and only
 	// write them explicitly when the admin actually set them.
-	s.db.Omit("used_bytes", "balance_cents", "token_version", "quota_bytes", "expire_at", "password_hash", "sub_token").Save(&u)
+	s.db.Omit(
+		"used_bytes", "balance_cents", "token_version", "quota_bytes", "expire_at", "password_hash", "sub_token",
+		"totp_secret", "totp_enabled", "last_totp_step",
+		"invite_code", "invited_by", "commission_balance_cents", "total_commission_cents", "commissioned_recharge_cents",
+	).Save(&u)
 	explicit := map[string]any{}
 	if req.Password != "" {
 		explicit["password_hash"] = u.PasswordHash
@@ -3726,6 +4663,7 @@ func (s *Server) handleAdminUpdateUser(c *gin.Context) {
 	} else {
 		s.resumeUserQuotaExceededRules(&u)
 	}
+	s.recordAudit(c, "admin.update_user", u.Email, fmt.Sprintf("更新用户 #%d (status=%s, role=%s)", u.ID, u.Status, u.Role))
 	c.JSON(http.StatusOK, u)
 }
 
@@ -3760,7 +4698,9 @@ func (s *Server) handleAdminResetUserSubscription(c *gin.Context) {
 		DurationDays  int  `json:"duration_days"`
 		ResetSubToken bool `json:"reset_sub_token"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
 	if req.DurationDays < 0 || req.DurationDays > 36500 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "有效天数需在 1-36500 之间"})
 		return
@@ -3838,7 +4778,9 @@ func (s *Server) handleAdminResetUserPassword(c *gin.Context) {
 	var req struct {
 		Password string `json:"password"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if !bindOptionalJSON(c, &req) {
+		return
+	}
 	newPassword := strings.TrimSpace(req.Password)
 	generated := false
 	if newPassword == "" {
@@ -3912,12 +4854,16 @@ func (s *Server) handleAdminListRedeemCodes(c *gin.Context) {
 		q = q.Where("used_by > 0")
 	}
 	if keyword != "" {
-		like := "%" + keyword + "%"
-		q = q.Where("code LIKE ? OR note LIKE ?", like, like)
+		like := buildSafeLike(keyword)
+		q = q.Where("(code LIKE ? ESCAPE '!' OR note LIKE ? ESCAPE '!')", like, like)
 	}
 
+	var total int64
+	q.Count(&total)
+	page, pageSize, pagedEnvelope := parseListPagination(c, 500, 1000)
+
 	var codes []model.RedeemCode
-	if err := q.Order("id desc").Limit(500).Find(&codes).Error; err != nil {
+	if err := q.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&codes).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "加载兑换码列表失败"})
 		return
 	}
@@ -3930,14 +4876,18 @@ func (s *Server) handleAdminListRedeemCodes(c *gin.Context) {
 			planMap[p.ID] = p.Name
 		}
 
-		userIDs := make([]uint64, 0)
+		userIDSet := make(map[uint64]struct{})
 		for _, rc := range codes {
 			if rc.UsedBy > 0 {
-				userIDs = append(userIDs, rc.UsedBy)
+				userIDSet[rc.UsedBy] = struct{}{}
 			}
 		}
-		userMap := make(map[uint64]string)
-		if len(userIDs) > 0 {
+		userMap := make(map[uint64]string, len(userIDSet))
+		if len(userIDSet) > 0 {
+			userIDs := make([]uint64, 0, len(userIDSet))
+			for id := range userIDSet {
+				userIDs = append(userIDs, id)
+			}
 			var users []model.User
 			s.db.Select("id, email").Where("id IN ?", userIDs).Find(&users)
 			for _, u := range users {
@@ -3955,7 +4905,7 @@ func (s *Server) handleAdminListRedeemCodes(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, codes)
+	respondListPayload(c, codes, total, page, pageSize, pagedEnvelope)
 }
 
 func (s *Server) handleAdminGenerateRedeem(c *gin.Context) {
@@ -4107,20 +5057,24 @@ func (s *Server) handleAdminBatchDeleteRedeemCodes(c *gin.Context) {
 }
 
 func (s *Server) handleAdminListAuditLogs(c *gin.Context) {
-	query := s.db.Model(&model.AuditLog{}).Order("id desc")
+	query := s.db.Model(&model.AuditLog{})
 	if act := strings.TrimSpace(c.Query("action")); act != "" {
 		query = query.Where("action = ?", act)
 	}
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
-		like := "%" + q + "%"
-		query = query.Where("(user_email LIKE ? OR target LIKE ? OR detail LIKE ? OR client_ip LIKE ?)", like, like, like, like)
+		like := buildSafeLike(q)
+		query = query.Where("(user_email LIKE ? ESCAPE '!' OR target LIKE ? ESCAPE '!' OR detail LIKE ? ESCAPE '!' OR client_ip LIKE ? ESCAPE '!')", like, like, like, like)
 	}
+	var total int64
+	query.Count(&total)
+
+	page, pageSize, pagedEnvelope := parseListPagination(c, 200, 500)
 	var logs []model.AuditLog
-	if err := query.Limit(200).Find(&logs).Error; err != nil {
+	if err := query.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&logs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "查询审计日志失败"})
 		return
 	}
-	c.JSON(http.StatusOK, logs)
+	respondListPayload(c, logs, total, page, pageSize, pagedEnvelope)
 }
 
 func (s *Server) handleAdminBackupSQLite(c *gin.Context) {

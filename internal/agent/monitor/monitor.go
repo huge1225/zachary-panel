@@ -133,9 +133,14 @@ func parseMemKB(line string) uint64 {
 	return 0
 }
 
+const maxProbeTargets = 32
+
 // ProbeTargets measures TCP handshake latency in milliseconds to each target address (-1 on timeout/error).
 // It enforces Anti-SSRF validation so users cannot use the panel probe feature to scan the Agent host's internal ports.
 func ProbeTargets(targets []string, allowPrivate bool) map[string]int {
+	if len(targets) > maxProbeTargets {
+		targets = targets[:maxProbeTargets]
+	}
 	results := make(map[string]int, len(targets))
 	for _, target := range targets {
 		start := time.Now()

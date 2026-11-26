@@ -114,7 +114,11 @@ func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) erro
 	g.procs[key] = proc
 	g.mu.Unlock()
 
-	sharedPortCounter.TrackPort(key, spec.ListenPort)
+	acctProto := "tcp"
+	if spec.Role == protocol.RoleEgress && spec.Tunnel != nil && gostTunnelTransport(spec.Tunnel.Transport) == "quic" {
+		acctProto = "udp"
+	}
+	sharedPortCounter.TrackPort(key, spec.ListenPort, acctProto)
 	go g.superviseProcess(procCtx, key, proc)
 
 	log.Printf("[GostEngine] Started gost process (PID %d) for rule %s on port %d", cmd.Process.Pid, key, spec.ListenPort)

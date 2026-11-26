@@ -191,6 +191,35 @@ prompt_line() {
   printf -v "${out_var}" '%s' "${ans}"
 }
 
+prompt_secret() {
+  local prompt_text="$1"
+  local default_val="${2:-}"
+  local out_var="$3"
+  if [[ "${NON_INTERACTIVE}" == "true" || -z "${PROMPT_FD}" ]]; then
+    printf -v "${out_var}" '%s' "${default_val}"
+    return 0
+  fi
+  local ans=""
+  printf "  %s: " "${prompt_text}"
+  if [[ -t "${PROMPT_FD}" ]]; then
+    if ! IFS= read -r -s -u "${PROMPT_FD}" ans; then
+      ans=""
+    fi
+    echo ""
+  else
+    if ! IFS= read -r -u "${PROMPT_FD}" ans; then
+      ans=""
+    fi
+    echo ""
+  fi
+  ans="${ans#"${ans%%[![:space:]]*}"}"
+  ans="${ans%"${ans##*[![:space:]]}"}"
+  if [[ -z "${ans}" ]]; then
+    ans="${default_val}"
+  fi
+  printf -v "${out_var}" '%s' "${ans}"
+}
+
 # Generate 16-char alphanumeric CSPRNG password (safe in all env files without special shell/compose characters)
 generate_random_password() {
   local pw=""
@@ -236,6 +265,37 @@ validate_email() {
   [[ "${e}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || [[ "${e}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]
 }
 
+unescape_env_quoted() {
+  local s="$1" out="" i=0 ch
+  local len=${#s}
+  while (( i < len )); do
+    ch="${s:i:1}"
+    if [[ "${ch}" == "\\" ]] && (( i + 1 < len )); then
+      out+="${s:i+1:1}"
+      (( i += 2 ))
+    else
+      out+="${ch}"
+      (( i += 1 ))
+    fi
+  done
+  printf '%s' "${out}"
+}
+
+quote_systemd_env() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  printf '"%s"' "${v}"
+}
+
+quote_compose_env() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  v="${v//\$/\$\$}"
+  printf '"%s"' "${v}"
+}
+
 # Safe loader for KEY=VALUE files without executing shell code
 load_env_file() {
   local file="$1"
@@ -249,6 +309,11 @@ load_env_file() {
       key="${key#"${key%%[![:space:]]*}"}"
       key="${key%"${key##*[![:space:]]}"}"
       if [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        if [[ "${val}" == \"*\" && ${#val} -ge 2 ]]; then
+          val="$(unescape_env_quoted "${val:1:${#val}-2}")"
+        elif [[ "${val}" == \'*\' && ${#val} -ge 2 ]]; then
+          val="${val:1:${#val}-2}"
+        fi
         export "${key}=${val}"
       fi
     fi
@@ -445,8 +510,12 @@ handle_lifecycle_action() {
             sleep 1
           fi
           load_env_file "${REPO_ROOT}/.panel.env"
-          nohup "${REPO_ROOT}/bin/nexus-master" >>"${REPO_ROOT}/panel.log" 2>&1 &
-          echo $! > "${REPO_ROOT}/panel.pid"
+          (
+            umask 077
+            nohup "${REPO_ROOT}/bin/nexus-master" >>"${REPO_ROOT}/panel.log" 2>&1 &
+            echo $! > "${REPO_ROOT}/panel.pid"
+          )
+          chmod 0600 "${REPO_ROOT}/panel.log" "${REPO_ROOT}/panel.pid" 2>/dev/null || true
           ok "本地面板已重启 (PID=$(cat "${REPO_ROOT}/panel.pid"))"
           ;;
       esac
@@ -628,7 +697,7 @@ if [[ -z "${DB_DSN}" ]]; then
         prompt_line "PostgreSQL 主机地址" "127.0.0.1" pg_host
         prompt_line "PostgreSQL 端口" "5432" pg_port
         prompt_line "PostgreSQL 用户名" "zachary" pg_user
-        prompt_line "PostgreSQL 密码" "" pg_pass
+        prompt_secret "PostgreSQL 密码" "" pg_pass
         prompt_line "PostgreSQL 数据库名" "zachary_panel" pg_db
         prompt_line "PostgreSQL SSL 模式 (disable/require)" "disable" pg_ssl
         DB_DSN="host=${pg_host} user=${pg_user} password=${pg_pass} dbname=${pg_db} port=${pg_port} sslmode=${pg_ssl}"
@@ -641,7 +710,7 @@ if [[ -z "${DB_DSN}" ]]; then
         prompt_line "MySQL 主机地址" "127.0.0.1" my_host
         prompt_line "MySQL 端口" "3306" my_port
         prompt_line "MySQL 用户名" "zachary" my_user
-        prompt_line "MySQL 密码" "" my_pass
+        prompt_secret "MySQL 密码" "" my_pass
         prompt_line "MySQL 数据库名" "zachary_panel" my_db
         DB_DSN="${my_user}:${my_pass}@tcp(${my_host}:${my_port})/${my_db}?charset=utf8mb4&parseTime=True&loc=Local"
       else
@@ -668,7 +737,7 @@ assert_no_control_chars "ADMIN_EMAIL" "${ADMIN_EMAIL}"
 PASSWORD_GENERATED="false"
 if [[ -z "${ADMIN_PASSWORD}" ]]; then
   if [[ "${NON_INTERACTIVE}" != "true" ]]; then
-    prompt_line "管理员初始密码 (8-72位，直接回车将自动生成16位随机强密码)" "" ADMIN_PASSWORD
+    prompt_secret "管理员初始密码 (8-72位，直接回车将自动生成16位随机强密码)" "" ADMIN_PASSWORD
   fi
   if [[ -z "${ADMIN_PASSWORD}" ]]; then
     ADMIN_PASSWORD="$(generate_random_password)"
@@ -687,12 +756,12 @@ if [[ -z "${TRUSTED_PROXIES}" || -z "${ALLOW_PRIVATE_TARGETS}" || -z "${SEED_DEM
     echo "${C_BOLD}[进度 5/6] 配置安全与高级选项${C_RESET}"
   fi
   if [[ -z "${TRUSTED_PROXIES}" ]]; then
-    if [[ "${MODE}" == "docker" ]]; then
-      default_proxies="172.16.0.0/12,127.0.0.1/32"
-    else
+    if [[ "${BIND_HOST}" == "127.0.0.1" ]]; then
       default_proxies="127.0.0.1/32"
+    else
+      default_proxies=""
     fi
-    prompt_line "受信任反向代理 IP/CIDR (逗号分隔)" "${default_proxies}" TRUSTED_PROXIES
+    prompt_line "受信任反向代理 IP/CIDR (逗号分隔，直连暴露建议留空)" "${default_proxies}" TRUSTED_PROXIES
   fi
   if [[ -z "${ALLOW_PRIVATE_TARGETS}" ]]; then
     prompt_line "是否允许转发规则目标为内网私有地址? (y/N)" "N" priv_ans
@@ -730,7 +799,7 @@ if [[ "${NON_INTERACTIVE}" != "true" ]]; then
   else
     echo "  管理员初始密码   : ******** (自定义已设置)"
   fi
-  echo "  受信任反向代理   : ${TRUSTED_PROXIES}"
+  echo "  受信任反向代理   : ${TRUSTED_PROXIES:-<无 (不信任代理头)>}"
   echo "  允许内网转发目标 : ${ALLOW_PRIVATE_TARGETS}"
   echo "  生成演示数据     : ${SEED_DEMO}"
   echo "  ----------------------------------------------------------"
@@ -741,30 +810,26 @@ if [[ "${NON_INTERACTIVE}" != "true" ]]; then
   fi
 fi
 
-umask 077
-
 # ==============================================================================
 # Execute Deployment by Mode
 # ==============================================================================
 case "${MODE}" in
   docker)
     detect_compose_cmd || die "未检测到 docker compose，请先安装 Docker 与 Docker Compose 插件"
+    umask 077
     ENV_FILE="${REPO_ROOT}/deploy/.env"
-    # Escape '$' as '$$' for docker compose .env interpolation safety
-    esc_dsn="${DB_DSN//\$/\$\$}"
-    esc_pw="${ADMIN_PASSWORD//\$/\$\$}"
     cat > "${ENV_FILE}" <<EOF
-NEXUS_BIND_HOST=${BIND_HOST}
-NEXUS_PORT=${PORT}
-NEXUS_LISTEN=:8080
-NEXUS_DB_DRIVER=${DB_DRIVER}
-NEXUS_DB_DSN=${esc_dsn}
-NEXUS_PUBLIC_URL=${PUBLIC_URL}
-NEXUS_TRUSTED_PROXIES=${TRUSTED_PROXIES}
-NEXUS_ADMIN_EMAIL=${ADMIN_EMAIL}
-NEXUS_ADMIN_PASSWORD=${esc_pw}
-NEXUS_ALLOW_PRIVATE_TARGETS=${ALLOW_PRIVATE_TARGETS}
-NEXUS_SEED_DEMO=${SEED_DEMO}
+NEXUS_BIND_HOST=$(quote_compose_env "${BIND_HOST}")
+NEXUS_PORT=$(quote_compose_env "${PORT}")
+NEXUS_LISTEN=":8080"
+NEXUS_DB_DRIVER=$(quote_compose_env "${DB_DRIVER}")
+NEXUS_DB_DSN=$(quote_compose_env "${DB_DSN}")
+NEXUS_PUBLIC_URL=$(quote_compose_env "${PUBLIC_URL}")
+NEXUS_TRUSTED_PROXIES=$(quote_compose_env "${TRUSTED_PROXIES}")
+NEXUS_ADMIN_EMAIL=$(quote_compose_env "${ADMIN_EMAIL}")
+NEXUS_ADMIN_PASSWORD=$(quote_compose_env "${ADMIN_PASSWORD}")
+NEXUS_ALLOW_PRIVATE_TARGETS=$(quote_compose_env "${ALLOW_PRIVATE_TARGETS}")
+NEXUS_SEED_DEMO=$(quote_compose_env "${SEED_DEMO}")
 EOF
     chmod 0600 "${ENV_FILE}"
     info "已写入容器配置文件 ${ENV_FILE} (权限 0600)"
@@ -778,26 +843,29 @@ EOF
     build_binaries_and_web
     sync_systemd_assets
 
+    umask 077
     install -d -m 0700 -o root -g root /etc/zachary-panel
     JWT_KEY="$(generate_random_hex32)"
     if [[ -f /etc/zachary-panel/panel.env ]]; then
       existing_jwt="$(grep '^NEXUS_JWT_SECRET=' /etc/zachary-panel/panel.env | head -n1 | cut -d= -f2- || true)"
+      existing_jwt="${existing_jwt#\"}"
+      existing_jwt="${existing_jwt%\"}"
       [[ ${#existing_jwt} -ge 32 ]] && JWT_KEY="${existing_jwt}"
     fi
     cat > /etc/zachary-panel/panel.env <<EOF
-NEXUS_LISTEN=${BIND_HOST}:${PORT}
-NEXUS_DB_DRIVER=${DB_DRIVER}
-NEXUS_DB_DSN=${DB_DSN}
-NEXUS_DATA_DIR=/var/lib/zachary-panel
-NEXUS_STATIC_DIR=/var/lib/zachary-panel/static
-NEXUS_WEB_DIR=/var/lib/zachary-panel/web
-NEXUS_PUBLIC_URL=${PUBLIC_URL}
-NEXUS_TRUSTED_PROXIES=${TRUSTED_PROXIES}
-NEXUS_ADMIN_EMAIL=${ADMIN_EMAIL}
-NEXUS_ADMIN_PASSWORD=${ADMIN_PASSWORD}
-NEXUS_JWT_SECRET=${JWT_KEY}
-NEXUS_ALLOW_PRIVATE_TARGETS=${ALLOW_PRIVATE_TARGETS}
-NEXUS_SEED_DEMO=${SEED_DEMO}
+NEXUS_LISTEN=$(quote_systemd_env "${BIND_HOST}:${PORT}")
+NEXUS_DB_DRIVER=$(quote_systemd_env "${DB_DRIVER}")
+NEXUS_DB_DSN=$(quote_systemd_env "${DB_DSN}")
+NEXUS_DATA_DIR="/var/lib/zachary-panel"
+NEXUS_STATIC_DIR="/var/lib/zachary-panel/static"
+NEXUS_WEB_DIR="/var/lib/zachary-panel/web"
+NEXUS_PUBLIC_URL=$(quote_systemd_env "${PUBLIC_URL}")
+NEXUS_TRUSTED_PROXIES=$(quote_systemd_env "${TRUSTED_PROXIES}")
+NEXUS_ADMIN_EMAIL=$(quote_systemd_env "${ADMIN_EMAIL}")
+NEXUS_ADMIN_PASSWORD=$(quote_systemd_env "${ADMIN_PASSWORD}")
+NEXUS_JWT_SECRET=$(quote_systemd_env "${JWT_KEY}")
+NEXUS_ALLOW_PRIVATE_TARGETS=$(quote_systemd_env "${ALLOW_PRIVATE_TARGETS}")
+NEXUS_SEED_DEMO=$(quote_systemd_env "${SEED_DEMO}")
 EOF
     chmod 0600 /etc/zachary-panel/panel.env
 
@@ -839,23 +907,24 @@ UNITEOF
 
   local)
     build_binaries_and_web
+    umask 077
     mkdir -p "${REPO_ROOT}/data"
     chmod 0700 "${REPO_ROOT}/data"
 
     ENV_FILE="${REPO_ROOT}/.panel.env"
     cat > "${ENV_FILE}" <<EOF
-NEXUS_LISTEN=${BIND_HOST}:${PORT}
-NEXUS_DB_DRIVER=${DB_DRIVER}
-NEXUS_DB_DSN=${DB_DSN}
-NEXUS_DATA_DIR=${REPO_ROOT}/data
-NEXUS_STATIC_DIR=${REPO_ROOT}/deploy
-NEXUS_WEB_DIR=${REPO_ROOT}/web/dist
-NEXUS_PUBLIC_URL=${PUBLIC_URL}
-NEXUS_TRUSTED_PROXIES=${TRUSTED_PROXIES}
-NEXUS_ADMIN_EMAIL=${ADMIN_EMAIL}
-NEXUS_ADMIN_PASSWORD=${ADMIN_PASSWORD}
-NEXUS_ALLOW_PRIVATE_TARGETS=${ALLOW_PRIVATE_TARGETS}
-NEXUS_SEED_DEMO=${SEED_DEMO}
+NEXUS_LISTEN=$(quote_systemd_env "${BIND_HOST}:${PORT}")
+NEXUS_DB_DRIVER=$(quote_systemd_env "${DB_DRIVER}")
+NEXUS_DB_DSN=$(quote_systemd_env "${DB_DSN}")
+NEXUS_DATA_DIR=$(quote_systemd_env "${REPO_ROOT}/data")
+NEXUS_STATIC_DIR=$(quote_systemd_env "${REPO_ROOT}/deploy")
+NEXUS_WEB_DIR=$(quote_systemd_env "${REPO_ROOT}/web/dist")
+NEXUS_PUBLIC_URL=$(quote_systemd_env "${PUBLIC_URL}")
+NEXUS_TRUSTED_PROXIES=$(quote_systemd_env "${TRUSTED_PROXIES}")
+NEXUS_ADMIN_EMAIL=$(quote_systemd_env "${ADMIN_EMAIL}")
+NEXUS_ADMIN_PASSWORD=$(quote_systemd_env "${ADMIN_PASSWORD}")
+NEXUS_ALLOW_PRIVATE_TARGETS=$(quote_systemd_env "${ALLOW_PRIVATE_TARGETS}")
+NEXUS_SEED_DEMO=$(quote_systemd_env "${SEED_DEMO}")
 EOF
     chmod 0600 "${ENV_FILE}"
 
@@ -883,7 +952,11 @@ echo "${C_GREEN}${C_BOLD}=======================================================
 echo "  部署模式       : ${MODE}"
 echo "  访问地址       : ${DISPLAY_URL}"
 echo "  管理员账号     : ${ADMIN_EMAIL}"
-echo "  管理员初始密码 : ${ADMIN_PASSWORD}"
+if [[ "${PASSWORD_GENERATED}" == "true" ]]; then
+  echo "  管理员初始密码 : ${ADMIN_PASSWORD} (自动生成，请立即妥善保存)"
+else
+  echo "  管理员初始密码 : ******** (您设置的初始密码)"
+fi
 echo "  (请登录后点击右上角「修改密码」妥善更新密码；若数据库已存在管理员账号，则保持原密码不变)"
 echo ""
 echo "  常用一键运维命令:"

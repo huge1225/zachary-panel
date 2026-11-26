@@ -30,6 +30,7 @@ COPY --from=go-builder /out/nexus-agent-linux-amd64 /app/static/releases/nexus-a
 COPY --from=go-builder /out/nexus-agent-linux-arm64 /app/static/releases/nexus-agent-linux-arm64
 COPY --from=web-builder /build/web/dist /app/web/dist
 COPY deploy/install-agent.sh /app/static/install-agent.sh
+RUN chmod -R a+rX /app/static /app/web && chmod 0755 /app/nexus-master /app/static/install-agent.sh
 
 ENV NEXUS_LISTEN=:8080 \
     NEXUS_DB_DRIVER=sqlite \

@@ -68,17 +68,23 @@ func init() {
 
 // Policy configures the Agent's local security policy.
 type Policy struct {
-	AllowPrivateTargets bool // False in production to block SSRF to local/LAN/Cloud metadata IPs
-	MinListenPort       int  // Default 1024 (never bind privileged ports)
-	MaxListenPort       int  // Default 65535
-	MaxConnsPerClientIP int  // Per-source-IP concurrent connection cap
+	AllowPrivateTargets   bool // False in production to block SSRF to local/LAN/Cloud metadata IPs
+	MinListenPort         int  // Default 1024 (never bind privileged ports)
+	MaxListenPort         int  // Default 65535
+	MaxConnsPerClientIP   int  // Per-source-IP concurrent TCP connection cap
+	MaxUDPSessionsPerRule int  // Per-rule concurrent UDP session cap (default 2048)
+	MaxUDPSessionsGlobal  int  // Node-wide concurrent UDP session cap across all rules (default 8192)
+	MaxUDPSessionsPerIP   int  // Per-source-IP concurrent UDP session cap (default 64)
 }
 
 var DefaultPolicy = Policy{
-	AllowPrivateTargets: false,
-	MinListenPort:       1024,
-	MaxListenPort:       65535,
-	MaxConnsPerClientIP: 256,
+	AllowPrivateTargets:   false,
+	MinListenPort:         1024,
+	MaxListenPort:         65535,
+	MaxConnsPerClientIP:   256,
+	MaxUDPSessionsPerRule: 2048,
+	MaxUDPSessionsGlobal:  8192,
+	MaxUDPSessionsPerIP:   64,
 }
 
 // ValidateListenPort ensures a rule does not bind privileged or critical host service ports.
@@ -250,6 +256,17 @@ func embeddedIPv4(ip net.IP) net.IP {
 
 // ValidateRuleSpec performs a comprehensive security audit on a RuleSpec before any EngineDriver executes it.
 func ValidateRuleSpec(spec protocol.RuleSpec, policy Policy) error {
+	switch spec.Role {
+	case "", protocol.RoleRelay, protocol.RoleIngress, protocol.RoleEgress:
+	default:
+		return fmt.Errorf("security violation: invalid rule role %q", spec.Role)
+	}
+	if spec.ListenHost != "" {
+		cleanHost := strings.Trim(strings.TrimSpace(spec.ListenHost), "[]")
+		if net.ParseIP(cleanHost) == nil {
+			return fmt.Errorf("security violation: listen_host %q must be a literal IP address", spec.ListenHost)
+		}
+	}
 	if err := ValidateListenPort(spec.ListenPort, policy); err != nil {
 		return err
 	}

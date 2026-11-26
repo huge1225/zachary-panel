@@ -339,12 +339,13 @@ func TestP2TOTP2FAAndAdminAPIKey(t *testing.T) {
 		t.Fatalf("expected 400 enabling TOTP with invalid code, got %d", wBadEnable.Code)
 	}
 
-	// 3. Enable TOTP with valid computed code
-	validCode, err := ComputeTOTPCode(setupResp.Secret, time.Now())
+	// 3. Enable TOTP with valid computed code from previous 30s window (-30s, accepted within ±1 step skew)
+	now := time.Now()
+	enableCode, err := ComputeTOTPCode(setupResp.Secret, now.Add(-30*time.Second))
 	if err != nil {
-		t.Fatalf("ComputeTOTPCode failed: %v", err)
+		t.Fatalf("ComputeTOTPCode(enable) failed: %v", err)
 	}
-	goodCodeBody, _ := json.Marshal(map[string]string{"code": validCode})
+	goodCodeBody, _ := json.Marshal(map[string]string{"code": enableCode})
 	reqEnable := httptest.NewRequest(http.MethodPost, "/api/v1/user/totp/enable", bytes.NewReader(goodCodeBody))
 	reqEnable.Header.Set("Authorization", "Bearer "+adminToken)
 	reqEnable.Header.Set("Content-Type", "application/json")
@@ -353,6 +354,19 @@ func TestP2TOTP2FAAndAdminAPIKey(t *testing.T) {
 	if wEnable.Code != http.StatusOK {
 		t.Fatalf("expected 200 enabling TOTP, got %d: %s", wEnable.Code, wEnable.Body.String())
 	}
+	renewedTok := wEnable.Header().Get("X-Renewed-Token")
+	if renewedTok == "" {
+		t.Fatalf("expected X-Renewed-Token header on TOTP enablement")
+	}
+	// Pre-2FA JWT must now be rejected immediately (token_version incremented)
+	reqStale := httptest.NewRequest(http.MethodGet, "/api/v1/user/profile", nil)
+	reqStale.Header.Set("Authorization", "Bearer "+adminToken)
+	wStale := httptest.NewRecorder()
+	r.ServeHTTP(wStale, reqStale)
+	if wStale.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 using pre-2FA token after enabling TOTP, got %d", wStale.Code)
+	}
+	adminToken = renewedTok
 
 	// 4. Login without TOTP code should return 401 with totp_required=true
 	loginNoCode, _ := json.Marshal(map[string]string{
@@ -368,7 +382,11 @@ func TestP2TOTP2FAAndAdminAPIKey(t *testing.T) {
 		t.Fatalf("expected 401 totp_required, got %d: %s", wLoginNoCode.Code, wLoginNoCode.Body.String())
 	}
 
-	// 5. Login with valid TOTP code should succeed
+	// 5. Login with current 30s window TOTP code should succeed once, and replaying the same code must return 401
+	validCode, err := ComputeTOTPCode(setupResp.Secret, now)
+	if err != nil {
+		t.Fatalf("ComputeTOTPCode(login) failed: %v", err)
+	}
 	loginWithCode, _ := json.Marshal(map[string]string{
 		"email":     "admin@nexus.local",
 		"password":  "admin123",
@@ -381,6 +399,15 @@ func TestP2TOTP2FAAndAdminAPIKey(t *testing.T) {
 	r.ServeHTTP(wLoginOK, reqLoginOK)
 	if wLoginOK.Code != http.StatusOK {
 		t.Fatalf("expected 200 login with TOTP code, got %d: %s", wLoginOK.Code, wLoginOK.Body.String())
+	}
+
+	reqReplay := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", bytes.NewReader(loginWithCode))
+	reqReplay.Header.Set("Content-Type", "application/json")
+	reqReplay.RemoteAddr = nextIP()
+	wReplay := httptest.NewRecorder()
+	r.ServeHTTP(wReplay, reqReplay)
+	if wReplay.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on TOTP same-step replay, got %d: %s", wReplay.Code, wReplay.Body.String())
 	}
 
 	// 6. Disable TOTP with current password and verify login without TOTP code works again

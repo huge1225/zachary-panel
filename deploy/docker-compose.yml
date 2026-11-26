@@ -14,8 +14,8 @@ services:
       - NEXUS_DB_DSN=${NEXUS_DB_DSN:-/data/nexus_panel.db}
       # 面板对外访问地址（生产建议使用 https://域名，用于生成 Agent 安装命令与 wss 控制通道；留空则按请求 Host 推断）
       - NEXUS_PUBLIC_URL=${NEXUS_PUBLIC_URL:-}
-      # 受信任的反向代理 IP/CIDR（逗号分隔）
-      - NEXUS_TRUSTED_PROXIES=${NEXUS_TRUSTED_PROXIES:-172.16.0.0/12,127.0.0.1/32}
+      # 受信任的反向代理 IP/CIDR（逗号分隔；若使用容器反代请按需显式填入反代容器/网桥 IP）
+      - NEXUS_TRUSTED_PROXIES=${NEXUS_TRUSTED_PROXIES-127.0.0.1/32}
       # 首次启动创建的管理员账号；不设置密码时会随机生成并仅在日志中打印一次
       - NEXUS_ADMIN_EMAIL=${NEXUS_ADMIN_EMAIL:-admin@nexus.local}
       - NEXUS_ADMIN_PASSWORD=${NEXUS_ADMIN_PASSWORD:-}

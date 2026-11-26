@@ -837,9 +837,9 @@
           </button>
 
           <div v-if="siteConfig.allow_register" style="text-align: center; font-size: 12.5px; color: var(--text-secondary);">
-            <a href="javascript:void(0)" @click="isRegisterMode = !isRegisterMode" style="color: var(--primary-text); text-decoration: none; font-weight: 500;">
+            <button type="button" @click="isRegisterMode = !isRegisterMode" style="background: none; border: none; padding: 0; cursor: pointer; color: var(--primary-text); font-weight: 500; font-size: inherit;">
               {{ isRegisterMode ? '已有账号？返回登录' : '没有账号？注册新账号' }}
-            </a>
+            </button>
           </div>
 
           <div style="border-top: 1px solid var(--border-color); padding-top: 14px; margin-top: 4px;">
@@ -3177,10 +3177,19 @@
           showToast(`成功批量导入 ${added} 条规则`)
         }
 
+        function sanitizePreviewExportField(raw) {
+          return String(raw ?? '')
+            .replace(/[\u0000-\u001f\u007f|\r\n]+/g, ' ')
+            .replace(/^[=+\-@\s]+/, '')
+            .trim()
+            .slice(0, 256)
+        }
+
         function exportRulesToClipboard() {
           const text = visibleRules.value.map(r => {
-            const firstTarget = parseTargets(r.targets_json)[0]?.address || ''
-            return `${r.name}|${r.listen_port}|${firstTarget}`
+            const firstTarget = sanitizePreviewExportField(parseTargets(r.targets_json)[0]?.address || '')
+            const safeName = sanitizePreviewExportField(r.name)
+            return `${safeName}|${Number(r.listen_port) || 0}|${firstTarget}`
           }).join('\n')
           copyConnectAddr(text)
           showToast(`已导出 ${visibleRules.value.length} 条规则到剪贴板`)
@@ -3696,7 +3705,7 @@
             node_name: node.name,
             systemd_install: `curl -fsSL ${scriptUrl} | sudo bash -s -- --master "${wsUrl}" --id ${node.id} --token "${tokenStr}"`,
             systemd_uninstall: `curl -fsSL ${scriptUrl} | sudo bash -s -- --uninstall`,
-            docker_install: `docker run -d --name nexus-agent --restart always --net=host --cap-add=NET_ADMIN ghcr.io/nexus-panel/agent:latest -master "${wsUrl}" -node-id ${node.id} -token "${tokenStr}" -report-interval 3s`,
+            docker_install: `docker run -d --name nexus-agent --restart always --net=host --cap-add=NET_ADMIN zachary-panel-agent:latest -master "${wsUrl}" -node-id ${node.id} -token "${tokenStr}" -report-interval 3s`,
             docker_uninstall: `docker stop nexus-agent && docker rm -f nexus-agent`,
           }
           showInstallModal.value = true

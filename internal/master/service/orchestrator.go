@@ -29,9 +29,42 @@ type Orchestrator struct {
 	allocMu sync.Mutex
 }
 
-// maxDeltaBytes caps a single reported traffic delta (per rule, per report window) to bound the impact of a
-// misbehaving Agent.
-const maxDeltaBytes int64 = 64 << 30 // 64 GiB
+// Traffic accounting safety ceilings: bound per-rule delta, per-report aggregate delta, and rate multiplier scaling
+// so a misbehaving or compromised Agent can never underflow/overflow int64 counters.
+const (
+	maxDeltaBytes        int64   = 10 << 30 // 10 GiB per rule per report window
+	maxReportWindowBytes int64   = 64 << 30 // 64 GiB aggregate across a single report frame
+	maxBilledDeltaBytes  int64   = 1 << 40  // 1 TiB ceiling after multiplier
+	maxRateMultiplier    float64 = 1000.0
+
+	// OrderExpireTimeout defines how long an unpaid pending BillingOrder remains payable before auto-closing.
+	OrderExpireTimeout = 30 * time.Minute
+)
+
+func sanitizeRateMultiplier(m float64) float64 {
+	if math.IsNaN(m) || math.IsInf(m, 0) || m <= 0 {
+		return 1.0
+	}
+	if m > maxRateMultiplier {
+		return maxRateMultiplier
+	}
+	return m
+}
+
+func safeScaleBytes(baseBytes int64, multiplier float64) int64 {
+	if baseBytes <= 0 {
+		return 0
+	}
+	m := sanitizeRateMultiplier(multiplier)
+	scaled := math.Round(float64(baseBytes) * m)
+	if math.IsNaN(scaled) || math.IsInf(scaled, 0) || scaled <= 0 {
+		return 0
+	}
+	if scaled >= float64(maxBilledDeltaBytes) {
+		return maxBilledDeltaBytes
+	}
+	return int64(scaled)
+}
 
 func NewOrchestrator(db *gorm.DB, agentHub *hub.AgentHub) *Orchestrator {
 	o := &Orchestrator{
@@ -280,9 +313,13 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 	var line model.TunnelLine
 	hasTunnelLine := false
 	if rule.TunnelLineID > 0 {
-		if err := o.db.First(&line, rule.TunnelLineID).Error; err == nil {
-			hasTunnelLine = true
+		if err := o.db.First(&line, rule.TunnelLineID).Error; err != nil {
+			return nil, 0, nil, fmt.Errorf("tunnel line %d not found", rule.TunnelLineID)
 		}
+		if !line.Enabled {
+			return nil, 0, nil, fmt.Errorf("tunnel line %d is disabled", rule.TunnelLineID)
+		}
+		hasTunnelLine = true
 	}
 
 	// Case 1: Single-node Direct Forwarding (专线/直连节点直接转发隧道 or standalone direct rule)
@@ -299,6 +336,7 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 			LoadBalance:    rule.LoadBalance,
 			Targets:        targets,
 			SpeedLimitMbps: speedLimit,
+			MaxConns:       8192,
 			AccessMode:     rule.AccessMode,
 			AccessCIDRs:    rule.AccessCIDRs,
 			UpdatedAt:      rule.UpdatedAt,
@@ -378,6 +416,7 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 		Targets:        targets,
 		Tunnel:         tunnelCfg,
 		SpeedLimitMbps: speedLimit,
+		MaxConns:       8192,
 		UpdatedAt:      rule.UpdatedAt,
 	}
 
@@ -397,6 +436,7 @@ func (o *Orchestrator) CompileRuleSpecs(rule *model.ForwardRule) (ingressSpec *p
 		},
 		Tunnel:         tunnelCfg,
 		SpeedLimitMbps: speedLimit,
+		MaxConns:       8192,
 		AccessMode:     rule.AccessMode,
 		AccessCIDRs:    rule.AccessCIDRs,
 		UpdatedAt:      rule.UpdatedAt,
@@ -448,13 +488,27 @@ func (o *Orchestrator) DispatchRule(rule *model.ForwardRule) {
 	}
 }
 
-// ownerMayRun reports whether the rule's owner may currently have this rule deployed.
+func (o *Orchestrator) tunnelLineEnabled(lineID uint64) bool {
+	if lineID == 0 {
+		return true
+	}
+	var line model.TunnelLine
+	if err := o.db.Select("id, enabled").First(&line, lineID).Error; err != nil {
+		return false
+	}
+	return line.Enabled
+}
+
+// ownerMayRun reports whether the rule's owner and bound tunnel line currently permit deploying this rule.
 func (o *Orchestrator) ownerMayRun(rule *model.ForwardRule) bool {
 	var u model.User
 	if err := o.db.First(&u, rule.UserID).Error; err != nil {
 		return false
 	}
-	return u.CanForward(time.Now()) && u.HasTunnelPermission(rule.TunnelLineID)
+	if !u.CanForward(time.Now()) || !u.HasTunnelPermission(rule.TunnelLineID) {
+		return false
+	}
+	return o.tunnelLineEnabled(rule.TunnelLineID)
 }
 
 // RemoveRuleFromAgents tears down a deleted rule from all involved Agents.
@@ -487,50 +541,93 @@ func (o *Orchestrator) SyncNodeRules(nodeID uint64, forceRestart ...bool) {
 	force := len(forceRestart) > 0 && forceRestart[0]
 	var specs []protocol.RuleSpec
 
-	// Never (re)deploy rules of banned / expired / over-quota accounts, whatever their rule status says.
-	now := time.Now()
-	canForward := map[uint64]bool{}
-	ownerOK := func(uid uint64) bool {
-		ok, seen := canForward[uid]
-		if !seen {
-			var u model.User
-			ok = o.db.First(&u, uid).Error == nil && u.CanForward(now)
-			canForward[uid] = ok
-		}
-		return ok
-	}
-
 	// 1. Rules where this node is the Ingress / Relay node
 	var ingressRules []model.ForwardRule
 	o.db.Where("ingress_node_id = ? AND enabled = ?", nodeID, true).Find(&ingressRules)
+
+	// 2. Rules where this node is the Egress node via a TunnelLine
+	var lines []model.TunnelLine
+	o.db.Where("egress_node_id = ? AND enabled = ?", nodeID, true).Find(&lines)
+	var tunnelRules []model.ForwardRule
+	if len(lines) > 0 {
+		lineIDs := make([]uint64, 0, len(lines))
+		for _, l := range lines {
+			lineIDs = append(lineIDs, l.ID)
+		}
+		o.db.Where("mode = 'tunnel' AND tunnel_line_id IN ? AND enabled = ?", lineIDs, true).Find(&tunnelRules)
+	}
+
+	// Batch preload bound tunnel lines for ingress rules so disabled lines are never pushed on reconnect/sync.
+	inLineSet := make(map[uint64]struct{})
 	for i := range ingressRules {
-		if !ownerOK(ingressRules[i].UserID) {
+		if ingressRules[i].TunnelLineID > 0 {
+			inLineSet[ingressRules[i].TunnelLineID] = struct{}{}
+		}
+	}
+	enabledLines := make(map[uint64]bool, len(inLineSet)+len(lines))
+	for _, l := range lines {
+		enabledLines[l.ID] = l.Enabled
+	}
+	if len(inLineSet) > 0 {
+		inLineIDs := make([]uint64, 0, len(inLineSet))
+		for lid := range inLineSet {
+			inLineIDs = append(inLineIDs, lid)
+		}
+		var fetchedLines []model.TunnelLine
+		o.db.Select("id, enabled").Where("id IN ?", inLineIDs).Find(&fetchedLines)
+		for _, l := range fetchedLines {
+			enabledLines[l.ID] = l.Enabled
+		}
+	}
+
+	// Batch preload owners for all candidate rules to avoid N+1 user queries during compilation & eligibility checks.
+	userIDSet := make(map[uint64]struct{}, len(ingressRules)+len(tunnelRules))
+	for i := range ingressRules {
+		userIDSet[ingressRules[i].UserID] = struct{}{}
+	}
+	for i := range tunnelRules {
+		userIDSet[tunnelRules[i].UserID] = struct{}{}
+	}
+	ownerMap := make(map[uint64]*model.User, len(userIDSet))
+	canForward := make(map[uint64]bool, len(userIDSet))
+	if len(userIDSet) > 0 {
+		uids := make([]uint64, 0, len(userIDSet))
+		for uid := range userIDSet {
+			uids = append(uids, uid)
+		}
+		var owners []model.User
+		o.db.Where("id IN ?", uids).Find(&owners)
+		now := time.Now()
+		for i := range owners {
+			ownerMap[owners[i].ID] = &owners[i]
+			canForward[owners[i].ID] = owners[i].CanForward(now)
+		}
+	}
+
+	for i := range ingressRules {
+		r := &ingressRules[i]
+		owner := ownerMap[r.UserID]
+		if owner == nil || !canForward[r.UserID] || !owner.HasTunnelPermission(r.TunnelLineID) {
 			continue
 		}
-		inSpec, _, _, err := o.CompileRuleSpecs(&ingressRules[i])
+		if r.TunnelLineID > 0 && !enabledLines[r.TunnelLineID] {
+			continue
+		}
+		inSpec, _, _, err := o.CompileRuleSpecs(r)
 		if err == nil && inSpec != nil {
 			specs = append(specs, *inSpec)
 		}
 	}
 
-	// 2. Rules where this node is the Egress node via a TunnelLine
-	var lines []model.TunnelLine
-	o.db.Where("egress_node_id = ? AND enabled = ?", nodeID, true).Find(&lines)
-	if len(lines) > 0 {
-		var lineIDs []uint64
-		for _, l := range lines {
-			lineIDs = append(lineIDs, l.ID)
+	for i := range tunnelRules {
+		r := &tunnelRules[i]
+		owner := ownerMap[r.UserID]
+		if owner == nil || !canForward[r.UserID] || !owner.HasTunnelPermission(r.TunnelLineID) {
+			continue
 		}
-		var tunnelRules []model.ForwardRule
-		o.db.Where("mode = 'tunnel' AND tunnel_line_id IN ? AND enabled = ?", lineIDs, true).Find(&tunnelRules)
-		for i := range tunnelRules {
-			if !ownerOK(tunnelRules[i].UserID) {
-				continue
-			}
-			_, _, egSpec, err := o.CompileRuleSpecs(&tunnelRules[i])
-			if err == nil && egSpec != nil {
-				specs = append(specs, *egSpec)
-			}
+		_, _, egSpec, err := o.CompileRuleSpecs(r)
+		if err == nil && egSpec != nil {
+			specs = append(specs, *egSpec)
 		}
 	}
 
@@ -548,31 +645,113 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 	if err := o.db.First(&node, nodeID).Error; err != nil {
 		return
 	}
+	if len(report.Deltas) == 0 {
+		return
+	}
 	if len(report.Deltas) > 10000 {
 		log.Printf("[Orchestrator] Dropped oversized traffic report from Node #%d (%d deltas)", nodeID, len(report.Deltas))
 		return
 	}
 
+	// Pre-collect unique rule IDs so we batch-fetch rules and tunnel lines in O(1) queries instead of N+1 per delta.
+	ruleIDSet := make(map[uint64]struct{}, len(report.Deltas))
+	for _, d := range report.Deltas {
+		if d.RuleID > 0 {
+			ruleIDSet[d.RuleID] = struct{}{}
+		}
+	}
+	if len(ruleIDSet) == 0 {
+		return
+	}
+	ruleIDs := make([]uint64, 0, len(ruleIDSet))
+	for id := range ruleIDSet {
+		ruleIDs = append(ruleIDs, id)
+	}
+	var fetchedRules []model.ForwardRule
+	o.db.Where("id IN ?", ruleIDs).Find(&fetchedRules)
+	ruleMap := make(map[uint64]*model.ForwardRule, len(fetchedRules))
+	lineIDSet := make(map[uint64]struct{})
+	for i := range fetchedRules {
+		r := &fetchedRules[i]
+		ruleMap[r.ID] = r
+		if r.TunnelLineID > 0 {
+			lineIDSet[r.TunnelLineID] = struct{}{}
+		}
+	}
+	lineMap := make(map[uint64]*model.TunnelLine, len(lineIDSet))
+	if len(lineIDSet) > 0 {
+		lineIDs := make([]uint64, 0, len(lineIDSet))
+		for lid := range lineIDSet {
+			lineIDs = append(lineIDs, lid)
+		}
+		var fetchedLines []model.TunnelLine
+		o.db.Where("id IN ?", lineIDs).Find(&fetchedLines)
+		for i := range fetchedLines {
+			lineMap[fetchedLines[i].ID] = &fetchedLines[i]
+		}
+	}
+
 	hourBucket := time.Now().Format("2006-01-02 15:00")
 	var nodeWindowBytes int64
+	seenRuleRoles := make(map[string]struct{}, len(report.Deltas))
+	userBilledTotals := make(map[uint64]int64)
 
 	for _, d := range report.Deltas {
-		// Reject negative / absurd values outright.
-		if d.UploadBytes < 0 || d.DownBytes < 0 || d.UploadBytes > maxDeltaBytes || d.DownBytes > maxDeltaBytes {
-			log.Printf("[Orchestrator] Dropped invalid traffic delta from Node #%d for rule #%d", nodeID, d.RuleID)
+		if d.RuleID == 0 {
 			continue
+		}
+		normRole := d.Role
+		if normRole == "" {
+			normRole = protocol.RoleRelay
+		}
+		roleKey := fmt.Sprintf("%d:%s", d.RuleID, normRole)
+		if _, dup := seenRuleRoles[roleKey]; dup {
+			log.Printf("[Orchestrator] Dropped duplicate traffic delta entry from Node #%d for %s", nodeID, roleKey)
+			continue
+		}
+		seenRuleRoles[roleKey] = struct{}{}
+
+		// Clamp negative or oversized per-window deltas to [0, maxDeltaBytes] so malformed values can never subtract
+		// usage or overflow int64, while genuine high-speed bursts are still billed up to the window cap.
+		if d.UploadBytes < 0 {
+			d.UploadBytes = 0
+		} else if d.UploadBytes > maxDeltaBytes {
+			log.Printf("[Orchestrator] Clamped oversized upload delta from Node #%d for rule #%d (%d -> %d)", nodeID, d.RuleID, d.UploadBytes, maxDeltaBytes)
+			d.UploadBytes = maxDeltaBytes
+		}
+		if d.DownBytes < 0 {
+			d.DownBytes = 0
+		} else if d.DownBytes > maxDeltaBytes {
+			log.Printf("[Orchestrator] Clamped oversized download delta from Node #%d for rule #%d (%d -> %d)", nodeID, d.RuleID, d.DownBytes, maxDeltaBytes)
+			d.DownBytes = maxDeltaBytes
 		}
 		rawTotal := d.UploadBytes + d.DownBytes
 		if rawTotal <= 0 {
 			continue
 		}
 
-		var rule model.ForwardRule
-		if err := o.db.First(&rule, d.RuleID).Error; err != nil {
+		if nodeWindowBytes+rawTotal > maxReportWindowBytes {
+			log.Printf("[Orchestrator] Capped oversized report window from Node #%d at %d bytes", nodeID, nodeWindowBytes)
+			break
+		}
+
+		rule, ok := ruleMap[d.RuleID]
+		if !ok {
 			continue
 		}
 		// Trust boundary: a node may only report traffic for rules it actually hosts in the reported role.
-		if !o.ruleOwnedBy(&rule, nodeID, d.Role) {
+		owned := false
+		switch d.Role {
+		case protocol.RoleEgress:
+			if rule.Mode == "tunnel" && rule.TunnelLineID > 0 {
+				if line, lOk := lineMap[rule.TunnelLineID]; lOk && line.EgressNodeID == nodeID {
+					owned = true
+				}
+			}
+		case protocol.RoleIngress, protocol.RoleRelay, "":
+			owned = rule.IngressNodeID == nodeID
+		}
+		if !owned {
 			log.Printf("[Orchestrator] Dropped out-of-scope traffic delta from Node #%d (rule #%d, role %q)", nodeID, d.RuleID, d.Role)
 			continue
 		}
@@ -583,16 +762,12 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 			continue
 		}
 
-		multiplier := node.TrafficRate
-		if multiplier <= 0 {
-			multiplier = 1.0
-		}
+		multiplier := sanitizeRateMultiplier(node.TrafficRate)
 		billingMode := "two_way"
 		if rule.TunnelLineID > 0 {
-			var line model.TunnelLine
-			if err := o.db.First(&line, rule.TunnelLineID).Error; err == nil {
+			if line, lOk := lineMap[rule.TunnelLineID]; lOk {
 				if line.RateMultiplier > 0 {
-					multiplier = line.RateMultiplier
+					multiplier = sanitizeRateMultiplier(line.RateMultiplier)
 				}
 				if line.BillingMode == "one_way" {
 					billingMode = "one_way"
@@ -608,10 +783,7 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 				baseBytes = d.UploadBytes
 			}
 		}
-		billed := int64(math.Round(float64(baseBytes) * multiplier))
-		if billed < 0 {
-			billed = 0
-		}
+		billed := safeScaleBytes(baseBytes, multiplier)
 
 		// Update ForwardRule counters
 		o.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Updates(map[string]any{
@@ -620,15 +792,17 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 			"billed_bytes": gorm.Expr("billed_bytes + ?", billed),
 		})
 
-		// Update User UsedBytes
-		o.db.Model(&model.User{}).Where("id = ?", rule.UserID).Update(
-			"used_bytes", gorm.Expr("used_bytes + ?", billed),
-		)
+		userBilledTotals[rule.UserID] += billed
 
-		// Upsert hourly traffic bucket
-		var stat model.TrafficHourlyStat
-		err := o.db.Where("user_id = ? AND rule_id = ? AND hour_bucket = ?", rule.UserID, rule.ID, hourBucket).First(&stat).Error
-		if err != nil {
+		// Upsert hourly traffic bucket using composite index idx_stat_user_rule_hour
+		res := o.db.Model(&model.TrafficHourlyStat{}).
+			Where("user_id = ? AND rule_id = ? AND hour_bucket = ?", rule.UserID, rule.ID, hourBucket).
+			Updates(map[string]any{
+				"upload_bytes": gorm.Expr("upload_bytes + ?", d.UploadBytes),
+				"down_bytes":   gorm.Expr("down_bytes + ?", d.DownBytes),
+				"billed_bytes": gorm.Expr("billed_bytes + ?", billed),
+			})
+		if res.Error == nil && res.RowsAffected == 0 {
 			o.db.Create(&model.TrafficHourlyStat{
 				UserID:      rule.UserID,
 				RuleID:      rule.ID,
@@ -638,19 +812,25 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 				DownBytes:   d.DownBytes,
 				BilledBytes: billed,
 			})
-		} else {
-			o.db.Model(&stat).Updates(map[string]any{
-				"upload_bytes": gorm.Expr("upload_bytes + ?", d.UploadBytes),
-				"down_bytes":   gorm.Expr("down_bytes + ?", d.DownBytes),
-				"billed_bytes": gorm.Expr("billed_bytes + ?", billed),
-			})
 		}
+	}
 
-		// Check if user quota is now exhausted
-		var user model.User
-		if err := o.db.First(&user, rule.UserID).Error; err == nil {
-			if !user.CanForward(time.Now()) {
-				o.EnforceUserQuotaCutoff(user.ID)
+	if len(userBilledTotals) > 0 {
+		touchedUIDs := make([]uint64, 0, len(userBilledTotals))
+		for uid, totalBilled := range userBilledTotals {
+			if totalBilled > 0 {
+				o.db.Model(&model.User{}).Where("id = ?", uid).Update(
+					"used_bytes", gorm.Expr("used_bytes + ?", totalBilled),
+				)
+			}
+			touchedUIDs = append(touchedUIDs, uid)
+		}
+		var touchedUsers []model.User
+		o.db.Where("id IN ?", touchedUIDs).Find(&touchedUsers)
+		now := time.Now()
+		for i := range touchedUsers {
+			if !touchedUsers[i].CanForward(now) {
+				o.EnforceUserQuotaCutoff(touchedUsers[i].ID)
 			}
 		}
 	}
@@ -666,6 +846,21 @@ func (o *Orchestrator) HandleTrafficReport(nodeID uint64, report protocol.Traffi
 			}
 		}
 	}
+}
+
+// CloseExpiredOrders automatically closes unpaid pending orders older than OrderExpireTimeout.
+func (o *Orchestrator) CloseExpiredOrders(now time.Time) int64 {
+	cutoff := now.Add(-OrderExpireTimeout)
+	res := o.db.Model(&model.BillingOrder{}).
+		Where("status = ? AND created_at < ?", "pending", cutoff).
+		Update("status", "cancelled")
+	if res.Error != nil {
+		return 0
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("[Orchestrator] Auto-closed %d expired unpaid orders (older than %s)", res.RowsAffected, OrderExpireTimeout)
+	}
+	return res.RowsAffected
 }
 
 // EnforceNodeQuotaCutoff pauses all active rules running on a node whose traffic quota has been exhausted.
@@ -748,7 +943,8 @@ func (o *Orchestrator) ResetNodeTraffic(nodeID uint64, now time.Time) int {
 	resumed := 0
 	for i := range rules {
 		var u model.User
-		if err := o.db.First(&u, rules[i].UserID).Error; err != nil || !u.CanForward(now) || !u.HasTunnelPermission(rules[i].TunnelLineID) {
+		if err := o.db.First(&u, rules[i].UserID).Error; err != nil || !u.CanForward(now) ||
+			!u.HasTunnelPermission(rules[i].TunnelLineID) || !o.tunnelLineEnabled(rules[i].TunnelLineID) {
 			continue
 		}
 		if res := o.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "node_quota_exceeded").
@@ -771,7 +967,7 @@ func (o *Orchestrator) ResumeUserQuotaRules(u *model.User, now time.Time) int {
 	o.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
 	resumed := 0
 	for i := range rules {
-		if !u.HasTunnelPermission(rules[i].TunnelLineID) || rules[i].ListenPort <= 0 {
+		if !u.HasTunnelPermission(rules[i].TunnelLineID) || !o.tunnelLineEnabled(rules[i].TunnelLineID) || rules[i].ListenPort <= 0 {
 			continue
 		}
 		if res := o.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", rules[i].ID, "quota_exceeded").

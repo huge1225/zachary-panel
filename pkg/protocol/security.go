@@ -17,10 +17,15 @@ const (
 	MaxClockSkewSeconds = 60
 )
 
+// maxReplayEntries caps the per-guard nonce cache so high-rate frames cannot exhaust memory between GC sweeps.
+const maxReplayEntries = 200000
+
 // GenerateNonce creates a random 16-byte hex nonce for message uniqueness.
 func GenerateNonce() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -63,8 +68,8 @@ func VerifyEnvelope(raw []byte, secretToken string, replayGuard *ReplayGuard) (*
 		return nil, nil, fmt.Errorf("envelope timestamp expired or skewed (diff=%ds)", diff)
 	}
 
-	if env.Nonce == "" || env.Signature == "" {
-		return nil, nil, fmt.Errorf("missing security nonce or HMAC signature")
+	if env.Nonce == "" || len(env.Nonce) > 128 || env.Signature == "" {
+		return nil, nil, fmt.Errorf("missing or invalid security nonce or HMAC signature")
 	}
 
 	expectedSig := computeHMAC(env.Type, env.Timestamp, env.Nonce, env.Payload, secretToken)
@@ -100,7 +105,7 @@ func VerifyHandshakeAuth(nodeID uint64, timestamp int64, nonce string, signature
 	if diff < -MaxClockSkewSeconds || diff > MaxClockSkewSeconds {
 		return fmt.Errorf("handshake timestamp out of window (diff=%ds)", diff)
 	}
-	if len(nonce) < 16 {
+	if len(nonce) < 16 || len(nonce) > 128 {
 		return fmt.Errorf("invalid handshake nonce")
 	}
 	expected := ComputeHandshakeAuth(nodeID, timestamp, nonce, secretToken)
@@ -136,7 +141,7 @@ func (r *ReplayGuard) Accept(nonce string, ts int64) bool {
 	defer r.mu.Unlock()
 
 	now := time.Now().Unix()
-	if now-r.lastGC > 30 {
+	if now-r.lastGC > 30 || len(r.seen) >= maxReplayEntries {
 		for k, exp := range r.seen {
 			if now-exp > MaxClockSkewSeconds*2 {
 				delete(r.seen, k)
@@ -144,7 +149,9 @@ func (r *ReplayGuard) Accept(nonce string, ts int64) bool {
 		}
 		r.lastGC = now
 	}
-
+	if len(r.seen) >= maxReplayEntries {
+		return false
+	}
 	if _, exists := r.seen[nonce]; exists {
 		return false
 	}

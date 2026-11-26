@@ -36,15 +36,20 @@ type SystemConfig struct {
 	EpayPID            string    `gorm:"size:64;default:''" json:"epay_pid"`
 	EpayKey                string    `gorm:"size:128;default:''" json:"epay_key"`
 	USDTAddress            string    `gorm:"size:128;default:''" json:"usdt_address"`
+	USDTWebhookSecret      string    `gorm:"size:128;default:''" json:"usdt_webhook_secret"`
 	RechargeNotice         string    `gorm:"size:512;default:''" json:"recharge_notice"`
 	NotifyTelegramBotToken string    `gorm:"size:128;default:''" json:"notify_telegram_bot_token"`
 	NotifyTelegramChatID   string    `gorm:"size:64;default:''" json:"notify_telegram_chat_id"`
 	NotifyWebhookURL       string    `gorm:"size:512;default:''" json:"notify_webhook_url"`
-	NotifyOnNodeEvents     bool      `gorm:"default:true" json:"notify_on_node_events"`
-	NotifyOnQuotaEvents    bool      `gorm:"default:true" json:"notify_on_quota_events"`
-	AdminAPIKeyHash        string    `gorm:"size:128;default:''" json:"-"`
-	AdminAPIKeyPrefix      string    `gorm:"size:32;default:''" json:"admin_api_key_prefix"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	NotifyOnNodeEvents        bool      `gorm:"default:true" json:"notify_on_node_events"`
+	NotifyOnQuotaEvents       bool      `gorm:"default:true" json:"notify_on_quota_events"`
+	NotifyOnTicketEvents      bool      `gorm:"default:true" json:"notify_on_ticket_events"`
+	AffiliateEnabled          bool      `gorm:"default:true" json:"affiliate_enabled"`
+	AffiliateCommissionRate   float64   `gorm:"default:10" json:"affiliate_commission_rate"`
+	AffiliateMinWithdrawCents int64     `gorm:"default:1000" json:"affiliate_min_withdraw_cents"`
+	AdminAPIKeyHash           string    `gorm:"size:128;default:''" json:"-"`
+	AdminAPIKeyPrefix         string    `gorm:"size:32;default:''" json:"admin_api_key_prefix"`
+	UpdatedAt                 time.Time `json:"updated_at"`
 }
 
 // RoleGroup defines a role / permission group (类似 Xboard 权限组):
@@ -60,34 +65,43 @@ type RoleGroup struct {
 
 // User represents a tenant or administrator account.
 type User struct {
-	ID             uint64     `gorm:"primaryKey" json:"id"`
-	Email          string     `gorm:"uniqueIndex;size:191;not null" json:"email"`
-	PasswordHash   string     `gorm:"not null" json:"-"`
-	Role           string     `gorm:"size:32;default:'user'" json:"role"`         // "admin" | "user"
-	Status         string     `gorm:"size:32;default:'active'" json:"status"`     // "active" | "banned"
-	RoleGroupID    uint64     `gorm:"default:1" json:"role_group_id"`             // 所属角色 ID (决定可用隧道)
-	PlanID         uint64     `gorm:"default:0" json:"plan_id"`                   // 绑定套餐 ID
-	AllowedTunnels string     `gorm:"size:512;default:''" json:"allowed_tunnels"` // 逗号分隔的授权隧道 ID (随角色同步，admin 默认 "*")
-	BalanceCents   int64      `gorm:"default:0" json:"balance_cents"`
-	QuotaBytes     int64      `gorm:"default:107374182400" json:"quota_bytes"` // 总配额字节 (默认 100GB)
-	UsedBytes      int64      `gorm:"default:0" json:"used_bytes"`             // 已用计费字节 (含倍率折算)
-	MaxRules       int        `gorm:"default:20" json:"max_rules"`             // 最大规则数
-	SpeedMbps      int        `gorm:"default:100" json:"speed_mbps"`           // 峰值带宽限制 Mbps
-	ExpireAt       time.Time  `json:"expire_at"`
-	MonthlyReset   bool       `gorm:"default:false" json:"monthly_reset"` // 长周期套餐是否每满 30 天自动重置已用流量
-	LastResetAt    *time.Time `json:"last_reset_at,omitempty"`            // 最近一次流量重置时间
-	SubToken       string     `gorm:"size:64;index" json:"sub_token"`     // 订阅链接专属 Token (可随时重置使旧链接失效)
-	TOTPSecret     string     `gorm:"size:64;default:''" json:"-"`        // TOTP 双因素认证密钥 (Base32)
-	TOTPEnabled    bool       `gorm:"default:false" json:"totp_enabled"`  // 是否已启用双因素认证 (2FA)
-	TokenVersion   int        `gorm:"default:0" json:"-"`                 // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
+	ID                        uint64     `gorm:"primaryKey" json:"id"`
+	Email                     string     `gorm:"uniqueIndex;size:191;not null" json:"email"`
+	PasswordHash              string     `gorm:"not null" json:"-"`
+	Role                      string     `gorm:"size:32;default:'user'" json:"role"`                                            // "admin" | "user"
+	Status                    string     `gorm:"size:32;default:'active';index:idx_user_status_expire,priority:1" json:"status"` // "active" | "banned"
+	RoleGroupID               uint64     `gorm:"default:1;index" json:"role_group_id"`                                          // 所属角色 ID (决定可用隧道)
+	PlanID                    uint64     `gorm:"default:0;index" json:"plan_id"`                                                // 绑定套餐 ID
+	AllowedTunnels            string     `gorm:"size:512;default:''" json:"allowed_tunnels"`                                    // 逗号分隔的授权隧道 ID (随角色同步，admin 默认 "*")
+	BalanceCents              int64      `gorm:"default:0" json:"balance_cents"`
+	QuotaBytes                int64      `gorm:"default:107374182400" json:"quota_bytes"` // 总配额字节 (默认 100GB)
+	UsedBytes                 int64      `gorm:"default:0" json:"used_bytes"`             // 已用计费字节 (含倍率折算)
+	MaxRules                  int        `gorm:"default:20" json:"max_rules"`             // 最大规则数
+	SpeedMbps                 int        `gorm:"default:100" json:"speed_mbps"`           // 峰值带宽限制 Mbps
+	ExpireAt                  time.Time  `gorm:"index:idx_user_status_expire,priority:2" json:"expire_at"`
+	MonthlyReset              bool       `gorm:"default:false" json:"monthly_reset"`               // 长周期套餐是否每满 30 天自动重置已用流量
+	LastResetAt               *time.Time `json:"last_reset_at,omitempty"`                          // 最近一次流量重置时间
+	SubToken                  string     `gorm:"size:64;index" json:"sub_token"`                   // 订阅链接专属 Token (可随时重置使旧链接失效)
+	InviteCode                string     `gorm:"size:32;index" json:"invite_code"`                 // 专属推广邀请码
+	InvitedBy                 uint64     `gorm:"default:0;index" json:"invited_by"`                // 邀请人用户 ID
+	CommissionBalanceCents    int64      `gorm:"default:0" json:"commission_balance_cents"`        // 可提现/可划转返利佣金 (分)
+	TotalCommissionCents      int64      `gorm:"default:0" json:"total_commission_cents"`          // 累计已获返利佣金 (分)
+	CommissionedRechargeCents int64      `gorm:"default:0" json:"-"`                               // 已在充值环节结算过佣金的余额分值 (防止余额购套餐重复返佣)
+	TOTPSecret                string     `gorm:"size:64;default:''" json:"-"`                      // TOTP 双因素认证密钥 (Base32)
+	TOTPEnabled               bool       `gorm:"default:false" json:"totp_enabled"`                // 是否已启用双因素认证 (2FA)
+	LastTOTPStep              int64      `gorm:"default:0" json:"-"`                               // 最近一次已消费的 30s TOTP 时间片 (防重放)
+	TokenVersion              int        `gorm:"default:0" json:"-"`                               // 递增后使该用户所有已签发 JWT 失效 (改密/封禁)
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
-// BeforeCreate ensures every newly created user receives a unique random subscription token.
+// BeforeCreate ensures every newly created user receives a unique random subscription token and invite code.
 func (u *User) BeforeCreate(tx *gorm.DB) error {
 	if strings.TrimSpace(u.SubToken) == "" {
 		u.SubToken = utils.GenerateRandomToken(16)
+	}
+	if strings.TrimSpace(u.InviteCode) == "" {
+		u.InviteCode = GenerateInviteCode()
 	}
 	return nil
 }
@@ -134,7 +148,7 @@ type Plan struct {
 	ID             uint64    `gorm:"primaryKey" json:"id"`
 	Name           string    `gorm:"size:128;not null" json:"name"`
 	Description    string    `gorm:"size:512" json:"description"`
-	RoleGroupID    uint64    `gorm:"default:1" json:"role_group_id"` // 套餐绑定的角色 ID
+	RoleGroupID    uint64    `gorm:"default:1;index" json:"role_group_id"` // 套餐绑定的角色 ID
 	PriceCents     int64     `gorm:"not null" json:"price_cents"`
 	DurationDays   int       `gorm:"default:30" json:"duration_days"`
 	QuotaBytes     int64     `gorm:"not null" json:"quota_bytes"`
@@ -172,11 +186,11 @@ type Node struct {
 	ResetDay         int                 `gorm:"default:0" json:"reset_day"`                // 每月自动重置流量日 (0=不开启, 1..28=每月几号)
 	LastResetMonth   string              `gorm:"size:16;default:''" json:"last_reset_month"` // 最近一次自动重置月份 (YYYY-MM)
 	DefaultEngine    protocol.EngineType `gorm:"size:32;default:'native'" json:"default_engine"`
-	SupportedEngines string              `gorm:"size:255;default:'native'" json:"supported_engines"` // Agent上报的可用引擎列表
-	AgentVersion     string              `gorm:"size:32;default:'1.1.0-sec'" json:"agent_version"`   // Agent 上报的当前程序版本号
-	SecretToken      string              `gorm:"size:128;not null" json:"secret_token"`
-	TunnelCertPEM    string              `gorm:"type:text" json:"-"`                      // Agent 上报的隧道 TLS 证书 (入口节点据此做证书固定)
-	Status           string              `gorm:"size:32;default:'offline'" json:"status"` // "online" | "offline" | "maintenance"
+	SupportedEngines string              `gorm:"size:255;default:'native'" json:"supported_engines"`       // Agent上报的可用引擎列表
+	AgentVersion     string              `gorm:"size:32;default:'1.1.0-sec'" json:"agent_version"`         // Agent 上报的当前程序版本号
+	SecretToken      string              `gorm:"size:128;not null" json:"secret_token,omitempty"`         // 仅在创建节点或生成对接脚本时读取
+	TunnelCertPEM    string              `gorm:"type:text" json:"-"`                                      // Agent 上报的隧道 TLS 证书 (入口节点据此做证书固定)
+	Status           string              `gorm:"size:32;default:'offline';index" json:"status"`           // "online" | "offline" | "maintenance"
 	CPUCores         int                 `gorm:"-" json:"cpu_cores"`
 	CPUUsage         float64             `gorm:"-" json:"cpu_usage"`
 	Load1            float64             `gorm:"-" json:"load_1"`
@@ -206,8 +220,8 @@ type TunnelLine struct {
 	Name           string              `gorm:"size:128;not null" json:"name"`
 	Type           string              `gorm:"size:32;default:'direct'" json:"type"` // "direct" (直接转发隧道) | "encrypt" (加密对接隧道)
 	Description    string              `gorm:"size:255" json:"description"`
-	IngressNodeID  uint64              `gorm:"not null" json:"ingress_node_id"`               // 入口节点 ID
-	EgressNodeID   uint64              `gorm:"default:0" json:"egress_node_id"`               // 出口节点 ID (仅 Type=="encrypt" 时需要)
+	IngressNodeID  uint64              `gorm:"not null;index" json:"ingress_node_id"`          // 入口节点 ID
+	EgressNodeID   uint64              `gorm:"default:0;index" json:"egress_node_id"`          // 出口节点 ID (仅 Type=="encrypt" 时需要)
 	Transport      string              `gorm:"size:32;default:'tls'" json:"transport"`        // "raw" | "tls" | "ws" | "wss" | "quic" | "custom"
 	Engine         protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"`        // 默认转发引擎: "native" | "gost" | "realm" | "nftables"
 	BillingMode    string              `gorm:"size:32;default:'two_way'" json:"billing_mode"` // "one_way" (单向计费) | "two_way" (双向计费)
@@ -221,11 +235,11 @@ type TunnelLine struct {
 // ForwardRule represents a user-configured port/tunnel forwarding rule.
 type ForwardRule struct {
 	ID            uint64              `gorm:"primaryKey" json:"id"`
-	UserID        uint64              `gorm:"index;not null" json:"user_id"`
+	UserID        uint64              `gorm:"index;index:idx_rule_user_enabled,priority:1;not null" json:"user_id"`
 	Name          string              `gorm:"size:128;not null" json:"name"`
 	Mode          string              `gorm:"size:32;default:'direct'" json:"mode"` // "direct" (单端直转) | "tunnel" (入口-出口专线联动)
 	IngressNodeID uint64              `gorm:"index;not null" json:"ingress_node_id"`
-	TunnelLineID  uint64              `gorm:"default:0" json:"tunnel_line_id"`        // Mode == "tunnel" 时关联的专线 ID
+	TunnelLineID  uint64              `gorm:"default:0;index" json:"tunnel_line_id"`  // Mode == "tunnel" 时关联的专线 ID
 	Engine        protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"` // 面板可选: "native" | "gost" | "realm" | "nftables"
 	Protocol      string              `gorm:"size:16;default:'tcp'" json:"protocol"`  // "tcp" | "udp" | "both"
 	ListenPort    int                 `gorm:"not null" json:"listen_port"`            // 入口节点分配的公网端口
@@ -240,8 +254,8 @@ type ForwardRule struct {
 	UploadBytes   int64               `gorm:"default:0" json:"upload_bytes"`
 	DownBytes     int64               `gorm:"default:0" json:"down_bytes"`
 	BilledBytes   int64               `gorm:"default:0" json:"billed_bytes"`
-	Enabled       bool                `gorm:"default:true" json:"enabled"`
-	Status        string              `gorm:"size:32;default:'syncing'" json:"status"` // "running" | "paused" | "error" | "quota_exceeded"
+	Enabled       bool                `gorm:"default:true;index:idx_rule_user_enabled,priority:2" json:"enabled"`
+	Status        string              `gorm:"size:32;default:'syncing';index" json:"status"` // "running" | "paused" | "error" | "quota_exceeded"
 	LastError     string              `gorm:"size:255" json:"last_error,omitempty"`
 	CreatedAt     time.Time           `json:"created_at"`
 	UpdatedAt     time.Time           `json:"updated_at"`
@@ -259,38 +273,140 @@ type RedeemCode struct {
 	QuotaBytes   int64      `gorm:"default:0" json:"quota_bytes"`
 	Duration     int        `gorm:"default:0" json:"duration_days"`
 	Note         string     `gorm:"size:128;default:''" json:"note"`
-	UsedBy       uint64     `gorm:"default:0" json:"used_by"`
+	UsedBy       uint64     `gorm:"default:0;index" json:"used_by"`
 	UsedAt       *time.Time `json:"used_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UsedByEmail  string     `gorm:"-" json:"used_by_email,omitempty"`
 	PlanName     string     `gorm:"-" json:"plan_name,omitempty"`
 }
 
-// BillingOrder records recharge orders, plan purchases, paid subscription resets, and redeem code redemptions.
+// BillingOrder records recharge orders, plan purchases, paid subscription resets, affiliate transfers, and redeem code redemptions.
 type BillingOrder struct {
+	ID            uint64     `gorm:"primaryKey" json:"id"`
+	OrderNo       string     `gorm:"uniqueIndex;size:64;not null" json:"order_no"`
+	UserID        uint64     `gorm:"index;index:idx_order_user_status,priority:1;not null" json:"user_id"`
+	UserEmail     string     `gorm:"size:191;default:''" json:"user_email"`
+	Type          string     `gorm:"size:32;index;not null" json:"type"` // "recharge" | "plan_purchase" | "plan_reset" | "redeem" | "affiliate_transfer"
+	PlanID        uint64     `gorm:"default:0" json:"plan_id"`
+	PlanName      string     `gorm:"size:128;default:''" json:"plan_name"`
+	OriginalCents int64      `gorm:"default:0" json:"original_cents"`
+	DiscountCents int64      `gorm:"default:0" json:"discount_cents"`
+	CouponCode    string     `gorm:"size:64;default:''" json:"coupon_code,omitempty"`
+	AmountCents   int64      `gorm:"default:0" json:"amount_cents"`
+	Status        string     `gorm:"size:32;default:'pending';index:idx_order_status_created,priority:1;index:idx_order_user_status,priority:2" json:"status"` // "pending" | "paid" | "cancelled"
+	Gateway       string     `gorm:"size:32;default:'balance'" json:"gateway"`                                                                                 // "balance" | "epay" | "usdt" | "manual" | "redeem" | "affiliate"
+	TradeNo       string     `gorm:"size:128;default:''" json:"trade_no"`
+	PayURL        string     `gorm:"size:512;default:''" json:"pay_url,omitempty"`
+	CreatedAt     time.Time  `gorm:"index:idx_order_status_created,priority:2" json:"created_at"`
+	PaidAt        *time.Time `json:"paid_at,omitempty"`
+}
+
+// Coupon defines a promotional discount code supporting percentage or fixed-amount deductions.
+type Coupon struct {
+	ID               uint64     `gorm:"primaryKey" json:"id"`
+	Code             string     `gorm:"uniqueIndex;size:64;not null" json:"code"`
+	Name             string     `gorm:"size:128;not null" json:"name"`
+	Type             string     `gorm:"size:16;not null" json:"type"`                       // "percent" (折扣比例 1..100, 如 20 表示减免 20%) | "fixed" (固定满减分值)
+	Value            int64      `gorm:"not null" json:"value"`                              // percent: 1..100; fixed: cents > 0
+	MinSpendCents    int64      `gorm:"default:0" json:"min_spend_cents"`                   // 最低消费门槛 (分)
+	MaxDiscountCents int64      `gorm:"default:0" json:"max_discount_cents"`                // 百分比券最高抵扣上限 (分, 0 表示不封顶)
+	AllowedPlanIDs   string     `gorm:"size:512;default:''" json:"allowed_plan_ids"`        // 允许使用的套餐 ID 列表 (空或 "*" 表示全部付费套餐)
+	StartsAt         *time.Time `json:"starts_at,omitempty"`                                // 生效时间 (空表示立即生效)
+	EndsAt           *time.Time `json:"ends_at,omitempty"`                                  // 失效时间 (空表示长期有效)
+	MaxUses          int        `gorm:"default:0" json:"max_uses"`                          // 总可用次数 (0 表示不限)
+	UsedCount        int        `gorm:"default:0" json:"used_count"`                        // 已核销总次数
+	PerUserLimit     int        `gorm:"default:1" json:"per_user_limit"`                    // 单用户限用次数 (0 表示不限)
+	Active           bool       `gorm:"default:true;index" json:"active"`                   // 是否启用
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+// CouponRedemption records each atomic coupon claim against a specific purchase or cycle reset order.
+type CouponRedemption struct {
+	ID            uint64    `gorm:"primaryKey" json:"id"`
+	CouponID      uint64    `gorm:"index:idx_coupon_user,priority:1;not null" json:"coupon_id"`
+	CouponCode    string    `gorm:"size:64;not null" json:"coupon_code"`
+	UserID        uint64    `gorm:"index:idx_coupon_user,priority:2;not null" json:"user_id"`
+	UserEmail     string    `gorm:"size:191;default:''" json:"user_email"`
+	OrderNo       string    `gorm:"size:64;index" json:"order_no"`
+	Scene         string    `gorm:"size:32;default:'plan_purchase'" json:"scene"` // "plan_purchase" | "plan_reset"
+	PlanID        uint64    `gorm:"default:0" json:"plan_id"`
+	OriginalCents int64     `gorm:"default:0" json:"original_cents"`
+	DiscountCents int64     `gorm:"default:0" json:"discount_cents"`
+	PayableCents  int64     `gorm:"default:0" json:"payable_cents"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// AffiliateCommission records automatic referral commission settled when an invited user recharges or buys a plan.
+type AffiliateCommission struct {
+	ID              uint64    `gorm:"primaryKey" json:"id"`
+	InviterID       uint64    `gorm:"index;not null" json:"inviter_id"`
+	InviteeID       uint64    `gorm:"index;not null" json:"invitee_id"`
+	InviteeEmail    string    `gorm:"size:191;default:''" json:"invitee_email"`
+	OrderID         uint64    `gorm:"uniqueIndex;not null" json:"order_id"`
+	OrderNo         string    `gorm:"size:64;not null" json:"order_no"`
+	Scene           string    `gorm:"size:32;not null" json:"scene"` // "recharge" | "plan_purchase" | "plan_reset"
+	BaseAmountCents int64     `gorm:"not null" json:"base_amount_cents"`
+	RatePercent     float64   `gorm:"not null" json:"rate_percent"`
+	CommissionCents int64     `gorm:"not null" json:"commission_cents"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// AffiliateWithdrawal tracks a user's commission payout request and administrator review lifecycle.
+type AffiliateWithdrawal struct {
 	ID          uint64     `gorm:"primaryKey" json:"id"`
-	OrderNo     string     `gorm:"uniqueIndex;size:64;not null" json:"order_no"`
+	WithdrawNo  string     `gorm:"uniqueIndex;size:64;not null" json:"withdraw_no"`
 	UserID      uint64     `gorm:"index;not null" json:"user_id"`
 	UserEmail   string     `gorm:"size:191;default:''" json:"user_email"`
-	Type        string     `gorm:"size:32;not null" json:"type"`             // "recharge" | "plan_purchase" | "plan_reset" | "redeem"
-	PlanID      uint64     `gorm:"default:0" json:"plan_id"`
-	PlanName    string     `gorm:"size:128;default:''" json:"plan_name"`
-	AmountCents int64      `gorm:"default:0" json:"amount_cents"`
-	Status      string     `gorm:"size:32;default:'pending'" json:"status"`  // "pending" | "paid" | "cancelled"
-	Gateway     string     `gorm:"size:32;default:'balance'" json:"gateway"` // "balance" | "epay" | "usdt" | "manual" | "redeem"
-	TradeNo     string     `gorm:"size:128;default:''" json:"trade_no"`
-	PayURL      string     `gorm:"size:512;default:''" json:"pay_url,omitempty"`
+	AmountCents int64      `gorm:"not null" json:"amount_cents"`
+	Method      string     `gorm:"size:32;not null" json:"method"`   // "usdt" | "alipay" | "wechat" | "bank"
+	Account     string     `gorm:"size:191;not null" json:"account"` // 收款地址或账号
+	RealName    string     `gorm:"size:64;default:''" json:"real_name"`
+	Status      string     `gorm:"size:32;default:'pending';index" json:"status"` // "pending" | "approved" | "rejected"
+	AdminRemark string     `gorm:"size:255;default:''" json:"admin_remark"`
+	ReviewedBy  uint64     `gorm:"default:0" json:"reviewed_by"`
+	ReviewedAt  *time.Time `json:"reviewed_at,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
-	PaidAt      *time.Time `json:"paid_at,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// SupportTicket represents a customer support ticket optionally linked to a forwarding rule.
+type SupportTicket struct {
+	ID            uint64     `gorm:"primaryKey" json:"id"`
+	TicketNo      string     `gorm:"uniqueIndex;size:64;not null" json:"ticket_no"`
+	UserID        uint64     `gorm:"index;index:idx_ticket_user_status,priority:1;not null" json:"user_id"`
+	UserEmail     string     `gorm:"size:191;default:''" json:"user_email"`
+	Subject       string     `gorm:"size:160;not null" json:"subject"`
+	Category      string     `gorm:"size:32;default:'general';index" json:"category"` // "network" | "rule" | "billing" | "account" | "general"
+	Priority      string     `gorm:"size:16;default:'normal'" json:"priority"`        // "low" | "normal" | "high" | "urgent"
+	RuleID        uint64     `gorm:"default:0;index" json:"rule_id"`
+	RuleName      string     `gorm:"size:160;default:''" json:"rule_name"`
+	Status        string     `gorm:"size:32;default:'open';index;index:idx_ticket_user_status,priority:2" json:"status"` // "open" | "answered" | "customer_reply" | "closed"
+	LastReplyBy   string     `gorm:"size:16;default:'user'" json:"last_reply_by"`                                        // "user" | "admin"
+	LastMessageAt time.Time  `gorm:"index" json:"last_message_at"`
+	ClosedAt      *time.Time `json:"closed_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
+}
+
+// TicketMessage stores a single conversational message inside a SupportTicket thread.
+type TicketMessage struct {
+	ID          uint64    `gorm:"primaryKey" json:"id"`
+	TicketID    uint64    `gorm:"index;not null" json:"ticket_id"`
+	SenderID    uint64    `gorm:"not null" json:"sender_id"`
+	SenderEmail string    `gorm:"size:191;default:''" json:"sender_email"`
+	SenderRole  string    `gorm:"size:16;not null" json:"sender_role"` // "user" | "admin"
+	Content     string    `gorm:"type:text;not null" json:"content"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // TrafficHourlyStat stores hourly aggregated traffic for dashboard charts.
 type TrafficHourlyStat struct {
 	ID          uint64    `gorm:"primaryKey" json:"id"`
-	UserID      uint64    `gorm:"index:idx_user_hour" json:"user_id"`
-	RuleID      uint64    `gorm:"index" json:"rule_id"`
+	UserID      uint64    `gorm:"index:idx_user_hour;index:idx_stat_user_rule_hour,priority:1" json:"user_id"`
+	RuleID      uint64    `gorm:"index;index:idx_stat_user_rule_hour,priority:2" json:"rule_id"`
 	NodeID      uint64    `json:"node_id"`
-	HourBucket  string    `gorm:"size:16;index:idx_user_hour" json:"hour_bucket"` // e.g. "2026-11-04 10:00"
+	HourBucket  string    `gorm:"size:16;index;index:idx_user_hour;index:idx_stat_user_rule_hour,priority:3" json:"hour_bucket"` // e.g. "2026-11-04 10:00"
 	UploadBytes int64     `json:"upload_bytes"`
 	DownBytes   int64     `json:"down_bytes"`
 	BilledBytes int64     `json:"billed_bytes"`
@@ -302,11 +418,11 @@ type AuditLog struct {
 	ID        uint64    `gorm:"primaryKey" json:"id"`
 	UserID    uint64    `gorm:"index" json:"user_id"`
 	UserEmail string    `gorm:"size:191;default:''" json:"user_email"`
-	Action    string    `gorm:"size:64;index;not null" json:"action"`
+	Action    string    `gorm:"size:64;index;index:idx_audit_action_created,priority:1;not null" json:"action"`
 	Target    string    `gorm:"size:191;default:''" json:"target"`
 	Detail    string    `gorm:"size:512;default:''" json:"detail"`
 	ClientIP  string    `gorm:"size:64;default:''" json:"client_ip"`
-	CreatedAt time.Time `json:"created_at"`
+	CreatedAt time.Time `gorm:"index:idx_audit_action_created,priority:2" json:"created_at"`
 }
 
 // InitDB opens a GORM connection (SQLite by default, or Postgres/MySQL via driver & dsn),
@@ -349,6 +465,12 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 		&ForwardRule{},
 		&RedeemCode{},
 		&BillingOrder{},
+		&Coupon{},
+		&CouponRedemption{},
+		&AffiliateCommission{},
+		&AffiliateWithdrawal{},
+		&SupportTicket{},
+		&TicketMessage{},
 		&TrafficHourlyStat{},
 		&AuditLog{},
 	)
@@ -360,9 +482,63 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 	ensureRelayPortUniqueIndex(db, driver)
 	backfillUserSubTokens(db)
 	ensureUserSubTokenUniqueIndex(db, driver)
+	backfillUserInviteCodes(db)
+	ensureUserInviteCodeUniqueIndex(db, driver)
+	ensureOrderTradeNoUniqueIndex(db, driver)
 
 	seedInitialData(db)
 	return db, nil
+}
+
+// ensureOrderTradeNoUniqueIndex enforces DB-level uniqueness on (gateway, trade_no) for paid orders with non-empty
+// external transaction references so concurrent webhook deliveries cannot reuse one trade_no/tx_hash across two orders.
+func ensureOrderTradeNoUniqueIndex(db *gorm.DB, driver string) {
+	const name = "idx_orders_gateway_trade_no"
+	if db.Migrator().HasIndex(&BillingOrder{}, name) {
+		return
+	}
+	var stmt string
+	switch driver {
+	case "mysql":
+		stmt = "CREATE UNIQUE INDEX " + name + " ON billing_orders ((CASE WHEN status = 'paid' AND trade_no <> '' THEN gateway END), (CASE WHEN status = 'paid' AND trade_no <> '' THEN trade_no END))"
+	default: // sqlite, postgres
+		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON billing_orders (gateway, trade_no) WHERE status = 'paid' AND trade_no <> ''"
+	}
+	if err := db.Exec(stmt).Error; err != nil {
+		log.Printf("[DB] WARNING: could not create unique index %s: %v", name, err)
+	}
+}
+
+// GenerateInviteCode returns a clean uppercase alphanumeric invite code (e.g. "AFF8F3A12B4").
+func GenerateInviteCode() string {
+	return "AFF" + strings.ToUpper(utils.GenerateRandomToken(4))
+}
+
+// backfillUserInviteCodes populates InviteCode for any existing user rows created before the column existed.
+func backfillUserInviteCodes(db *gorm.DB) {
+	var users []User
+	db.Select("id").Where("invite_code = '' OR invite_code IS NULL").Find(&users)
+	for _, u := range users {
+		db.Model(&User{}).Where("id = ?", u.ID).Update("invite_code", GenerateInviteCode())
+	}
+}
+
+// ensureUserInviteCodeUniqueIndex guarantees non-empty user invite codes are unique across accounts.
+func ensureUserInviteCodeUniqueIndex(db *gorm.DB, driver string) {
+	const name = "idx_users_invite_code"
+	if db.Migrator().HasIndex(&User{}, name) {
+		return
+	}
+	var stmt string
+	switch driver {
+	case "mysql":
+		stmt = "CREATE UNIQUE INDEX " + name + " ON users ((CASE WHEN invite_code <> '' THEN invite_code END))"
+	default: // sqlite, postgres
+		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON users (invite_code) WHERE invite_code <> ''"
+	}
+	if err := db.Exec(stmt).Error; err != nil {
+		log.Printf("[DB] WARNING: could not create unique index %s: %v", name, err)
+	}
 }
 
 // backfillUserSubTokens populates SubToken for any existing user rows created before the column existed.

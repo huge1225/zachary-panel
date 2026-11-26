@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 	"nexus-panel/internal/agent/security"
 	"nexus-panel/internal/master/model"
@@ -36,14 +38,19 @@ type SyncNodeCallback func(nodeID uint64)
 // AckScopeFunc reports whether a node is allowed to report status for (ruleID, role).
 type AckScopeFunc func(nodeID uint64, ruleID uint64, role protocol.RuleRole) bool
 
-// registerTimeout bounds how long a freshly upgraded connection may wait before sending its signed register frame.
-const registerTimeout = 10 * time.Second
+const (
+	// registerTimeout bounds how long a freshly upgraded connection may wait before sending its signed register frame.
+	registerTimeout = 10 * time.Second
+	// agentReadTimeout bounds idle silence on an established Agent WebSocket (Agents report every ~3s).
+	agentReadTimeout = 90 * time.Second
+)
 
 // AgentSession represents a live connected Agent node.
 type AgentSession struct {
 	NodeID           uint64
 	SecretToken      string
 	ReplayGuard      *protocol.ReplayGuard
+	ReportLimiter    *rate.Limiter
 	Conn             *websocket.Conn
 	WriteMu          sync.Mutex
 	AgentVersion     string
@@ -95,6 +102,15 @@ type AgentHub struct {
 
 	guardsMu   sync.Mutex
 	nodeGuards map[uint64]*protocol.ReplayGuard // per-node nonce cache shared across sessions (handshake + frames)
+
+	wsFailMu     sync.Mutex
+	wsFailByIP   map[string]*wsIPFailEntry
+	wsFailLastGC time.Time
+}
+
+type wsIPFailEntry struct {
+	lim      *rate.Limiter
+	lastSeen time.Time
 }
 
 func NewAgentHub(db *gorm.DB) *AgentHub {
@@ -103,7 +119,42 @@ func NewAgentHub(db *gorm.DB) *AgentHub {
 		sessions:     make(map[uint64]*AgentSession),
 		probeWaiters: make(map[string]chan protocol.ProbeResultPayload),
 		nodeGuards:   make(map[uint64]*protocol.ReplayGuard),
+		wsFailByIP:   make(map[string]*wsIPFailEntry),
 	}
+}
+
+func (h *AgentHub) allowHandshakeFail(ip string) bool {
+	h.wsFailMu.Lock()
+	defer h.wsFailMu.Unlock()
+	now := time.Now()
+	if now.Sub(h.wsFailLastGC) > time.Minute || len(h.wsFailByIP) > 20000 {
+		for k, e := range h.wsFailByIP {
+			if now.Sub(e.lastSeen) > 10*time.Minute {
+				delete(h.wsFailByIP, k)
+			}
+		}
+		h.wsFailLastGC = now
+	}
+	e, ok := h.wsFailByIP[ip]
+	if !ok {
+		if len(h.wsFailByIP) >= 50000 {
+			return false
+		}
+		e = &wsIPFailEntry{lim: rate.NewLimiter(rate.Every(3*time.Second), 8)}
+		h.wsFailByIP[ip] = e
+	}
+	e.lastSeen = now
+	return e.lim.Allow()
+}
+
+func (h *AgentHub) isHandshakeBlocked(ip string) bool {
+	h.wsFailMu.Lock()
+	defer h.wsFailMu.Unlock()
+	e, ok := h.wsFailByIP[ip]
+	if !ok {
+		return false
+	}
+	return e.lim.Tokens() < 1.0 && time.Since(e.lastSeen) < 3*time.Second
 }
 
 func (h *AgentHub) SetCallbacks(onTraffic TrafficHandlerFunc, onNodeOnline SyncNodeCallback) {
@@ -139,18 +190,28 @@ func (h *AgentHub) guardFor(nodeID uint64) *protocol.ReplayGuard {
 
 // HandleAgentWS upgrades HTTP connections from Agents and processes incoming frames.
 func (h *AgentHub) HandleAgentWS(c *gin.Context) {
-	unauthorized := func() {
+	clientIP := c.ClientIP()
+	if h.isHandshakeBlocked(clientIP) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed agent handshakes"})
+		return
+	}
+	rejectHandshake := func() {
+		if !h.allowHandshakeFail(clientIP) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "too many failed agent handshakes"})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 	}
+
 	nodeID, err := strconv.ParseUint(c.GetHeader("X-Node-ID"), 10, 64)
 	if err != nil || nodeID == 0 {
-		unauthorized()
+		rejectHandshake()
 		return
 	}
 
 	var node model.Node
 	if err := h.db.First(&node, nodeID).Error; err != nil {
-		unauthorized()
+		rejectHandshake()
 		return
 	}
 
@@ -160,15 +221,15 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 	authNonce := c.GetHeader("X-Auth-Nonce")
 
 	if err := protocol.VerifyHandshakeAuth(nodeID, authTS, authNonce, authSig, node.SecretToken); err != nil {
-		log.Printf("[AgentHub] Rejected handshake for node #%d from %s: %v", nodeID, c.ClientIP(), err)
-		unauthorized()
+		log.Printf("[AgentHub] Rejected handshake for node #%d from %s: %v", nodeID, clientIP, err)
+		rejectHandshake()
 		return
 	}
 	// Global (cross-session) replay protection for the handshake itself.
 	replayGuard := h.guardFor(nodeID)
 	if !replayGuard.Accept("hs:"+authNonce, authTS) {
-		log.Printf("[AgentHub] Rejected replayed handshake for node #%d from %s", nodeID, c.ClientIP())
-		unauthorized()
+		log.Printf("[AgentHub] Rejected replayed handshake for node #%d from %s", nodeID, clientIP)
+		rejectHandshake()
 		return
 	}
 
@@ -177,11 +238,16 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 		return
 	}
 	conn.SetReadLimit(4 * 1024 * 1024)
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
+		return nil
+	})
 
 	sess := &AgentSession{
 		NodeID:        nodeID,
 		SecretToken:   node.SecretToken,
 		ReplayGuard:   replayGuard,
+		ReportLimiter: rate.NewLimiter(rate.Every(time.Second), 6),
 		Conn:          conn,
 		ConnectedAt:   time.Now(),
 		LastHeartbeat: time.Now(),
@@ -201,7 +267,7 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 		_ = conn.Close()
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
 
 	h.mu.Lock()
 	if prev, ok := h.sessions[nodeID]; ok {
@@ -231,6 +297,7 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 	h.handleRegister(sess, firstPayload)
 
 	for {
+		_ = conn.SetReadDeadline(time.Now().Add(agentReadTimeout))
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return
@@ -241,8 +308,21 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 
 func sanitizeVersionString(v string) string {
 	v = strings.TrimSpace(v)
-	if len(v) > 32 {
-		v = v[:32]
+	var b strings.Builder
+	for _, r := range v {
+		if r >= 0x20 && r != 0x7f && b.Len() < 32 {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func sanitizeFloat(v, minVal, maxVal float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < minVal {
+		return minVal
+	}
+	if v > maxVal {
+		return maxVal
 	}
 	return v
 }
@@ -253,15 +333,17 @@ func (h *AgentHub) handleRegister(sess *AgentSession, payloadBytes []byte) {
 		return
 	}
 	var engStrs []string
+	var cleanEngines []protocol.EngineType
 	for _, e := range reg.SupportedEngines {
 		switch e {
 		case protocol.EngineNative, protocol.EngineGost, protocol.EngineRealm, protocol.EngineNftables:
 			engStrs = append(engStrs, string(e))
+			cleanEngines = append(cleanEngines, e)
 		}
 	}
 	ver := sanitizeVersionString(reg.AgentVersion)
 	h.mu.Lock()
-	sess.SupportedEngines = reg.SupportedEngines
+	sess.SupportedEngines = cleanEngines
 	if ver != "" {
 		sess.AgentVersion = ver
 	}
@@ -313,29 +395,54 @@ func (h *AgentHub) processAgentMessage(sess *AgentSession, raw []byte) {
 		var hb protocol.AgentHeartbeatPayload
 		if err := json.Unmarshal(payloadBytes, &hb); err == nil {
 			ver := sanitizeVersionString(hb.AgentVersion)
+			cores := hb.CPUCores
+			if cores < 0 || cores > 4096 {
+				cores = 0
+			}
+			activeRules := hb.ActiveRules
+			if activeRules < 0 || activeRules > 100000 {
+				activeRules = 0
+			}
+			activeConns := hb.ActiveConns
+			if activeConns < 0 || activeConns > 100000000 {
+				activeConns = 0
+			}
+			uptime := hb.UptimeSeconds
+			if uptime < 0 {
+				uptime = 0
+			}
 			h.mu.Lock()
 			if ver != "" {
 				sess.AgentVersion = ver
 			}
-			sess.CPUCores = hb.CPUCores
-			sess.CPUUsage = hb.CPUUsagePercent
-			sess.Load1 = hb.Load1
-			sess.Load5 = hb.Load5
-			sess.Load15 = hb.Load15
+			sess.CPUCores = cores
+			sess.CPUUsage = sanitizeFloat(hb.CPUUsagePercent, 0, 100)
+			sess.Load1 = sanitizeFloat(hb.Load1, 0, 100000)
+			sess.Load5 = sanitizeFloat(hb.Load5, 0, 100000)
+			sess.Load15 = sanitizeFloat(hb.Load15, 0, 100000)
 			sess.MemUsedBytes = hb.MemUsedBytes
 			sess.MemTotalBytes = hb.MemTotalBytes
-			sess.MemUsage = hb.MemUsagePercent
+			sess.MemUsage = sanitizeFloat(hb.MemUsagePercent, 0, 100)
 			sess.DiskUsedBytes = hb.DiskUsedBytes
 			sess.DiskTotalBytes = hb.DiskTotalBytes
-			sess.DiskUsage = hb.DiskUsagePercent
+			sess.DiskUsage = sanitizeFloat(hb.DiskUsagePercent, 0, 100)
 			sess.NetRxBytesPerS = hb.NetRxBytesPerS
 			sess.NetTxBytesPerS = hb.NetTxBytesPerS
-			sess.ActiveRules = hb.ActiveRules
-			sess.ActiveConns = hb.ActiveConns
-			sess.UptimeSeconds = hb.UptimeSeconds
+			sess.ActiveRules = activeRules
+			sess.ActiveConns = activeConns
+			sess.UptimeSeconds = uptime
 			sess.LastHeartbeat = time.Now()
 			if len(hb.SupportedEngines) > 0 && len(hb.SupportedEngines) <= 8 {
-				sess.SupportedEngines = hb.SupportedEngines
+				var clean []protocol.EngineType
+				for _, e := range hb.SupportedEngines {
+					switch e {
+					case protocol.EngineNative, protocol.EngineGost, protocol.EngineRealm, protocol.EngineNftables:
+						clean = append(clean, e)
+					}
+				}
+				if len(clean) > 0 {
+					sess.SupportedEngines = clean
+				}
 			}
 			h.mu.Unlock()
 
@@ -351,6 +458,10 @@ func (h *AgentHub) processAgentMessage(sess *AgentSession, raw []byte) {
 		}
 
 	case protocol.MsgTrafficReport:
+		if sess.ReportLimiter != nil && !sess.ReportLimiter.Allow() {
+			log.Printf("[AgentHub] Rate-limited excessive traffic report from Node #%d", sess.NodeID)
+			return
+		}
 		var tr protocol.TrafficReportPayload
 		if err := json.Unmarshal(payloadBytes, &tr); err == nil {
 			if h.onTraffic != nil {
@@ -458,7 +569,9 @@ func (h *AgentHub) RequestProbe(nodeID uint64, ruleID uint64, targets []string) 
 
 	defer func() {
 		h.probeWaitersMu.Lock()
-		delete(h.probeWaiters, waitKey)
+		if cur, ok := h.probeWaiters[waitKey]; ok && cur == ch {
+			delete(h.probeWaiters, waitKey)
+		}
 		h.probeWaitersMu.Unlock()
 	}()
 

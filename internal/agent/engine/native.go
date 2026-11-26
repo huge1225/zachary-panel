@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -109,12 +111,15 @@ func (inst *nativeRuleInstance) isAllowedRemoteAddr(addr net.Addr) bool {
 //   - inside TLS the Ingress sends an HMAC auth header (rule secret + timestamp + nonce, replay-protected);
 //   - UDP is framed inside the same encrypted tunnel instead of being sent as plaintext datagrams.
 type NativeEngine struct {
-	mu            sync.RWMutex
-	policy        security.Policy
-	connGuard     *security.IPConnGuard
-	rules         map[string]*nativeRuleInstance
-	serverTLSConf *tls.Config
-	customWrapper CustomTunnelWrapper
+	mu                 sync.RWMutex
+	policy             security.Policy
+	connGuard          *security.IPConnGuard
+	udpIPGuard         *security.IPConnGuard
+	egressHandshakeSem chan struct{}
+	activeUDPSessions  int64
+	rules              map[string]*nativeRuleInstance
+	serverTLSConf      *tls.Config
+	customWrapper      CustomTunnelWrapper
 }
 
 // NewNativeEngine creates a ready-to-use NativeEngine. cert is the node's persistent tunnel identity used when
@@ -127,11 +132,17 @@ func NewNativeEngine(pol security.Policy, cert *security.TunnelCert) *NativeEngi
 			MinVersion:   tls.VersionTLS12,
 		}
 	}
+	maxUDPIPs := pol.MaxUDPSessionsPerIP
+	if maxUDPIPs <= 0 {
+		maxUDPIPs = 64
+	}
 	return &NativeEngine{
-		policy:        pol,
-		connGuard:     security.NewIPConnGuard(pol.MaxConnsPerClientIP),
-		rules:         make(map[string]*nativeRuleInstance),
-		serverTLSConf: tlsCfg,
+		policy:             pol,
+		connGuard:          security.NewIPConnGuard(pol.MaxConnsPerClientIP),
+		udpIPGuard:         security.NewIPConnGuard(maxUDPIPs),
+		egressHandshakeSem: make(chan struct{}, 512),
+		rules:              make(map[string]*nativeRuleInstance),
+		serverTLSConf:      tlsCfg,
 	}
 }
 
@@ -269,7 +280,27 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 	return nil
 }
 
+func setTCPKeepAlive(c net.Conn) {
+	var tc *net.TCPConn
+	switch v := c.(type) {
+	case *net.TCPConn:
+		tc = v
+	case *tls.Conn:
+		if raw, ok := v.NetConn().(*net.TCPConn); ok {
+			tc = raw
+		}
+	}
+	if tc != nil {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+}
+
 func (e *NativeEngine) serveTCP(ctx context.Context, inst *nativeRuleInstance) {
+	maxConns := inst.spec.MaxConns
+	if maxConns <= 0 {
+		maxConns = 8192
+	}
 	for {
 		conn, err := inst.tcpListener.Accept()
 		if err != nil {
@@ -281,21 +312,26 @@ func (e *NativeEngine) serveTCP(ctx context.Context, inst *nativeRuleInstance) {
 				continue
 			}
 		}
+		setTCPKeepAlive(conn)
 
 		if !isTunnelEgress(inst.spec) && !inst.isAllowedRemoteAddr(conn.RemoteAddr()) {
 			_ = conn.Close()
 			continue
 		}
 
-		if inst.spec.MaxConns > 0 && atomic.LoadInt64(&inst.tracker.ActiveConns) >= int64(inst.spec.MaxConns) {
+		if maxConns > 0 && atomic.LoadInt64(&inst.tracker.ActiveConns) >= int64(maxConns) {
 			_ = conn.Close()
 			continue
 		}
 
-		releaseIP, allowed := e.connGuard.Acquire(conn.RemoteAddr())
-		if !allowed {
-			_ = conn.Close()
-			continue
+		releaseIP := func() {}
+		if !isTunnelEgress(inst.spec) {
+			var allowed bool
+			releaseIP, allowed = e.connGuard.Acquire(conn.RemoteAddr())
+			if !allowed {
+				_ = conn.Close()
+				continue
+			}
 		}
 
 		atomic.AddInt64(&inst.tracker.ActiveConns, 1)
@@ -311,6 +347,22 @@ func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstan
 	}()
 
 	if isTunnelEgress(inst.spec) {
+		if e.egressHandshakeSem != nil {
+			select {
+			case e.egressHandshakeSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			default:
+				return
+			}
+		}
+		releaseHS := sync.OnceFunc(func() {
+			if e.egressHandshakeSem != nil {
+				<-e.egressHandshakeSem
+			}
+		})
+		defer releaseHS()
+
 		// Complete the TLS handshake explicitly with a deadline so idle scanners cannot pin goroutines
 		if tc, ok := clientConn.(*tls.Conn); ok {
 			hsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -337,6 +389,8 @@ func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstan
 				clientConn.RemoteAddr().String(), inst.spec.RuleID, err)
 			return
 		}
+		// Release pre-auth handshake slot once authenticated so long-lived legitimate tunnels never exhaust it
+		releaseHS()
 		if mode == security.TunnelModeUDP {
 			if wantsUDP(inst.spec) {
 				e.serveTunnelUDP(ctx, inst, clientConn)
@@ -500,11 +554,35 @@ func (e *NativeEngine) dialUpstream(ctx context.Context, inst *nativeRuleInstanc
 // --- UDP ---
 
 const (
-	maxUDPSessions  = 2048
-	udpIdleTimeout  = 60 * time.Second
-	udpQueueLength  = 256
-	maxUDPFrameSize = 65535
+	maxUDPSessions    = 2048
+	maxUDPGlobal      = 8192
+	udpIdleTimeout    = 60 * time.Second
+	udpReadPollWindow = 15 * time.Second
+	udpQueueLength    = 256
+	maxUDPFrameSize   = 65535
 )
+
+var udpBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, maxUDPFrameSize)
+		return &b
+	},
+}
+
+func acquireUDPBuf() *[]byte {
+	return udpBufPool.Get().(*[]byte)
+}
+
+func releaseUDPBuf(b *[]byte) {
+	if b != nil {
+		udpBufPool.Put(b)
+	}
+}
+
+// ActiveUDPSessions returns the total number of live UDP sessions across all rules on this NativeEngine.
+func (e *NativeEngine) ActiveUDPSessions() int64 {
+	return atomic.LoadInt64(&e.activeUDPSessions)
+}
 
 // udpUpstream abstracts a plain UDP socket or a UDP-over-TLS framed tunnel stream.
 type udpUpstream interface {
@@ -517,7 +595,7 @@ type plainUDPUpstream struct{ c *net.UDPConn }
 
 func (u *plainUDPUpstream) WritePacket(p []byte) error { _, err := u.c.Write(p); return err }
 func (u *plainUDPUpstream) ReadPacket(buf []byte) (int, error) {
-	_ = u.c.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+	_ = u.c.SetReadDeadline(time.Now().Add(udpReadPollWindow))
 	n, _, err := u.c.ReadFromUDP(buf)
 	return n, err
 }
@@ -545,8 +623,13 @@ func (f *framedUpstream) WritePacket(p []byte) error {
 
 func (f *framedUpstream) ReadPacket(buf []byte) (int, error) {
 	var hdr [2]byte
-	_ = f.c.SetReadDeadline(time.Now().Add(udpIdleTimeout))
-	if _, err := io.ReadFull(f.c, hdr[:]); err != nil {
+	_ = f.c.SetReadDeadline(time.Now().Add(udpReadPollWindow))
+	// Read first byte so a poll timeout never leaves a half-consumed frame header on the stream.
+	if _, err := io.ReadFull(f.c, hdr[:1]); err != nil {
+		return 0, err
+	}
+	_ = f.c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(f.c, hdr[1:]); err != nil {
 		return 0, err
 	}
 	n := int(binary.BigEndian.Uint16(hdr[:]))
@@ -561,20 +644,43 @@ func (f *framedUpstream) ReadPacket(buf []byte) (int, error) {
 
 func (f *framedUpstream) Close() error { return f.c.Close() }
 
-func (e *NativeEngine) resolveSafeUDP(inst *nativeRuleInstance, addr string) (*net.UDPAddr, error) {
+func (e *NativeEngine) resolveSafeUDP(ctx context.Context, inst *nativeRuleInstance, addr string) (*net.UDPAddr, error) {
 	allowPrivate := e.policy.AllowPrivateTargets || (inst.spec.Role == protocol.RoleIngress)
 	if err := security.ValidateTargetAddress(addr, allowPrivate); err != nil {
 		return nil, err
 	}
-	rAddr, err := net.ResolveUDPAddr("udp", addr)
+	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, err
 	}
-	// Enforce Anti-SSRF & Anti-DNS-Rebinding on resolved UDP IP
-	if err := security.ValidateResolvedIP(rAddr.IP, allowPrivate); err != nil {
-		return nil, err
+	portNum, err := strconv.Atoi(portStr)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return nil, fmt.Errorf("invalid UDP target port %q", portStr)
 	}
-	return rAddr, nil
+	var chosen net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		if err := security.ValidateResolvedIP(ip, allowPrivate); err != nil {
+			return nil, err
+		}
+		chosen = ip
+	} else {
+		resolveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		ips, lErr := net.DefaultResolver.LookupIP(resolveCtx, "ip", host)
+		cancel()
+		if lErr != nil || len(ips) == 0 {
+			return nil, fmt.Errorf("UDP DNS resolution failed for %s: %w", host, lErr)
+		}
+		for _, ip := range ips {
+			if security.ValidateResolvedIP(ip, allowPrivate) == nil {
+				chosen = ip
+				break
+			}
+		}
+		if chosen == nil {
+			return nil, fmt.Errorf("security violation: UDP DNS resolution of %q pointed to restricted IP %s", host, ips[0].String())
+		}
+	}
+	return &net.UDPAddr{IP: chosen, Port: portNum}, nil
 }
 
 func (e *NativeEngine) openUDPUpstream(ctx context.Context, inst *nativeRuleInstance) (udpUpstream, error) {
@@ -585,7 +691,7 @@ func (e *NativeEngine) openUDPUpstream(ctx context.Context, inst *nativeRuleInst
 		}
 		return &framedUpstream{c: conn}, nil
 	}
-	rAddr, err := e.resolveSafeUDP(inst, inst.spec.Targets[0].Address)
+	rAddr, err := e.resolveSafeUDP(ctx, inst, inst.spec.Targets[0].Address)
 	if err != nil {
 		return nil, err
 	}
@@ -605,7 +711,22 @@ type udpSession struct {
 func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 	var sessions sync.Map
 	var sessionCount int64
-	buf := make([]byte, maxUDPFrameSize)
+	readBufPtr := acquireUDPBuf()
+	defer releaseUDPBuf(readBufPtr)
+	buf := *readBufPtr
+
+	maxRuleCap := e.policy.MaxUDPSessionsPerRule
+	if maxRuleCap <= 0 {
+		maxRuleCap = maxUDPSessions
+	}
+	if inst.spec.MaxConns > 0 && inst.spec.MaxConns < maxRuleCap {
+		maxRuleCap = inst.spec.MaxConns
+	}
+	maxGlobalCap := e.policy.MaxUDPSessionsGlobal
+	if maxGlobalCap <= 0 {
+		maxGlobalCap = maxUDPGlobal
+	}
+	idleSec := int64(udpIdleTimeout.Seconds())
 
 	for {
 		n, clientAddr, err := inst.udpConn.ReadFromUDP(buf)
@@ -622,32 +743,43 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 			continue
 		}
 
-		inst.tracker.AddUpload(int64(n))
-		if inst.tracker.Limiter != nil {
-			_ = inst.tracker.Limiter.WaitN(ctx, n)
-		}
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-
 		clientKey := clientAddr.String()
 		val, ok := sessions.Load(clientKey)
 		var sess *udpSession
 		if !ok {
-			if atomic.LoadInt64(&sessionCount) >= maxUDPSessions {
+			// Enforce 3-tier UDP session caps (per-rule, node-global, per-source-IP) BEFORE charging upload bytes
+			// or blocking the shared UDP read loop on rate.Limiter.WaitN.
+			if atomic.AddInt64(&sessionCount, 1) > int64(maxRuleCap) {
+				atomic.AddInt64(&sessionCount, -1)
 				continue
 			}
+			if atomic.AddInt64(&e.activeUDPSessions, 1) > int64(maxGlobalCap) {
+				atomic.AddInt64(&e.activeUDPSessions, -1)
+				atomic.AddInt64(&sessionCount, -1)
+				continue
+			}
+			releaseUDPIP, allowed := e.udpIPGuard.Acquire(clientAddr)
+			if !allowed {
+				atomic.AddInt64(&e.activeUDPSessions, -1)
+				atomic.AddInt64(&sessionCount, -1)
+				continue
+			}
+
 			sess = &udpSession{
 				queue:    make(chan []byte, udpQueueLength),
 				done:     make(chan struct{}),
 				lastSeen: time.Now().Unix(),
 			}
 			sessions.Store(clientKey, sess)
-			atomic.AddInt64(&sessionCount, 1)
+			atomic.AddInt64(&inst.tracker.ActiveConns, 1)
 
-			go func(cAddr *net.UDPAddr, s *udpSession, key string) {
+			go func(cAddr *net.UDPAddr, s *udpSession, key string, relIP func()) {
 				defer func() {
 					close(s.done)
 					sessions.Delete(key)
+					relIP()
+					atomic.AddInt64(&inst.tracker.ActiveConns, -1)
+					atomic.AddInt64(&e.activeUDPSessions, -1)
 					atomic.AddInt64(&sessionCount, -1)
 				}()
 				up, err := e.openUDPUpstream(ctx, inst)
@@ -662,10 +794,17 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 					for {
 						select {
 						case p := <-s.queue:
+							if inst.tracker.Limiter != nil && len(p) > 0 {
+								if inst.tracker.Limiter.WaitN(ctx, len(p)) != nil {
+									_ = up.Close()
+									return
+								}
+							}
 							if up.WritePacket(p) != nil {
 								_ = up.Close()
 								return
 							}
+							inst.tracker.AddUpload(int64(len(p)))
 						case <-s.done:
 							return
 						case <-ctx.Done():
@@ -676,14 +815,28 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 				}()
 
 				// reader: upstream datagrams -> client
-				rBuf := make([]byte, maxUDPFrameSize)
+				rBufPtr := acquireUDPBuf()
+				defer releaseUDPBuf(rBufPtr)
+				rBuf := *rBufPtr
 				for {
 					rn, rErr := up.ReadPacket(rBuf)
 					if rErr != nil {
+						var netErr net.Error
+						if errors.As(rErr, &netErr) && netErr.Timeout() {
+							if time.Now().Unix()-atomic.LoadInt64(&s.lastSeen) < idleSec {
+								continue
+							}
+						}
 						return
 					}
-					if inst.tracker.Limiter != nil {
-						_ = inst.tracker.Limiter.WaitN(ctx, rn)
+					// Even if upstream sends unilateral keepalives, evict sessions where the client left > udpIdleTimeout ago.
+					if time.Now().Unix()-atomic.LoadInt64(&s.lastSeen) >= idleSec {
+						return
+					}
+					if inst.tracker.Limiter != nil && rn > 0 {
+						if inst.tracker.Limiter.WaitN(ctx, rn) != nil {
+							return
+						}
 					}
 					wn, wErr := inst.udpConn.WriteToUDP(rBuf[:rn], cAddr)
 					if wn > 0 {
@@ -693,15 +846,17 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 						return
 					}
 				}
-			}(clientAddr, sess, clientKey)
+			}(clientAddr, sess, clientKey, releaseUDPIP)
 		} else {
 			sess = val.(*udpSession)
 			atomic.StoreInt64(&sess.lastSeen, time.Now().Unix())
 		}
 
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
 		select {
 		case sess.queue <- pkt:
-		default: // queue full: drop datagram (UDP semantics)
+		default: // queue full: drop datagram without charging unforwarded bytes
 		}
 	}
 }
@@ -709,7 +864,7 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 // serveTunnelUDP runs on the Egress side for an authenticated UDP-mode tunnel stream: it unpacks framed
 // datagrams, forwards them to the rule's (SSRF-validated) target and frames the replies back.
 func (e *NativeEngine) serveTunnelUDP(ctx context.Context, inst *nativeRuleInstance, tunnelConn net.Conn) {
-	rAddr, err := e.resolveSafeUDP(inst, inst.spec.Targets[0].Address)
+	rAddr, err := e.resolveSafeUDP(ctx, inst, inst.spec.Targets[0].Address)
 	if err != nil {
 		log.Printf("[NativeEngine] Blocked unsafe UDP target on rule %s: %v", inst.key, err)
 		return
@@ -721,17 +876,34 @@ func (e *NativeEngine) serveTunnelUDP(ctx context.Context, inst *nativeRuleInsta
 	defer upConn.Close()
 	tunnel := &framedUpstream{c: tunnelConn}
 
+	var lastClientSeen int64
+	atomic.StoreInt64(&lastClientSeen, time.Now().Unix())
+	idleSec := int64(udpIdleTimeout.Seconds())
+
 	go func() {
 		defer tunnelConn.Close()
-		rBuf := make([]byte, maxUDPFrameSize)
+		rBufPtr := acquireUDPBuf()
+		defer releaseUDPBuf(rBufPtr)
+		rBuf := *rBufPtr
 		for {
-			_ = upConn.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+			_ = upConn.SetReadDeadline(time.Now().Add(udpReadPollWindow))
 			rn, _, rErr := upConn.ReadFromUDP(rBuf)
 			if rErr != nil {
+				var netErr net.Error
+				if errors.As(rErr, &netErr) && netErr.Timeout() {
+					if time.Now().Unix()-atomic.LoadInt64(&lastClientSeen) < idleSec {
+						continue
+					}
+				}
 				return
 			}
-			if inst.tracker.Limiter != nil {
-				_ = inst.tracker.Limiter.WaitN(ctx, rn)
+			if time.Now().Unix()-atomic.LoadInt64(&lastClientSeen) >= idleSec {
+				return
+			}
+			if inst.tracker.Limiter != nil && rn > 0 {
+				if inst.tracker.Limiter.WaitN(ctx, rn) != nil {
+					return
+				}
 			}
 			if tunnel.WritePacket(rBuf[:rn]) != nil {
 				return
@@ -740,14 +912,25 @@ func (e *NativeEngine) serveTunnelUDP(ctx context.Context, inst *nativeRuleInsta
 		}
 	}()
 
-	buf := make([]byte, maxUDPFrameSize)
+	bufPtr := acquireUDPBuf()
+	defer releaseUDPBuf(bufPtr)
+	buf := *bufPtr
 	for {
 		n, rErr := tunnel.ReadPacket(buf)
 		if rErr != nil {
+			var netErr net.Error
+			if errors.As(rErr, &netErr) && netErr.Timeout() {
+				if time.Now().Unix()-atomic.LoadInt64(&lastClientSeen) < idleSec {
+					continue
+				}
+			}
 			return
 		}
-		if inst.tracker.Limiter != nil {
-			_ = inst.tracker.Limiter.WaitN(ctx, n)
+		atomic.StoreInt64(&lastClientSeen, time.Now().Unix())
+		if inst.tracker.Limiter != nil && n > 0 {
+			if inst.tracker.Limiter.WaitN(ctx, n) != nil {
+				return
+			}
 		}
 		if _, wErr := upConn.Write(buf[:n]); wErr != nil {
 			return

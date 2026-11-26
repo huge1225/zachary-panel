@@ -10,9 +10,12 @@ import (
 
 // GenerateRandomToken generates a cryptographically secure hex token of nBytes length.
 func GenerateRandomToken(nBytes int) string {
+	if nBytes <= 0 {
+		nBytes = 16
+	}
 	b := make([]byte, nBytes)
 	if _, err := rand.Read(b); err != nil {
-		return "fallback-secret-token"
+		panic("crypto/rand unavailable: " + err.Error())
 	}
 	return hex.EncodeToString(b)
 }

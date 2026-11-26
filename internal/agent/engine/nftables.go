@@ -229,6 +229,21 @@ type nftResolvedRule struct {
 	dstPort int
 }
 
+// sanitizeNftComment restricts nft rule comments to safe identifier characters so an unexpected key can never
+// break out of quoted nft script syntax.
+func sanitizeNftComment(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == ':' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
 // buildNftForwardScript renders the complete nexus_forward table. It is a pure function for testability.
 func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) string {
 	var s strings.Builder
@@ -244,7 +259,11 @@ func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) strin
 		if r.spec.SpeedLimitMbps <= 0 {
 			continue
 		}
-		kb := r.spec.SpeedLimitMbps * 125 // Mbps -> kbytes/second
+		mbps := r.spec.SpeedLimitMbps
+		if mbps > 100000 {
+			mbps = 100000
+		}
+		kb := mbps * 125 // Mbps -> kbytes/second
 		for _, dir := range []string{"up", "down"} {
 			fmt.Fprintf(&s, "  limit %s {\n    rate over %d kbytes/second burst %d kbytes\n  }\n", nftLimitName(dir, r.key), kb, kb*2)
 		}
@@ -253,9 +272,10 @@ func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) strin
 	s.WriteString("  chain prerouting {\n")
 	s.WriteString("    type nat hook prerouting priority dstnat; policy accept;\n")
 	for _, r := range rules {
+		safeKey := sanitizeNftComment(r.key)
 		for _, proto := range nftProtos(r.spec) {
 			fmt.Fprintf(&s, "    fib daddr type local %s dport %d dnat ip to %s:%d comment \"nexus:%s\"\n",
-				proto, r.spec.ListenPort, r.dstIP, r.dstPort, r.key)
+				proto, r.spec.ListenPort, r.dstIP, r.dstPort, safeKey)
 		}
 	}
 	s.WriteString("  }\n")
@@ -265,6 +285,7 @@ func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) strin
 	s.WriteString("  chain forward {\n")
 	s.WriteString("    type filter hook forward priority filter; policy accept;\n")
 	for _, r := range rules {
+		safeKey := sanitizeNftComment(r.key)
 		for i, proto := range nftProtos(r.spec) {
 			match := fmt.Sprintf("meta l4proto %s ct status dnat ct original proto-dst %d ct reply ip saddr %s ct reply proto-src %d",
 				proto, r.spec.ListenPort, r.dstIP, r.dstPort)
@@ -280,7 +301,7 @@ func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) strin
 				if dir == "reply" {
 					label = "nexus_down:"
 				}
-				comment := label + r.key
+				comment := label + safeKey
 				// tcp and udp rules share a comment and are summed on read; the carried total goes onto the first
 				// protocol's rule only, otherwise every rebuild would multiply it.
 				ctr := "counter"
@@ -328,7 +349,17 @@ func (n *NftablesEngine) syncTableLocked() error {
 	// would be reported (and billed) a second time.
 	state := nftCounterState{}
 	if n.carryReady {
-		state = nftCounterState(readNftCounters(n.binPath, "nexus_forward"))
+		if cur, err := readNftCountersChecked(n.binPath, "nexus_forward"); err == nil {
+			state = nftCounterState(cur)
+		} else {
+			// Fall back to last known in-memory cumulative counters if listing failed transiently.
+			for k, v := range n.lastUp {
+				state["nexus_up:"+sanitizeNftComment(k)] = v
+			}
+			for k, v := range n.lastDown {
+				state["nexus_down:"+sanitizeNftComment(k)] = v
+			}
+		}
 	}
 	script := buildNftForwardScript(resolved, state)
 
@@ -345,26 +376,48 @@ func (n *NftablesEngine) syncTableLocked() error {
 	return nil
 }
 
-// readNftCounters returns cumulative counter bytes keyed by rule comment for the given inet table.
-func readNftCounters(bin, table string) map[string]int64 {
-	res := make(map[string]int64)
+// readNftCountersChecked returns cumulative counter bytes keyed by rule comment for the given inet table,
+// returning an explicit error when the nft binary fails or emits invalid JSON.
+func readNftCountersChecked(bin, table string) (map[string]int64, error) {
 	if bin == "" {
-		return res
+		return nil, fmt.Errorf("nft binary unavailable")
 	}
 	out, err := exec.Command(bin, "-j", "list", "table", "inet", table).Output()
 	if err != nil {
-		return res
+		return nil, err
 	}
-	return parseNftCounters(out)
+	return parseNftCountersChecked(out)
 }
 
-func parseNftCounters(out []byte) map[string]int64 {
+func parseNftCounterBytes(raw any) (int64, bool) {
+	switch v := raw.(type) {
+	case json.Number:
+		if iv, err := v.Int64(); err == nil && iv >= 0 {
+			return iv, true
+		}
+		if uv, err := strconv.ParseUint(v.String(), 10, 64); err == nil {
+			if uv > uint64(1<<62) {
+				return 1 << 62, true
+			}
+			return int64(uv), true
+		}
+	case float64:
+		if v >= 0 && v < float64(1<<62) {
+			return int64(v), true
+		}
+	}
+	return 0, false
+}
+
+func parseNftCountersChecked(out []byte) (map[string]int64, error) {
 	res := make(map[string]int64)
 	var parsed struct {
 		Nftables []map[string]any `json:"nftables"`
 	}
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		return res
+	dec := json.NewDecoder(bytes.NewReader(out))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, err
 	}
 	for _, item := range parsed.Nftables {
 		ruleObj, ok := item["rule"].(map[string]any)
@@ -382,11 +435,19 @@ func parseNftCounters(out []byte) map[string]int64 {
 				continue
 			}
 			if ctr, ok := exMap["counter"].(map[string]any); ok {
-				if bFloat, ok := ctr["bytes"].(float64); ok {
-					res[comment] += int64(bFloat)
+				if bVal, ok := parseNftCounterBytes(ctr["bytes"]); ok {
+					res[comment] += bVal
 				}
 			}
 		}
+	}
+	return res, nil
+}
+
+func parseNftCounters(out []byte) map[string]int64 {
+	res, err := parseNftCountersChecked(out)
+	if err != nil {
+		return make(map[string]int64)
 	}
 	return res
 }
@@ -399,17 +460,28 @@ func (n *NftablesEngine) CollectDeltas() []protocol.RuleTrafficDelta {
 	if len(n.rules) == 0 || !n.Available() {
 		return nil
 	}
-	totals := readNftCounters(n.binPath, "nexus_forward")
+	totals, err := readNftCountersChecked(n.binPath, "nexus_forward")
+	if err != nil {
+		// Transient nft read failure: preserve lastUp/lastDown so historical bytes are NOT double-billed next tick!
+		return nil
+	}
 
 	var deltas []protocol.RuleTrafficDelta
 	for key, spec := range n.rules {
-		curUp, curDown := totals["nexus_up:"+key], totals["nexus_down:"+key]
+		safeKey := sanitizeNftComment(key)
+		curUp, curDown := totals["nexus_up:"+safeKey], totals["nexus_down:"+safeKey]
 		up, down := curUp-n.lastUp[key], curDown-n.lastDown[key]
 		if up < 0 {
 			up = curUp
 		}
 		if down < 0 {
 			down = curDown
+		}
+		if up > maxAgentDeltaBytes {
+			up = maxAgentDeltaBytes
+		}
+		if down > maxAgentDeltaBytes {
+			down = maxAgentDeltaBytes
 		}
 		n.lastUp[key], n.lastDown[key] = curUp, curDown
 		if up > 0 || down > 0 {
@@ -459,7 +531,11 @@ func NftSelfCheck() error {
 	}
 	scripts := map[string]string{
 		"nexus_forward": buildNftForwardScript(sample, nftCounterState{"nexus_up:1:relay": 1234, "nexus_down:1:relay": 5678}),
-		"nexus_acct":    buildNftAcctScript(map[string]int{"3:relay": 40003}, nftCounterState{"acct_up:3:relay": 99}),
+		"nexus_acct": buildNftAcctScript(map[string]acctEntry{
+			"3:relay": {Port: 40003, Proto: "both"},
+			"4:relay": {Port: 40004, Proto: "tcp"},
+			"5:relay": {Port: 40005, Proto: "udp"},
+		}, nftCounterState{"acct_up:3:relay": 99, "acct_down:5:relay": 42}),
 	}
 	for _, name := range []string{"nexus_forward", "nexus_acct"} {
 		cmd := exec.Command(bin, "-c", "-f", "-")

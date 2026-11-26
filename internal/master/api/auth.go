@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"net/http"
 	"net/mail"
@@ -40,7 +41,101 @@ var (
 	subLimiter      = newKeyedLimiter(rate.Every(2*time.Second), 15) // per client IP: subscription pulls
 	sensitiveLimits = newKeyedLimiter(rate.Every(3*time.Second), 10) // per user: redeem / probe / password
 	accountGuard    = newAccountLockout()
+	apiKeyGuard     = newIPFailureGuard(rate.Every(6*time.Second), 5, 8, 10*time.Minute)
+	payNotifyGuard  = newIPFailureGuard(rate.Every(3*time.Second), 10, 15, 10*time.Minute)
 )
+
+// ipFailureGuard throttles repeated authentication/signature failures from a single client IP without limiting
+// legitimate authenticated requests from healthy IPs.
+type ipFailureGuard struct {
+	mu           sync.Mutex
+	every        rate.Limit
+	burst        int
+	lockFails    int
+	lockDuration time.Duration
+	entries      map[string]*ipFailEntry
+	lastGC       time.Time
+}
+
+type ipFailEntry struct {
+	lim         *rate.Limiter
+	fails       int
+	lockedUntil time.Time
+	lastSeen    time.Time
+}
+
+func newIPFailureGuard(every rate.Limit, burst, lockFails int, lockDuration time.Duration) *ipFailureGuard {
+	return &ipFailureGuard{
+		every:        every,
+		burst:        burst,
+		lockFails:    lockFails,
+		lockDuration: lockDuration,
+		entries:      make(map[string]*ipFailEntry),
+	}
+}
+
+func (g *ipFailureGuard) gcLocked(now time.Time) {
+	if now.Sub(g.lastGC) < time.Minute && len(g.entries) < 20000 {
+		return
+	}
+	for k, e := range g.entries {
+		if now.After(e.lockedUntil) && now.Sub(e.lastSeen) > 15*time.Minute {
+			delete(g.entries, k)
+		}
+	}
+	g.lastGC = now
+}
+
+// isBlocked checks if clientIP is currently locked out due to prior failures (without consuming tokens on success).
+func (g *ipFailureGuard) isBlocked(ip string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	e, ok := g.entries[ip]
+	if !ok {
+		return false
+	}
+	return time.Now().Before(e.lockedUntil)
+}
+
+// recordFailure records a failed attempt for clientIP and returns true when the IP should receive 429 Too Many Requests.
+func (g *ipFailureGuard) recordFailure(ip string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := time.Now()
+	g.gcLocked(now)
+	e, ok := g.entries[ip]
+	if !ok {
+		if len(g.entries) >= 50000 {
+			return true
+		}
+		e = &ipFailEntry{lim: rate.NewLimiter(g.every, g.burst)}
+		g.entries[ip] = e
+	}
+	if now.Sub(e.lastSeen) > g.lockDuration {
+		e.fails = 0
+	}
+	e.lastSeen = now
+	e.fails++
+	allowedByBucket := e.lim.Allow()
+	if e.fails >= g.lockFails {
+		e.lockedUntil = now.Add(g.lockDuration)
+		e.fails = 0
+		return true
+	}
+	if !allowedByBucket {
+		if now.After(e.lockedUntil) {
+			e.lockedUntil = now.Add(30 * time.Second)
+		}
+		return true
+	}
+	return now.Before(e.lockedUntil)
+}
+
+func (g *ipFailureGuard) recordSuccess(ip string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.entries, ip)
+}
 
 func ephemeralJWTSecret() []byte {
 	b := make([]byte, 32)
@@ -99,6 +194,9 @@ func (k *keyedLimiter) Allow(key string) bool {
 	}
 	e, ok := k.m[key]
 	if !ok {
+		if len(k.m) >= 50000 {
+			return false
+		}
 		e = &limEntry{lim: rate.NewLimiter(k.every, k.burst)}
 		k.m[key] = e
 	}
@@ -190,25 +288,39 @@ func (a *accountLockout) success(email, ip string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.entries, "pair|"+email+"|"+ip)
+	now := time.Now()
 	m, ok := a.known[email]
 	if !ok {
 		if len(a.known) > 20000 {
-			a.known = make(map[string]map[string]time.Time)
-		}
-		m = make(map[string]time.Time)
-		a.known[email] = m
-	}
-	if len(m) >= maxKnownIPsPerAccount {
-		var oldestIP string
-		var oldest time.Time
-		for k, t := range m {
-			if oldestIP == "" || t.Before(oldest) {
-				oldestIP, oldest = k, t
+			for acct, ips := range a.known {
+				for kip, ts := range ips {
+					if now.Sub(ts) >= knownIPTTL {
+						delete(ips, kip)
+					}
+				}
+				if len(ips) == 0 {
+					delete(a.known, acct)
+				}
 			}
 		}
-		delete(m, oldestIP)
+		if len(a.known) <= 20000 {
+			m = make(map[string]time.Time)
+			a.known[email] = m
+		}
 	}
-	m[ip] = time.Now()
+	if m != nil {
+		if len(m) >= maxKnownIPsPerAccount {
+			var oldestIP string
+			var oldest time.Time
+			for k, t := range m {
+				if oldestIP == "" || t.Before(oldest) {
+					oldestIP, oldest = k, t
+				}
+			}
+			delete(m, oldestIP)
+		}
+		m[ip] = now
+	}
 }
 
 // reset clears all lockout state for an account (used by tests / admin tooling).
@@ -269,10 +381,27 @@ func (s *Server) AuthMiddleware() gin.HandlerFunc {
 			apiKey = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 		}
 		if apiKey != "" {
+			clientIP := c.ClientIP()
+			if apiKeyGuard.isBlocked(clientIP) {
+				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "API Key 鉴权失败次数过多，请稍后再试"})
+				return
+			}
+			if len(apiKey) > 256 {
+				if apiKeyGuard.recordFailure(clientIP) {
+					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "API Key 鉴权失败次数过多，请稍后再试"})
+					return
+				}
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or revoked API key"})
+				return
+			}
 			cfg := s.getSystemConfig()
 			expectedHash := strings.TrimSpace(cfg.AdminAPIKeyHash)
 			givenHash := hashAPIKey(apiKey)
 			if expectedHash == "" || subtle.ConstantTimeCompare([]byte(expectedHash), []byte(givenHash)) != 1 {
+				if apiKeyGuard.recordFailure(clientIP) {
+					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "API Key 鉴权失败次数过多，请稍后再试"})
+					return
+				}
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or revoked API key"})
 				return
 			}
@@ -281,6 +410,7 @@ func (s *Server) AuthMiddleware() gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "no active administrator account"})
 				return
 			}
+			apiKeyGuard.recordSuccess(clientIP)
 			c.Set("user_id", adminUser.ID)
 			c.Set("user_role", "admin")
 			c.Next()
@@ -318,8 +448,8 @@ func (s *Server) AuthMiddleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
 			return
 		}
-		if user.Status == "banned" {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "账号已被封禁"})
+		if user.Status != "active" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "账号已被封禁或未激活"})
 			return
 		}
 
@@ -428,8 +558,8 @@ func (s *Server) handleLogin(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "邮箱或密码错误"})
 		return
 	}
-	if user.Status == "banned" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "账号已被封禁"})
+	if user.Status != "active" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "账号已被封禁或未激活"})
 		return
 	}
 	if user.TOTPEnabled && strings.TrimSpace(user.TOTPSecret) != "" {
@@ -441,10 +571,10 @@ func (s *Server) handleLogin(c *gin.Context) {
 			})
 			return
 		}
-		if !VerifyTOTPCode(user.TOTPSecret, totpCode, time.Now()) {
+		if !s.verifyAndConsumeUserTOTP(&user, totpCode, time.Now(), nil) {
 			accountGuard.fail(email, clientIP)
 			c.JSON(http.StatusUnauthorized, gin.H{
-				"error":         "双因素认证 (2FA) 动态验证码错误",
+				"error":         "双因素认证 (2FA) 动态验证码错误或已使用，请等待新验证码重试",
 				"totp_required": true,
 			})
 			return
@@ -478,8 +608,9 @@ func (s *Server) handleRegister(c *gin.Context) {
 	}
 
 	var req struct {
-		Email    string `json:"email" binding:"required"`
-		Password string `json:"password" binding:"required"`
+		Email      string `json:"email" binding:"required"`
+		Password   string `json:"password" binding:"required"`
+		InviteCode string `json:"invite_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入有效邮箱且密码为 8-72 位"})
@@ -491,6 +622,22 @@ func (s *Server) handleRegister(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入有效邮箱且密码为 8-72 位"})
 		return
 	}
+
+	var inviterID uint64
+	rawInvite := normalizeInviteCode(req.InviteCode)
+	if rawInvite != "" {
+		if !isValidInviteCodeFormat(rawInvite) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "邀请码格式无效"})
+			return
+		}
+		var inviter model.User
+		if err := s.db.Select("id, status").Where("invite_code = ?", rawInvite).First(&inviter).Error; err != nil || inviter.Status != "active" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "邀请码不存在或已失效"})
+			return
+		}
+		inviterID = inviter.ID
+	}
+
 	var count int64
 	s.db.Model(&model.User{}).Where("LOWER(email) = ?", email).Count(&count)
 	if count > 0 {
@@ -537,6 +684,7 @@ func (s *Server) handleRegister(c *gin.Context) {
 		QuotaBytes:     quotaBytes,
 		MaxRules:       maxRules,
 		SpeedMbps:      speedMbps,
+		InvitedBy:      inviterID,
 		ExpireAt:       time.Now().AddDate(0, 0, 7),
 	}
 	if err := s.db.Create(&user).Error; err != nil {
@@ -544,7 +692,11 @@ func (s *Server) handleRegister(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "注册失败，请稍后再试"})
 		return
 	}
-	s.recordAuditForUser(c, user.ID, user.Email, "user.register", user.Email, "新用户注册账号")
+	auditDetail := "新用户注册账号"
+	if inviterID > 0 {
+		auditDetail = fmt.Sprintf("新用户通过邀请码 %s 注册账号 (邀请人 #%d)", rawInvite, inviterID)
+	}
+	s.recordAuditForUser(c, user.ID, user.Email, "user.register", user.Email, auditDetail)
 
 	token, _ := GenerateToken(&user)
 	c.JSON(http.StatusCreated, gin.H{
@@ -564,7 +716,7 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请填写原密码和新密码"})
 		return
 	}
-	if !validPassword(req.NewPassword) {
+	if len(req.OldPassword) > 1024 || !validPassword(req.NewPassword) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "新密码长度需为 8-72 位"})
 		return
 	}
@@ -573,7 +725,14 @@ func (s *Server) handleChangePassword(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
 		return
 	}
+	email := normalizeEmail(user.Email)
+	clientIP := c.ClientIP()
+	if accountGuard.locked(email, clientIP) {
+		c.JSON(http.StatusTooManyRequests, gin.H{"error": "密码校验失败次数过多，请稍后再试"})
+		return
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.OldPassword)); err != nil {
+		accountGuard.fail(email, clientIP)
 		c.JSON(http.StatusForbidden, gin.H{"error": "原密码错误"})
 		return
 	}

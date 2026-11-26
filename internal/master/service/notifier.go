@@ -188,3 +188,22 @@ func (n *Notifier) NotifyQuotaEventAsync(event, title, message string) {
 		_ = n.SendAlert(event, title, message)
 	}()
 }
+
+// NotifyTicketEventAsync dispatches customer support ticket creation/reply alerts to Webhook and/or Telegram Bot.
+func (n *Notifier) NotifyTicketEventAsync(event, title, message string) {
+	if n == nil {
+		return
+	}
+	cfg := n.loadConfig()
+	if !cfg.NotifyOnTicketEvents {
+		return
+	}
+	if strings.TrimSpace(cfg.NotifyWebhookURL) == "" &&
+		(strings.TrimSpace(cfg.NotifyTelegramBotToken) == "" || strings.TrimSpace(cfg.NotifyTelegramChatID) == "") {
+		return
+	}
+	go func() {
+		_ = n.SendAlert(event, title, message)
+	}()
+}
+

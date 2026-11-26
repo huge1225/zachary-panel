@@ -438,6 +438,8 @@ func (m *Manager) SyncAll(ctx context.Context, desired []protocol.RuleSpec, forc
 	return acks
 }
 
+const maxAgentDeltaBytes int64 = 10 << 30 // 10 GiB per 3s reporting tick per rule
+
 // CollectAllDeltas gathers incremental traffic statistics across all registered engines.
 func (m *Manager) CollectAllDeltas() (deltas []protocol.RuleTrafficDelta, totalRules int, totalConns int64) {
 	m.mu.RLock()
@@ -450,6 +452,21 @@ func (m *Manager) CollectAllDeltas() (deltas []protocol.RuleTrafficDelta, totalR
 		totalRules += d.ActiveRuleCount()
 		engineDeltas := d.CollectDeltas()
 		for _, dt := range engineDeltas {
+			if dt.UploadBytes < 0 {
+				dt.UploadBytes = 0
+			} else if dt.UploadBytes > maxAgentDeltaBytes {
+				dt.UploadBytes = maxAgentDeltaBytes
+			}
+			if dt.DownBytes < 0 {
+				dt.DownBytes = 0
+			} else if dt.DownBytes > maxAgentDeltaBytes {
+				dt.DownBytes = maxAgentDeltaBytes
+			}
+			if dt.ActiveConns < 0 {
+				dt.ActiveConns = 0
+			} else if dt.ActiveConns > 1_000_000 {
+				dt.ActiveConns = 1_000_000
+			}
 			totalConns += dt.ActiveConns
 			if dt.UploadBytes > 0 || dt.DownBytes > 0 || dt.ActiveConns > 0 {
 				deltas = append(deltas, dt)

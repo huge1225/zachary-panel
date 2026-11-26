@@ -1,8 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted, type Ref } from 'vue'
 import {
   api,
   formatBytes,
+  safeExternalUrl,
+  sanitizeExportField,
+  sanitizeCSVCell,
+  sanitizeDownloadFilename,
   type User,
   type NodeItem,
   type TunnelLine,
@@ -15,22 +19,64 @@ import {
   type EngineType,
   type TargetEndpoint,
   type SystemConfig,
+  type CouponItem,
+  type CouponPreviewResp,
+  type AffiliateOverviewResp,
+  type AffiliateWithdrawalItem,
+  type SupportTicketItem,
+  type TicketMessageItem,
 } from './api/client'
 
-const isDark = ref(false)
+const isDark = ref(
+  typeof document !== 'undefined' && document.documentElement.classList.contains('dark'),
+)
 function toggleTheme() {
   isDark.value = !isDark.value
   document.documentElement.classList.toggle('dark', isDark.value)
+  try {
+    localStorage.setItem('nexus_theme', isDark.value ? 'dark' : 'light')
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+function useDebouncedRef<T>(source: Ref<T>, delayMs = 220): Ref<T> {
+  const debounced = ref(source.value) as Ref<T>
+  let timer: ReturnType<typeof setTimeout> | null = null
+  watch(source, (val) => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => {
+      debounced.value = val
+    }, delayMs)
+  })
+  onUnmounted(() => {
+    if (timer) clearTimeout(timer)
+  })
+  return debounced
 }
 
 const autoRefresh = ref(true)
+const showMobileNav = ref(false)
 
 const token = ref<string | null>(localStorage.getItem('nexus_token'))
+const isRegisterMode = ref(false)
 const emailInput = ref('')
 const passwordInput = ref('')
+const inviteCodeInput = ref('')
 const authError = ref('')
 
-const activeTab = ref<'dashboard' | 'rules' | 'lines' | 'nodes' | 'roles' | 'users' | 'store' | 'settings'>('dashboard')
+type TabId =
+  | 'dashboard'
+  | 'rules'
+  | 'lines'
+  | 'nodes'
+  | 'roles'
+  | 'users'
+  | 'store'
+  | 'affiliate'
+  | 'tickets'
+  | 'settings'
+const activeTab = ref<TabId>('dashboard')
 const tabTitleMap: Record<string, string> = {
   dashboard: '概览',
   rules: '转发管理',
@@ -39,9 +85,19 @@ const tabTitleMap: Record<string, string> = {
   roles: '角色管理',
   users: '用户管理',
   store: '套餐管理',
+  affiliate: '推广返利',
+  tickets: '工单客服',
   settings: '系统设置',
 }
 const currentTabTitle = computed(() => tabTitleMap[activeTab.value] || '')
+
+function switchTab(tab: TabId) {
+  activeTab.value = tab
+  showMobileNav.value = false
+  if (tab === 'settings') {
+    syncSettingsForm()
+  }
+}
 
 const siteConfig = ref<SystemConfig>({
   id: 1,
@@ -54,6 +110,9 @@ const siteConfig = ref<SystemConfig>({
   default_speed_mbps: 100,
   default_role_group_id: 1,
   default_tunnels: '1',
+  affiliate_enabled: true,
+  affiliate_commission_rate: 10,
+  affiliate_min_withdraw_cents: 1000,
 })
 
 const user = ref<User | null>(null)
@@ -66,8 +125,45 @@ const plans = ref<Plan[]>([])
 const redeemCodesList = ref<RedeemCodeItem[]>([])
 const ordersList = ref<BillingOrder[]>([])
 const auditLogsList = ref<AuditLogItem[]>([])
+const couponsList = ref<CouponItem[]>([])
+const affiliateOverview = ref<AffiliateOverviewResp | null>(null)
+const adminWithdrawalsList = ref<AffiliateWithdrawalItem[]>([])
+const ticketsList = ref<SupportTicketItem[]>([])
 
 const isAdmin = computed(() => user.value?.role === 'admin')
+
+// O(1) lookup maps for high-density table rendering
+const roleMap = computed(() => new Map(rolesList.value.map((r) => [r.id, r])))
+const planMap = computed(() => new Map(plans.value.map((p) => [p.id, p])))
+const nodeMap = computed(() => new Map(nodes.value.map((n) => [n.id, n])))
+const lineMap = computed(() => new Map(lines.value.map((l) => [l.id, l])))
+const userMap = computed(() => new Map(usersList.value.map((u) => [u.id, u])))
+
+const lineRuleCountMap = computed(() => {
+  const m = new Map<number, number>()
+  for (const r of rules.value) {
+    m.set(r.tunnel_line_id, (m.get(r.tunnel_line_id) || 0) + 1)
+  }
+  return m
+})
+
+const rolePlanCountMap = computed(() => {
+  const m = new Map<number, number>()
+  for (const p of plans.value) {
+    m.set(p.role_group_id, (m.get(p.role_group_id) || 0) + 1)
+  }
+  return m
+})
+
+const roleUserCountMap = computed(() => {
+  const m = new Map<number, number>()
+  for (const u of usersList.value) {
+    if (u.role !== 'admin' && u.role_group_id) {
+      m.set(u.role_group_id, (m.get(u.role_group_id) || 0) + 1)
+    }
+  }
+  return m
+})
 
 function parseAllowedIds(str?: string): number[] {
   if (!str) return []
@@ -79,7 +175,7 @@ function parseAllowedIds(str?: string): number[] {
 
 function getRoleById(id?: number): RoleGroup | undefined {
   if (!id) return undefined
-  return rolesList.value.find((r) => r.id === id)
+  return roleMap.value.get(id)
 }
 
 function roleNameById(id?: number): string {
@@ -88,7 +184,7 @@ function roleNameById(id?: number): string {
 
 function planNameById(id?: number): string {
   if (!id) return '自定义配额'
-  return plans.value.find((p) => p.id === id)?.name || '自定义配额'
+  return planMap.value.get(id)?.name || '自定义配额'
 }
 
 function allowedTunnelIdsForUser(u: User | null | undefined): number[] {
@@ -118,12 +214,15 @@ const visibleRules = computed(() => {
 })
 
 const ruleSearchQuery = ref('')
+const debouncedRuleSearch = useDebouncedRef(ruleSearchQuery, 220)
 const ruleFilterTunnelId = ref<number>(0)
 const ruleFilterProtocol = ref<string>('all')
 const ruleFilterStatus = ref<string>('all')
+const rulesPage = ref(1)
+const rulesPageSize = ref(20)
 
 const filteredRules = computed(() => {
-  const q = ruleSearchQuery.value.trim().toLowerCase()
+  const q = debouncedRuleSearch.value.trim().toLowerCase()
   return visibleRules.value.filter((r) => {
     if (ruleFilterTunnelId.value > 0 && r.tunnel_line_id !== ruleFilterTunnelId.value) return false
     if (ruleFilterProtocol.value !== 'all' && r.protocol !== ruleFilterProtocol.value) return false
@@ -140,13 +239,26 @@ const filteredRules = computed(() => {
   })
 })
 
+const rulesTotalPages = computed(() => Math.max(1, Math.ceil(filteredRules.value.length / rulesPageSize.value)))
+const pagedRules = computed(() => {
+  const p = Math.min(rulesPage.value, rulesTotalPages.value)
+  const start = (p - 1) * rulesPageSize.value
+  return filteredRules.value.slice(start, start + rulesPageSize.value)
+})
+watch([debouncedRuleSearch, ruleFilterTunnelId, ruleFilterProtocol, ruleFilterStatus, rulesPageSize], () => {
+  rulesPage.value = 1
+})
+
 const userSearchQuery = ref('')
+const debouncedUserSearch = useDebouncedRef(userSearchQuery, 220)
 const userFilterPlanId = ref<number>(-1)
 const userFilterRoleId = ref<number>(-1)
 const userFilterStatus = ref<string>('all')
+const usersPage = ref(1)
+const usersPageSize = ref(20)
 
 const filteredUsersList = computed(() => {
-  const q = userSearchQuery.value.trim().toLowerCase()
+  const q = debouncedUserSearch.value.trim().toLowerCase()
   return usersList.value.filter((u) => {
     if (userFilterPlanId.value >= 0 && (u.plan_id || 0) !== userFilterPlanId.value) return false
     if (userFilterRoleId.value >= 0 && (u.role_group_id || 0) !== userFilterRoleId.value) return false
@@ -163,6 +275,16 @@ const filteredUsersList = computed(() => {
     }
     return true
   })
+})
+
+const usersTotalPages = computed(() => Math.max(1, Math.ceil(filteredUsersList.value.length / usersPageSize.value)))
+const pagedUsersList = computed(() => {
+  const p = Math.min(usersPage.value, usersTotalPages.value)
+  const start = (p - 1) * usersPageSize.value
+  return filteredUsersList.value.slice(start, start + usersPageSize.value)
+})
+watch([debouncedUserSearch, userFilterPlanId, userFilterRoleId, userFilterStatus, usersPageSize], () => {
+  usersPage.value = 1
 })
 
 const toastMsg = ref('')
@@ -413,16 +535,19 @@ const validSelectedRuleIds = computed(() => {
 })
 const allVisibleSelected = computed(
   () =>
-    filteredRules.value.length > 0 &&
-    filteredRules.value.every((r) => selectedRuleIds.value.includes(r.id)),
+    pagedRules.value.length > 0 &&
+    pagedRules.value.every((r) => selectedRuleIds.value.includes(r.id)),
 )
 
 function toggleSelectAllRules(e: Event) {
   const checked = (e.target as HTMLInputElement).checked
+  const pageIds = pagedRules.value.map((r) => r.id)
   if (checked) {
-    selectedRuleIds.value = filteredRules.value.map((r) => r.id)
+    const merged = new Set([...selectedRuleIds.value, ...pageIds])
+    selectedRuleIds.value = Array.from(merged)
   } else {
-    selectedRuleIds.value = []
+    const pageSet = new Set(pageIds)
+    selectedRuleIds.value = selectedRuleIds.value.filter((id) => !pageSet.has(id))
   }
 }
 
@@ -553,10 +678,15 @@ function handleBatchFileSelect(e: Event) {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
+  if (file.size > 1024 * 1024) {
+    showToast('导入文件大小不能超过 1MB')
+    input.value = ''
+    return
+  }
   const reader = new FileReader()
   reader.onload = () => {
     batchForm.value.rawText = String(reader.result || '')
-    showToast(`已读取文件 ${file.name}`)
+    showToast(`已读取文件 ${sanitizeExportField(file.name, 80)}`)
   }
   reader.readAsText(file)
   input.value = ''
@@ -586,6 +716,25 @@ async function submitBatchRules() {
   }
 }
 
+function downloadSafeCSV(filename: string, headers: string[], rows: unknown[][]) {
+  const safeName = sanitizeDownloadFilename(filename, 'export.csv')
+  const csvLines = [
+    headers.map((h) => sanitizeCSVCell(h, 64)).join(','),
+    ...rows.map((row) => row.map((cell) => sanitizeCSVCell(cell, 512)).join(',')),
+  ]
+  const blob = new Blob(['\uFEFF' + csvLines.join('\r\n')], {
+    type: 'text/csv;charset=utf-8',
+  })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = safeName
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
 function exportRulesToClipboard() {
   const source =
     validSelectedRuleIds.value.length > 0
@@ -594,14 +743,41 @@ function exportRulesToClipboard() {
   const text = source
     .map((r) => {
       const addrs = parseTargets(r.targets_json)
-        .map((t) => t.address)
+        .map((t) => sanitizeExportField(t.address, 255))
         .filter(Boolean)
         .join(';')
-      return `${r.name}|${r.listen_port}|${addrs}|${r.protocol}`
+      const safeName = sanitizeExportField(r.name, 64)
+      const safeProto = sanitizeExportField(r.protocol || 'tcp', 16)
+      return `${safeName}|${Number(r.listen_port) || 0}|${addrs}|${safeProto}`
     })
     .join('\n')
   copyConnectAddr(text)
-  showToast(`已导出 ${source.length} 条规则到剪贴板`)
+  showToast(`已安全导出 ${source.length} 条规则到剪贴板`)
+}
+
+function exportRulesToCSV() {
+  const source =
+    validSelectedRuleIds.value.length > 0
+      ? filteredRules.value.filter((r) => validSelectedRuleIds.value.includes(r.id))
+      : filteredRules.value
+  if (source.length === 0) {
+    showToast('当前没有可导出的规则')
+    return
+  }
+  downloadSafeCSV(
+    `zachary-rules-${new Date().toISOString().slice(0, 10)}.csv`,
+    ['ID', '规则名称', '协议', '入口端口', '目标地址', '状态', '计费流量'],
+    source.map((r) => [
+      r.id,
+      r.name,
+      r.protocol,
+      r.listen_port,
+      parseTargets(r.targets_json).map((t) => t.address).join(';'),
+      r.status,
+      formatBytes(r.billed_bytes),
+    ]),
+  )
+  showToast(`已导出 ${source.length} 条规则 CSV 文件`)
 }
 
 // --- 角色管理 (管理员：角色决定可用隧道) ---
@@ -1041,12 +1217,17 @@ const settingsForm = ref({
   epay_pid: '',
   epay_key: '',
   usdt_address: '',
+  usdt_webhook_secret: '',
   recharge_notice: '',
   notify_telegram_bot_token: '',
   notify_telegram_chat_id: '',
   notify_webhook_url: '',
   notify_on_node_events: false,
   notify_on_quota_events: false,
+  notify_on_ticket_events: false,
+  affiliate_enabled: true,
+  affiliate_commission_rate: 10,
+  affiliate_min_withdraw_yuan: 10,
 })
 
 function syncSettingsForm() {
@@ -1064,12 +1245,17 @@ function syncSettingsForm() {
     epay_pid: siteConfig.value.epay_pid || '',
     epay_key: siteConfig.value.epay_key || '',
     usdt_address: siteConfig.value.usdt_address || '',
+    usdt_webhook_secret: siteConfig.value.usdt_webhook_secret || '',
     recharge_notice: siteConfig.value.recharge_notice || '',
     notify_telegram_bot_token: siteConfig.value.notify_telegram_bot_token || '',
     notify_telegram_chat_id: siteConfig.value.notify_telegram_chat_id || '',
     notify_webhook_url: siteConfig.value.notify_webhook_url || '',
     notify_on_node_events: !!siteConfig.value.notify_on_node_events,
     notify_on_quota_events: !!siteConfig.value.notify_on_quota_events,
+    notify_on_ticket_events: !!siteConfig.value.notify_on_ticket_events,
+    affiliate_enabled: siteConfig.value.affiliate_enabled ?? true,
+    affiliate_commission_rate: siteConfig.value.affiliate_commission_rate ?? 10,
+    affiliate_min_withdraw_yuan: Number(((siteConfig.value.affiliate_min_withdraw_cents ?? 1000) / 100).toFixed(2)),
   }
 }
 
@@ -1092,16 +1278,21 @@ async function saveSystemSettings() {
       epay_pid: settingsForm.value.epay_pid.trim(),
       epay_key: settingsForm.value.epay_key.trim(),
       usdt_address: settingsForm.value.usdt_address.trim(),
+      usdt_webhook_secret: settingsForm.value.usdt_webhook_secret.trim(),
       recharge_notice: settingsForm.value.recharge_notice.trim(),
       notify_telegram_bot_token: settingsForm.value.notify_telegram_bot_token.trim(),
       notify_telegram_chat_id: settingsForm.value.notify_telegram_chat_id.trim(),
       notify_webhook_url: settingsForm.value.notify_webhook_url.trim(),
       notify_on_node_events: settingsForm.value.notify_on_node_events,
       notify_on_quota_events: settingsForm.value.notify_on_quota_events,
+      notify_on_ticket_events: settingsForm.value.notify_on_ticket_events,
+      affiliate_enabled: settingsForm.value.affiliate_enabled,
+      affiliate_commission_rate: Math.max(0, Math.min(50, Number(settingsForm.value.affiliate_commission_rate) || 0)),
+      affiliate_min_withdraw_cents: Math.round(Math.max(1, Number(settingsForm.value.affiliate_min_withdraw_yuan) || 10) * 100),
     })
     siteConfig.value = updated
     document.title = siteConfig.value.site_name
-    showToast('面板基础、支付与告警配置已保存')
+    showToast('面板基础、支付、分销与告警配置已保存')
   } catch (e: any) {
     showToast(e.message)
   }
@@ -1120,9 +1311,12 @@ async function sendTestNotify() {
 
 const auditFilterAction = ref('all')
 const auditSearchQuery = ref('')
+const debouncedAuditSearch = useDebouncedRef(auditSearchQuery, 220)
+const auditPage = ref(1)
+const auditPageSize = ref(20)
 
 const filteredAuditLogs = computed(() => {
-  const q = auditSearchQuery.value.trim().toLowerCase()
+  const q = debouncedAuditSearch.value.trim().toLowerCase()
   return auditLogsList.value.filter((item) => {
     if (auditFilterAction.value !== 'all' && item.action !== auditFilterAction.value) return false
     if (q) {
@@ -1131,6 +1325,16 @@ const filteredAuditLogs = computed(() => {
     }
     return true
   })
+})
+
+const auditTotalPages = computed(() => Math.max(1, Math.ceil(filteredAuditLogs.value.length / auditPageSize.value)))
+const pagedAuditLogs = computed(() => {
+  const p = Math.min(auditPage.value, auditTotalPages.value)
+  const start = (p - 1) * auditPageSize.value
+  return filteredAuditLogs.value.slice(start, start + auditPageSize.value)
+})
+watch([debouncedAuditSearch, auditFilterAction, auditPageSize], () => {
+  auditPage.value = 1
 })
 
 async function refreshAuditLogs() {
@@ -1280,10 +1484,13 @@ async function submitChangePassword() {
 async function handleAuth() {
   authError.value = ''
   try {
-    const res = await api.login(emailInput.value.trim(), passwordInput.value, totpInput.value.trim())
+    const res = isRegisterMode.value
+      ? await api.register(emailInput.value.trim(), passwordInput.value, inviteCodeInput.value.trim())
+      : await api.login(emailInput.value.trim(), passwordInput.value, totpInput.value.trim())
     passwordInput.value = ''
     totpInput.value = ''
     totpRequired.value = false
+    isRegisterMode.value = false
     localStorage.setItem('nexus_token', res.token)
     token.value = res.token
     user.value = res.user
@@ -1295,7 +1502,7 @@ async function handleAuth() {
     if (e?.totp_required) {
       totpRequired.value = true
     }
-    authError.value = e.message || '登录失败'
+    authError.value = e.message || (isRegisterMode.value ? '注册失败' : '登录失败')
   }
 }
 
@@ -1337,19 +1544,24 @@ async function refreshAll() {
     if (cfg) {
       siteConfig.value = cfg
       document.title = cfg.site_name || 'Zachary Panel'
+      if (!cfg.allow_register) {
+        isRegisterMode.value = false
+      } else if (!token.value && inviteCodeInput.value) {
+        isRegisterMode.value = true
+      }
     }
   } catch {
     // ignore
   }
   if (!token.value) return
   try {
-    const [dash, nodeList, lineList, ruleList, planList, roleList] = await Promise.all([
+    const [dash, nodeList, lineList, planList, roleList, affOv] = await Promise.all([
       api.getDashboard(),
       api.getNodes(),
       api.getLines(),
-      api.getRules(),
       api.getPlans(),
       api.getRoles().catch(() => []),
+      api.getAffiliateOverview().catch(() => null),
     ])
     user.value = dash.user
     hourlyStats.value = dash.hourly_stats || []
@@ -1358,27 +1570,44 @@ async function refreshAll() {
     topNodes.value = dash.top_nodes || []
     nodes.value = nodeList
     lines.value = lineList
-    rules.value = ruleList
     plans.value = planList
     rolesList.value = roleList
+    if (affOv) {
+      affiliateOverview.value = affOv
+    }
     if (dash.user.role === 'admin') {
-      const [uList, adminCfg, rcList, ordList, aLogs] = await Promise.all([
+      const [ruleList, uList, adminCfg, rcList, ordList, aLogs, cpList, wdList, tkList] = await Promise.all([
+        api.getRules({ all: true }),
         api.adminListUsers().catch(() => []),
         api.adminGetSettings().catch(() => null),
         api.adminListRedeemCodes().catch(() => []),
         api.getOrders({ all: true }).catch(() => []),
         api.adminListAuditLogs().catch(() => []),
+        api.adminListCoupons().catch(() => []),
+        api.adminListWithdrawals().catch(() => []),
+        api.adminListTickets().catch(() => []),
       ])
+      rules.value = ruleList
       usersList.value = uList
       redeemCodesList.value = rcList
       ordersList.value = ordList
       auditLogsList.value = aLogs
+      couponsList.value = cpList
+      adminWithdrawalsList.value = wdList
+      ticketsList.value = tkList
       if (adminCfg) {
         siteConfig.value = adminCfg
         syncSettingsForm()
       }
     } else {
-      ordersList.value = await api.getOrders().catch(() => [])
+      const [ruleList, ordList, tkList] = await Promise.all([
+        api.getRules(),
+        api.getOrders().catch(() => []),
+        api.listTickets().catch(() => []),
+      ])
+      rules.value = ruleList
+      ordersList.value = ordList
+      ticketsList.value = tkList
       if (['lines', 'nodes', 'roles', 'users', 'settings'].includes(activeTab.value)) {
         activeTab.value = 'dashboard'
       }
@@ -1630,11 +1859,8 @@ async function handleResetSubscription() {
     showToast('当前账号未绑定套餐，请先在下方选购套餐')
     return
   }
-  if (
-    !window.confirm(
-      `确定花费 ¥${(p.price_cents / 100).toFixed(2)} 重置当前套餐「${p.name}」的订阅周期吗？\n这将立即清零已用流量、顺延 ${p.duration_days} 天有效期，并自动恢复因超额暂停的转发规则。`,
-    )
-  ) {
+  if (p.price_cents > 0) {
+    openCheckoutModal('plan_reset', p)
     return
   }
   try {
@@ -1666,6 +1892,9 @@ async function handleRedeem() {
 const showRedeemGenModal = ref(false)
 const redeemFilterStatus = ref<'all' | 'unused' | 'used'>('all')
 const redeemSearchKeyword = ref('')
+const debouncedRedeemSearch = useDebouncedRef(redeemSearchKeyword, 220)
+const redeemPage = ref(1)
+const redeemPageSize = ref(20)
 const lastGeneratedCodes = ref<string[]>([])
 const redeemGenForm = ref({
   cardType: 'plan' as 'plan' | 'balance' | 'quota',
@@ -1679,7 +1908,7 @@ const redeemGenForm = ref({
 })
 
 const filteredRedeemCodes = computed(() => {
-  const kw = redeemSearchKeyword.value.trim().toLowerCase()
+  const kw = debouncedRedeemSearch.value.trim().toLowerCase()
   return redeemCodesList.value.filter((rc) => {
     if (redeemFilterStatus.value === 'unused' && rc.used_by > 0) return false
     if (redeemFilterStatus.value === 'used' && rc.used_by === 0) return false
@@ -1689,6 +1918,16 @@ const filteredRedeemCodes = computed(() => {
     }
     return true
   })
+})
+
+const redeemTotalPages = computed(() => Math.max(1, Math.ceil(filteredRedeemCodes.value.length / redeemPageSize.value)))
+const pagedRedeemCodes = computed(() => {
+  const p = Math.min(redeemPage.value, redeemTotalPages.value)
+  const start = (p - 1) * redeemPageSize.value
+  return filteredRedeemCodes.value.slice(start, start + redeemPageSize.value)
+})
+watch([debouncedRedeemSearch, redeemFilterStatus, redeemPageSize], () => {
+  redeemPage.value = 1
 })
 
 function openRedeemGenModal() {
@@ -1762,13 +2001,16 @@ async function submitGenerateRedeemCodes() {
 }
 
 async function copyAllUnusedRedeemCodes() {
-  const unused = filteredRedeemCodes.value.filter((rc) => rc.used_by === 0).map((rc) => rc.code)
+  const unused = filteredRedeemCodes.value
+    .filter((rc) => rc.used_by === 0)
+    .map((rc) => sanitizeExportField(rc.code, 64))
+    .filter(Boolean)
   if (unused.length === 0) {
     showToast('当前列表没有未使用的卡密')
     return
   }
   await copyConnectAddr(unused.join('\n'))
-  showToast(`已复制 ${unused.length} 张未使用卡密`)
+  showToast(`已安全复制 ${unused.length} 张未使用卡密`)
 }
 
 async function deleteRedeemCodeItem(rc: RedeemCodeItem) {
@@ -1804,6 +2046,35 @@ async function clearUsedRedeemCodes() {
 // --- 在线充值与账单明细 ---
 const showRechargeModal = ref(false)
 const lastCreatedOrder = ref<BillingOrder | null>(null)
+const safeCreatedOrderPayUrl = computed(() => safeExternalUrl(lastCreatedOrder.value?.pay_url))
+const orderSearchQuery = ref('')
+const debouncedOrderSearch = useDebouncedRef(orderSearchQuery, 220)
+const orderFilterStatus = ref<'all' | 'paid' | 'pending' | 'cancelled'>('all')
+const ordersPage = ref(1)
+const ordersPageSize = ref(20)
+
+const filteredOrders = computed(() => {
+  const q = debouncedOrderSearch.value.trim().toLowerCase()
+  return ordersList.value.filter((ord) => {
+    if (orderFilterStatus.value !== 'all' && ord.status !== orderFilterStatus.value) return false
+    if (q) {
+      const hay = `${ord.order_no} ${ord.user_email || ''} ${ord.plan_name || ''} ${ord.trade_no || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+})
+
+const ordersTotalPages = computed(() => Math.max(1, Math.ceil(filteredOrders.value.length / ordersPageSize.value)))
+const pagedOrders = computed(() => {
+  const p = Math.min(ordersPage.value, ordersTotalPages.value)
+  const start = (p - 1) * ordersPageSize.value
+  return filteredOrders.value.slice(start, start + ordersPageSize.value)
+})
+watch([debouncedOrderSearch, orderFilterStatus, ordersPageSize], () => {
+  ordersPage.value = 1
+})
+
 const rechargeForm = ref({
   amount_yuan: 50,
   gateway: 'epay' as 'epay' | 'usdt' | 'manual',
@@ -1831,9 +2102,12 @@ async function submitRechargeOrder() {
     })
     lastCreatedOrder.value = order
     ordersList.value = [order, ...ordersList.value]
-    if (order.pay_url) {
-      window.open(order.pay_url, '_blank', 'noopener,noreferrer')
+    const safeUrl = safeExternalUrl(order.pay_url)
+    if (safeUrl) {
+      window.open(safeUrl, '_blank', 'noopener,noreferrer')
       showToast('已生成充值订单并打开支付页面')
+    } else if (order.pay_url) {
+      showToast('支付跳转链接协议不安全，已拦截外部跳转')
     } else {
       showToast(`充值订单 ${order.order_no} 已创建，请按说明完成支付`)
     }
@@ -1860,6 +2134,18 @@ async function confirmOrderAdmin(ord: BillingOrder) {
   }
 }
 
+function formatDateTimeDisplay(iso?: string): string {
+  if (!iso || iso.startsWith('0001-')) return '-'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return '-'
+  const yyyy = d.getFullYear()
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mi = String(d.getMinutes()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`
+}
+
 function orderTypeLabel(tp: string): string {
   switch (tp) {
     case 'recharge':
@@ -1870,12 +2156,116 @@ function orderTypeLabel(tp: string): string {
       return '重置周期'
     case 'redeem':
       return '卡密核销'
+    case 'affiliate_transfer':
+      return '佣金转余额'
     default:
       return tp
   }
 }
 
+// --- 商业增长闭环 1：套餐结算台 + 优惠券实时试算抵扣 & 管理员优惠券管理 ---
+const showCheckoutModal = ref(false)
+const checkoutScene = ref<'plan_purchase' | 'plan_reset'>('plan_purchase')
+const checkoutPlan = ref<Plan | null>(null)
+const checkoutCouponInput = ref('')
+const checkoutCouponPreview = ref<CouponPreviewResp | null>(null)
+const checkoutCouponError = ref('')
+const checkoutPreviewLoading = ref(false)
+const checkoutSubmitting = ref(false)
+
+watch(checkoutCouponInput, (val) => {
+  const norm = val.trim().toUpperCase()
+  if (checkoutCouponPreview.value && checkoutCouponPreview.value.coupon_code !== norm) {
+    checkoutCouponPreview.value = null
+  }
+  if (checkoutCouponError.value) {
+    checkoutCouponError.value = ''
+  }
+})
+
+const checkoutPayableCents = computed(() => {
+  if (checkoutCouponPreview.value) return checkoutCouponPreview.value.payable_cents
+  return checkoutPlan.value?.price_cents || 0
+})
+
+function openCheckoutModal(scene: 'plan_purchase' | 'plan_reset', plan: Plan) {
+  checkoutScene.value = scene
+  checkoutPlan.value = plan
+  checkoutCouponInput.value = ''
+  checkoutCouponPreview.value = null
+  checkoutCouponError.value = ''
+  checkoutPreviewLoading.value = false
+  checkoutSubmitting.value = false
+  showCheckoutModal.value = true
+}
+
+function clearCheckoutCoupon() {
+  checkoutCouponInput.value = ''
+  checkoutCouponPreview.value = null
+  checkoutCouponError.value = ''
+}
+
+async function handlePreviewCheckoutCoupon() {
+  if (!checkoutPlan.value) return
+  const code = checkoutCouponInput.value.trim()
+  if (!code) {
+    checkoutCouponPreview.value = null
+    checkoutCouponError.value = '请输入优惠券码后再点击试算'
+    return
+  }
+  checkoutPreviewLoading.value = true
+  checkoutCouponError.value = ''
+  try {
+    const res = await api.previewCoupon({
+      code,
+      plan_id: checkoutPlan.value.id,
+      scene: checkoutScene.value,
+    })
+    checkoutCouponPreview.value = res
+    checkoutCouponInput.value = res.coupon_code
+  } catch (e: any) {
+    checkoutCouponPreview.value = null
+    checkoutCouponError.value = e.message || '优惠券试算失败'
+  } finally {
+    checkoutPreviewLoading.value = false
+  }
+}
+
+async function confirmCheckoutPayment() {
+  const plan = checkoutPlan.value
+  if (!plan || checkoutSubmitting.value) return
+  const typedCode = checkoutCouponInput.value.trim()
+  if (typedCode && !checkoutCouponPreview.value) {
+    await handlePreviewCheckoutCoupon()
+    if (!checkoutCouponPreview.value) {
+      return
+    }
+  }
+  const appliedCode = checkoutCouponPreview.value?.coupon_code || undefined
+  checkoutSubmitting.value = true
+  try {
+    const res =
+      checkoutScene.value === 'plan_reset'
+        ? await api.resetSubscription(appliedCode)
+        : await api.purchasePlan(plan.id, appliedCode)
+    user.value = res.user
+    showCheckoutModal.value = false
+    showToast(res.message)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  } finally {
+    checkoutSubmitting.value = false
+  }
+}
+
 async function handleBuyPlan(planId: number) {
+  const plan = plans.value.find((p) => p.id === planId)
+  if (!plan) return
+  if (plan.price_cents > 0) {
+    openCheckoutModal('plan_purchase', plan)
+    return
+  }
   try {
     const res = await api.purchasePlan(planId)
     showToast(res.message)
@@ -1885,8 +2275,527 @@ async function handleBuyPlan(planId: number) {
   }
 }
 
+const couponSearchQuery = ref('')
+const debouncedCouponSearch = useDebouncedRef(couponSearchQuery, 220)
+const couponsPage = ref(1)
+const couponsPageSize = ref(20)
+
+const filteredCoupons = computed(() => {
+  const q = debouncedCouponSearch.value.trim().toLowerCase()
+  if (!q) return couponsList.value
+  return couponsList.value.filter((cp) => `${cp.code} ${cp.name}`.toLowerCase().includes(q))
+})
+const couponsTotalPages = computed(() => Math.max(1, Math.ceil(filteredCoupons.value.length / couponsPageSize.value)))
+const pagedCoupons = computed(() => {
+  const p = Math.min(couponsPage.value, couponsTotalPages.value)
+  const start = (p - 1) * couponsPageSize.value
+  return filteredCoupons.value.slice(start, start + couponsPageSize.value)
+})
+watch([debouncedCouponSearch, couponsPageSize], () => {
+  couponsPage.value = 1
+})
+
+const showCouponModal = ref(false)
+const editingCouponId = ref<number | null>(null)
+const couponForm = ref({
+  code: '',
+  name: '',
+  type: 'percent' as 'percent' | 'fixed',
+  percent_value: 20,
+  fixed_yuan: 10,
+  min_spend_yuan: 0,
+  max_discount_yuan: 0,
+  allowedPlanIds: [] as number[],
+  starts_at: '',
+  ends_at: '',
+  max_uses: 0,
+  per_user_limit: 1,
+  active: true,
+})
+
+function openCreateCouponModal() {
+  if (!isAdmin.value) return
+  editingCouponId.value = null
+  couponForm.value = {
+    code: '',
+    name: '',
+    type: 'percent',
+    percent_value: 20,
+    fixed_yuan: 10,
+    min_spend_yuan: 0,
+    max_discount_yuan: 0,
+    allowedPlanIds: [],
+    starts_at: '',
+    ends_at: '',
+    max_uses: 0,
+    per_user_limit: 1,
+    active: true,
+  }
+  showCouponModal.value = true
+}
+
+function openEditCouponModal(cp: CouponItem) {
+  if (!isAdmin.value) return
+  editingCouponId.value = cp.id
+  couponForm.value = {
+    code: cp.code,
+    name: cp.name,
+    type: cp.type,
+    percent_value: cp.type === 'percent' ? cp.value : 20,
+    fixed_yuan: cp.type === 'fixed' ? Number((cp.value / 100).toFixed(2)) : 10,
+    min_spend_yuan: Number(((cp.min_spend_cents || 0) / 100).toFixed(2)),
+    max_discount_yuan: Number(((cp.max_discount_cents || 0) / 100).toFixed(2)),
+    allowedPlanIds: parseAllowedIds(cp.allowed_plan_ids),
+    starts_at: formatDateInput(cp.starts_at),
+    ends_at: formatDateInput(cp.ends_at),
+    max_uses: cp.max_uses || 0,
+    per_user_limit: cp.per_user_limit ?? 1,
+    active: cp.active,
+  }
+  showCouponModal.value = true
+}
+
+async function submitCouponForm() {
+  if (!isAdmin.value) return
+  const f = couponForm.value
+  if (!f.name.trim()) {
+    showToast('请输入优惠券名称')
+    return
+  }
+  const value =
+    f.type === 'percent'
+      ? Math.round(Number(f.percent_value) || 0)
+      : Math.round(Math.max(0, Number(f.fixed_yuan) || 0) * 100)
+  const payload = {
+    code: f.code.trim() || undefined,
+    name: f.name.trim(),
+    type: f.type,
+    value,
+    min_spend_cents: Math.round(Math.max(0, Number(f.min_spend_yuan) || 0) * 100),
+    max_discount_cents:
+      f.type === 'percent' ? Math.round(Math.max(0, Number(f.max_discount_yuan) || 0) * 100) : 0,
+    allowed_plan_ids: f.allowedPlanIds.join(','),
+    starts_at: f.starts_at ? f.starts_at.trim() : '',
+    ends_at: f.ends_at ? f.ends_at.trim() : '',
+    max_uses: Math.max(0, Math.round(Number(f.max_uses) || 0)),
+    per_user_limit: Math.max(0, Math.round(Number(f.per_user_limit) || 0)),
+    active: Boolean(f.active),
+  }
+  try {
+    if (editingCouponId.value) {
+      await api.adminUpdateCoupon(editingCouponId.value, payload)
+      showToast('优惠券配置已更新')
+    } else {
+      const created = await api.adminCreateCoupon(payload)
+      showToast(`优惠券 ${created.code} 已创建`)
+    }
+    showCouponModal.value = false
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function toggleCouponActive(cp: CouponItem) {
+  if (!isAdmin.value) return
+  try {
+    const updated = await api.adminUpdateCoupon(cp.id, {
+      name: cp.name,
+      type: cp.type,
+      value: cp.value,
+      min_spend_cents: cp.min_spend_cents,
+      max_discount_cents: cp.max_discount_cents,
+      allowed_plan_ids: cp.allowed_plan_ids,
+      starts_at: cp.starts_at || '',
+      ends_at: cp.ends_at || '',
+      max_uses: cp.max_uses,
+      per_user_limit: cp.per_user_limit,
+      active: !cp.active,
+    })
+    cp.active = updated.active
+    showToast(updated.active ? `优惠券 ${cp.code} 已启用` : `优惠券 ${cp.code} 已停用`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function deleteCouponItem(cp: CouponItem) {
+  if (!isAdmin.value) return
+  if (!window.confirm(`确定删除优惠券「${cp.name}」(${cp.code}) 吗？`)) return
+  try {
+    await api.adminDeleteCoupon(cp.id)
+    couponsList.value = couponsList.value.filter((x) => x.id !== cp.id)
+    showToast(`已删除优惠券 ${cp.code}`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+// --- 商业增长闭环 2：邀请返利 / 推广分销中心 ---
+function affiliateSceneLabel(scene: string): string {
+  switch (scene) {
+    case 'recharge':
+      return '受邀人充值'
+    case 'plan_purchase':
+      return '购买套餐'
+    case 'plan_reset':
+      return '周期重置'
+    default:
+      return scene
+  }
+}
+
+function withdrawMethodLabel(method: string): string {
+  switch (method) {
+    case 'usdt':
+      return 'USDT-TRC20'
+    case 'alipay':
+      return '支付宝'
+    case 'wechat':
+      return '微信收款'
+    case 'bank':
+      return '银行卡'
+    default:
+      return method.toUpperCase()
+  }
+}
+
+async function handleTransferCommission() {
+  const avail = affiliateOverview.value?.commission_balance_cents ?? user.value?.commission_balance_cents ?? 0
+  if (avail <= 0) {
+    showToast('当前暂无可划转的推广佣金')
+    return
+  }
+  if (!window.confirm(`确定将全部可用推广佣金 ¥${(avail / 100).toFixed(2)} 一键划转至账户余额吗？`)) {
+    return
+  }
+  try {
+    const res = await api.transferAffiliateCommission(0)
+    user.value = res.user
+    showToast(res.message)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+const showWithdrawModal = ref(false)
+const withdrawForm = ref({
+  amount_yuan: 50,
+  method: 'usdt' as 'usdt' | 'alipay' | 'wechat' | 'bank',
+  account: '',
+  real_name: '',
+})
+
+function openWithdrawModal() {
+  const avail = affiliateOverview.value?.commission_balance_cents ?? user.value?.commission_balance_cents ?? 0
+  const minCents = affiliateOverview.value?.min_withdraw_cents ?? siteConfig.value.affiliate_min_withdraw_cents ?? 1000
+  withdrawForm.value = {
+    amount_yuan: Number((Math.max(minCents, avail) / 100).toFixed(2)),
+    method: 'usdt',
+    account: '',
+    real_name: '',
+  }
+  showWithdrawModal.value = true
+}
+
+async function submitWithdrawRequest() {
+  const amountCents = Math.round(Math.max(0, Number(withdrawForm.value.amount_yuan) || 0) * 100)
+  if (amountCents <= 0) {
+    showToast('请输入有效的提现金额')
+    return
+  }
+  if (!withdrawForm.value.account.trim()) {
+    showToast('请填写收款钱包地址或收款账号')
+    return
+  }
+  try {
+    const res = await api.requestAffiliateWithdraw({
+      amount_cents: amountCents,
+      method: withdrawForm.value.method,
+      account: withdrawForm.value.account.trim(),
+      real_name: withdrawForm.value.real_name.trim() || undefined,
+    })
+    user.value = res.user
+    showWithdrawModal.value = false
+    showToast(res.message)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+const withdrawFilterStatus = ref<'all' | 'pending' | 'approved' | 'rejected'>('all')
+const withdrawSearchQuery = ref('')
+const debouncedWithdrawSearch = useDebouncedRef(withdrawSearchQuery, 220)
+
+const filteredAdminWithdrawals = computed(() => {
+  const q = debouncedWithdrawSearch.value.trim().toLowerCase()
+  return adminWithdrawalsList.value.filter((wd) => {
+    if (withdrawFilterStatus.value !== 'all' && wd.status !== withdrawFilterStatus.value) return false
+    if (q) {
+      const hay = `${wd.withdraw_no} ${wd.user_email} ${wd.account} ${wd.real_name || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+})
+
+async function reviewWithdrawalAdmin(wd: AffiliateWithdrawalItem, action: 'approve' | 'reject') {
+  if (!isAdmin.value) return
+  const label = action === 'approve' ? '确认已打款并通过审核' : '驳回申请并将冻结佣金原路退回用户佣金余额'
+  const remark = window.prompt(`提现单 ${wd.withdraw_no} (¥${(wd.amount_cents / 100).toFixed(2)}) — ${label}\n请输入审核备注（可留空）：`, '')
+  if (remark === null) return
+  try {
+    const res = await api.adminReviewWithdrawal(wd.id, { action, remark: remark.trim() })
+    showToast(res.message)
+    await refreshAll()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+// --- 商业增长闭环 3：工单客服中心 (Ticket) ---
+const ticketFilterStatus = ref<'all' | 'open' | 'answered' | 'customer_reply' | 'closed'>('all')
+const ticketFilterCategory = ref<'all' | 'network' | 'rule' | 'billing' | 'account' | 'general'>('all')
+const ticketSearchQuery = ref('')
+const debouncedTicketSearch = useDebouncedRef(ticketSearchQuery, 220)
+const ticketsPage = ref(1)
+const ticketsPageSize = ref(20)
+
+const filteredTickets = computed(() => {
+  const q = debouncedTicketSearch.value.trim().toLowerCase()
+  return ticketsList.value.filter((tk) => {
+    if (ticketFilterStatus.value !== 'all' && tk.status !== ticketFilterStatus.value) return false
+    if (ticketFilterCategory.value !== 'all' && tk.category !== ticketFilterCategory.value) return false
+    if (q) {
+      const hay = `${tk.ticket_no} ${tk.subject} ${tk.user_email || ''} ${tk.rule_name || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    return true
+  })
+})
+
+const ticketsTotalPages = computed(() => Math.max(1, Math.ceil(filteredTickets.value.length / ticketsPageSize.value)))
+const pagedTickets = computed(() => {
+  const p = Math.min(ticketsPage.value, ticketsTotalPages.value)
+  const start = (p - 1) * ticketsPageSize.value
+  return filteredTickets.value.slice(start, start + ticketsPageSize.value)
+})
+watch([debouncedTicketSearch, ticketFilterStatus, ticketFilterCategory, ticketsPageSize], () => {
+  ticketsPage.value = 1
+})
+
+const pendingTicketCount = computed(() => {
+  if (isAdmin.value) {
+    return ticketsList.value.filter((t) => t.status === 'open' || t.status === 'customer_reply').length
+  }
+  return ticketsList.value.filter((t) => t.status === 'answered').length
+})
+
+function ticketCategoryText(cat: string): string {
+  switch (cat) {
+    case 'network':
+      return '线路与网络'
+    case 'rule':
+      return '转发规则'
+    case 'billing':
+      return '账单与支付'
+    case 'account':
+      return '账号与权限'
+    default:
+      return '综合咨询'
+  }
+}
+
+function ticketPriorityText(prio: string): string {
+  switch (prio) {
+    case 'urgent':
+      return '紧急'
+    case 'high':
+      return '高优'
+    case 'low':
+      return '低优'
+    default:
+      return '常规'
+  }
+}
+
+function ticketPriorityBadge(prio: string): string {
+  switch (prio) {
+    case 'urgent':
+      return 'badge-danger'
+    case 'high':
+      return 'badge-warning'
+    case 'low':
+      return 'badge-neutral'
+    default:
+      return 'badge-info'
+  }
+}
+
+function ticketStatusText(st: string): string {
+  switch (st) {
+    case 'open':
+      return '待受理'
+    case 'answered':
+      return '客服已回复'
+    case 'customer_reply':
+      return '用户追问中'
+    case 'closed':
+      return '已结单'
+    default:
+      return st
+  }
+}
+
+function ticketStatusBadge(st: string): string {
+  switch (st) {
+    case 'open':
+      return 'badge-warning'
+    case 'answered':
+      return 'badge-success'
+    case 'customer_reply':
+      return 'badge-primary'
+    case 'closed':
+      return 'badge-neutral'
+    default:
+      return 'badge-neutral'
+  }
+}
+
+const showCreateTicketModal = ref(false)
+const ticketCreateForm = ref({
+  subject: '',
+  category: 'network' as 'network' | 'rule' | 'billing' | 'account' | 'general',
+  priority: 'normal' as 'low' | 'normal' | 'high' | 'urgent',
+  rule_id: 0,
+  message: '',
+})
+
+function openCreateTicketModal() {
+  ticketCreateForm.value = {
+    subject: '',
+    category: 'network',
+    priority: 'normal',
+    rule_id: 0,
+    message: '',
+  }
+  showCreateTicketModal.value = true
+}
+
+async function submitCreateTicket() {
+  const f = ticketCreateForm.value
+  if (!f.subject.trim() || !f.message.trim()) {
+    showToast('请填写工单标题与详细问题描述')
+    return
+  }
+  try {
+    const res = await api.createTicket({
+      subject: f.subject.trim(),
+      category: f.category,
+      priority: f.priority,
+      rule_id: Number(f.rule_id) > 0 ? Number(f.rule_id) : undefined,
+      message: f.message.trim(),
+    })
+    showCreateTicketModal.value = false
+    ticketsList.value = [res.ticket, ...ticketsList.value]
+    showToast(`工单 ${res.ticket.ticket_no} 已提交，客服将尽快响应`)
+    activeTicket.value = res.ticket
+    activeTicketMessages.value = res.messages || []
+    ticketReplyInput.value = ''
+    showTicketDetailModal.value = true
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+const showTicketDetailModal = ref(false)
+const activeTicket = ref<SupportTicketItem | null>(null)
+const activeTicketMessages = ref<TicketMessageItem[]>([])
+const ticketReplyInput = ref('')
+const ticketThreadRef = ref<HTMLElement | null>(null)
+
+function scrollTicketThreadToBottom() {
+  nextTick(() => {
+    if (ticketThreadRef.value) {
+      ticketThreadRef.value.scrollTop = ticketThreadRef.value.scrollHeight
+    }
+  })
+}
+
+async function openTicketDetail(tk: SupportTicketItem) {
+  try {
+    const res = await api.getTicketDetail(tk.id)
+    activeTicket.value = res.ticket
+    activeTicketMessages.value = res.messages || []
+    ticketReplyInput.value = ''
+    showTicketDetailModal.value = true
+    scrollTicketThreadToBottom()
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function submitTicketReply() {
+  if (!activeTicket.value) return
+  const msg = ticketReplyInput.value.trim()
+  if (!msg) {
+    showToast('请输入回复内容')
+    return
+  }
+  try {
+    const res = await api.replyTicket(activeTicket.value.id, msg)
+    activeTicket.value = res.ticket
+    activeTicketMessages.value = [...activeTicketMessages.value, res.message]
+    ticketReplyInput.value = ''
+    const idx = ticketsList.value.findIndex((x) => x.id === res.ticket.id)
+    if (idx >= 0) {
+      ticketsList.value[idx] = res.ticket
+    }
+    scrollTicketThreadToBottom()
+    showToast('回复已发送')
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function handleCloseActiveTicket(target?: SupportTicketItem) {
+  const tk = target || activeTicket.value
+  if (!tk) return
+  if (!window.confirm(`确定关闭工单「${tk.subject}」(${tk.ticket_no}) 吗？`)) return
+  try {
+    const res = await api.closeTicket(tk.id)
+    if (activeTicket.value?.id === tk.id) {
+      activeTicket.value = res.ticket
+    }
+    const idx = ticketsList.value.findIndex((x) => x.id === tk.id)
+    if (idx >= 0) {
+      ticketsList.value[idx] = res.ticket
+    }
+    showToast(res.message || '工单已结单')
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function handleAdminTicketStatusChange(status: string, priority?: string) {
+  if (!isAdmin.value || !activeTicket.value) return
+  try {
+    const res = await api.adminUpdateTicketStatus(activeTicket.value.id, { status, priority })
+    activeTicket.value = res.ticket
+    const idx = ticketsList.value.findIndex((x) => x.id === res.ticket.id)
+    if (idx >= 0) {
+      ticketsList.value[idx] = res.ticket
+    }
+    showToast(res.message)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
 function getTunnelById(id: number): TunnelLine | undefined {
-  return lines.value.find((l) => l.id === id)
+  return lineMap.value.get(id)
 }
 
 // 规则实际运行引擎与配置引擎不同（限速规则从 gost/realm 回退到 native）
@@ -1895,16 +2804,16 @@ function ruleEngineFallback(rule: ForwardRule): boolean {
 }
 
 function nodeNameById(id: number): string {
-  return nodes.value.find((n) => n.id === id)?.name || `#${id}`
+  return nodeMap.value.get(id)?.name || `#${id}`
 }
 
 function nodeConnectIPById(id: number): string {
-  const n = nodes.value.find((n) => n.id === id)
+  const n = nodeMap.value.get(id)
   return n ? n.connect_ip || n.public_host || n.server_ip : '127.0.0.1'
 }
 
 function userEmailById(uid: number): string {
-  return usersList.value.find((u) => u.id === uid)?.email || `#${uid}`
+  return userMap.value.get(uid)?.email || `#${uid}`
 }
 
 const targetsCache: Record<string, TargetEndpoint[]> = {}
@@ -1919,8 +2828,337 @@ function parseTargets(jsonStr: string): TargetEndpoint[] {
   }
 }
 
+// --- 全局 Ctrl / Cmd + K 快速检索与跳转面板 + Esc 快捷键关闭 ---
+interface CommandItem {
+  id: string
+  category: string
+  badgeClass?: string
+  title: string
+  subtitle?: string
+  keywords: string
+  run: () => void
+}
+
+const showCommandPalette = ref(false)
+const cmdkQuery = ref('')
+const cmdkActiveIndex = ref(0)
+const cmdkInputRef = ref<HTMLInputElement | null>(null)
+
+function openCommandPalette() {
+  if (!token.value) return
+  showCommandPalette.value = true
+  cmdkQuery.value = ''
+  cmdkActiveIndex.value = 0
+  nextTick(() => {
+    cmdkInputRef.value?.focus()
+  })
+}
+
+const commandItems = computed<CommandItem[]>(() => {
+  if (!token.value) return []
+  const items: CommandItem[] = [
+    {
+      id: 'nav-dashboard',
+      category: '导航',
+      badgeClass: 'badge-primary',
+      title: '前往 概览仪表盘',
+      subtitle: '查看流量趋势、订阅链接与配额使用率',
+      keywords: 'dashboard 概览 首页 监控 趋势 订阅',
+      run: () => switchTab('dashboard'),
+    },
+    {
+      id: 'nav-rules',
+      category: '导航',
+      badgeClass: 'badge-primary',
+      title: '前往 转发管理',
+      subtitle: `管理当前 ${visibleRules.value.length} 条端口与专线转发规则`,
+      keywords: 'rules 转发 规则 端口 测速 导入 导出',
+      run: () => switchTab('rules'),
+    },
+    {
+      id: 'nav-store',
+      category: '导航',
+      badgeClass: 'badge-primary',
+      title: '前往 套餐与账单中心',
+      subtitle: '购买套餐、优惠券抵扣、充值余额、核销卡密与账单',
+      keywords: 'store coupon 套餐 商城 优惠券 折扣码 充值 账单 订单 卡密 兑换码',
+      run: () => switchTab('store'),
+    },
+    {
+      id: 'nav-affiliate',
+      category: '导航',
+      badgeClass: 'badge-primary',
+      title: '前往 推广返利中心',
+      subtitle: '复制专属推广链接、查看返佣明细、一键划转余额或申请提现',
+      keywords: 'affiliate invite referral 推广 邀请 返利 分销 佣金 提现',
+      run: () => switchTab('affiliate'),
+    },
+    {
+      id: 'nav-tickets',
+      category: '导航',
+      badgeClass: 'badge-primary',
+      title: '前往 工单客服中心',
+      subtitle: `提交技术与账单工单、对话追问（当前 ${ticketsList.value.length} 张工单）`,
+      keywords: 'tickets support 工单 客服 售后 咨询 故障',
+      run: () => switchTab('tickets'),
+    },
+    {
+      id: 'act-create-rule',
+      category: '操作',
+      badgeClass: 'badge-success',
+      title: '+ 新增转发规则',
+      subtitle: '快速创建 TCP / UDP / 加密隧道转发规则',
+      keywords: 'create add rule 新增 创建 转发 规则',
+      run: () => {
+        switchTab('rules')
+        openCreateRuleModal()
+      },
+    },
+    {
+      id: 'act-batch-rule',
+      category: '操作',
+      badgeClass: 'badge-info',
+      title: '批量导入转发规则',
+      subtitle: '支持多行文本、CSV 或 JSON 批量创建规则',
+      keywords: 'batch import 批量 导入 规则',
+      run: () => {
+        switchTab('rules')
+        openBatchModal()
+      },
+    },
+    {
+      id: 'act-create-ticket',
+      category: '操作',
+      badgeClass: 'badge-info',
+      title: '+ 提交客服工单',
+      subtitle: '关联转发规则发起网络、账单或账号技术支持工单',
+      keywords: 'ticket support create 提交 新建 工单 客服',
+      run: () => {
+        switchTab('tickets')
+        openCreateTicketModal()
+      },
+    },
+    {
+      id: 'act-recharge',
+      category: '操作',
+      badgeClass: 'badge-success',
+      title: '在线充值账户余额',
+      subtitle: '支持易支付收银台 / USDT-TRC20 / 人工充值',
+      keywords: 'recharge pay topup 充值 余额 支付 usdt epay',
+      run: () => openRechargeModal(),
+    },
+    {
+      id: 'act-security',
+      category: '安全',
+      badgeClass: 'badge-warning',
+      title: '修改密码 / 配置双因素认证 (2FA)',
+      subtitle: user.value?.totp_enabled ? '当前 2FA 已启用' : '绑定 Google / Microsoft Authenticator',
+      keywords: 'password totp 2fa 安全 密码 双因素 认证',
+      run: () => openPasswordModal(),
+    },
+    {
+      id: 'act-theme',
+      category: '界面',
+      badgeClass: 'badge-neutral',
+      title: isDark.value ? '切换至 浅色主题 (Light)' : '切换至 深色主题 (Dark)',
+      subtitle: '即时切换并记住您的深浅色偏好',
+      keywords: 'theme dark light 深色 浅色 夜间 主题 外观',
+      run: () => toggleTheme(),
+    },
+  ]
+
+  if (isAdmin.value) {
+    items.push(
+      {
+        id: 'nav-lines',
+        category: '管理',
+        badgeClass: 'badge-purple',
+        title: '前往 隧道管理',
+        subtitle: `共 ${lines.value.length} 条端口直转与加密对接隧道`,
+        keywords: 'lines tunnels 隧道 专线 线路',
+        run: () => switchTab('lines'),
+      },
+      {
+        id: 'nav-nodes',
+        category: '管理',
+        badgeClass: 'badge-purple',
+        title: '前往 节点管理',
+        subtitle: `共 ${nodes.value.length} 台转发节点服务器`,
+        keywords: 'nodes servers 节点 服务器 探针 升级 对接',
+        run: () => switchTab('nodes'),
+      },
+      {
+        id: 'nav-roles',
+        category: '管理',
+        badgeClass: 'badge-purple',
+        title: '前往 角色管理',
+        subtitle: '配置角色权限组与授权可用隧道',
+        keywords: 'roles groups 角色 权限组',
+        run: () => switchTab('roles'),
+      },
+      {
+        id: 'nav-users',
+        category: '管理',
+        badgeClass: 'badge-purple',
+        title: '前往 用户管理',
+        subtitle: `共 ${usersList.value.length} 位注册用户`,
+        keywords: 'users tenants 用户 账号 配额 封禁',
+        run: () => switchTab('users'),
+      },
+      {
+        id: 'nav-settings',
+        category: '管理',
+        badgeClass: 'badge-purple',
+        title: '前往 系统设置与审计日志',
+        subtitle: '支付网关、分销返佣、告警通知、API Key、SQLite 热备与审计',
+        keywords: 'settings audit backup 设置 分销 告警 支付 审计 备份 api key',
+        run: () => switchTab('settings'),
+      },
+      {
+        id: 'act-add-coupon',
+        category: '操作',
+        badgeClass: 'badge-success',
+        title: '+ 新增优惠券 / 折扣码',
+        subtitle: '创建百分比折扣券或固定满减券并限定适用套餐',
+        keywords: 'coupon discount 优惠券 折扣码 满减 新增',
+        run: () => {
+          switchTab('store')
+          openCreateCouponModal()
+        },
+      },
+      {
+        id: 'act-add-node',
+        category: '操作',
+        badgeClass: 'badge-success',
+        title: '+ 新增转发节点',
+        subtitle: '注册新节点并生成 Agent 对接脚本',
+        keywords: 'add create node 新增 节点 服务器',
+        run: () => {
+          switchTab('nodes')
+          openCreateNodeModal()
+        },
+      },
+      {
+        id: 'act-backup-db',
+        category: '运维',
+        badgeClass: 'badge-info',
+        title: '一键导出 SQLite 热备快照 (.db)',
+        subtitle: '在线一致性导出主控数据库文件',
+        keywords: 'sqlite backup db 热备 备份 导出 数据库',
+        run: () => downloadSQLiteBackup(),
+      },
+    )
+  }
+
+  for (const r of visibleRules.value.slice(0, 50)) {
+    const addr = `${nodeConnectIPById(r.ingress_node_id)}:${r.listen_port}`
+    items.push({
+      id: `rule-${r.id}`,
+      category: '规则',
+      badgeClass: r.enabled ? 'badge-success' : 'badge-neutral',
+      title: `${r.name} (${addr})`,
+      subtitle: `${r.protocol.toUpperCase()} · ${getTunnelById(r.tunnel_line_id)?.name || '直连'}`,
+      keywords: `${r.name} ${r.listen_port} ${r.targets_json} ${addr}`,
+      run: () => {
+        switchTab('rules')
+        ruleSearchQuery.value = String(r.listen_port || r.name)
+      },
+    })
+  }
+
+  for (const tk of ticketsList.value.slice(0, 20)) {
+    items.push({
+      id: `ticket-${tk.id}`,
+      category: '工单',
+      badgeClass: ticketStatusBadge(tk.status),
+      title: `${tk.ticket_no} · ${tk.subject}`,
+      subtitle: `${ticketStatusText(tk.status)} · ${tk.user_email}`,
+      keywords: `${tk.ticket_no} ${tk.subject} ${tk.user_email}`,
+      run: () => {
+        switchTab('tickets')
+        openTicketDetail(tk)
+      },
+    })
+  }
+
+  if (isAdmin.value) {
+    for (const n of nodes.value.slice(0, 30)) {
+      items.push({
+        id: `node-${n.id}`,
+        category: '节点',
+        badgeClass: n.status === 'online' ? 'badge-success' : 'badge-danger',
+        title: n.name,
+        subtitle: `${n.connect_ip || n.server_ip} · ${n.status === 'online' ? '在线' : '离线'}`,
+        keywords: `${n.name} ${n.connect_ip} ${n.server_ip}`,
+        run: () => {
+          switchTab('nodes')
+          openEditNodeModal(n)
+        },
+      })
+    }
+    for (const u of usersList.value.slice(0, 40)) {
+      items.push({
+        id: `user-${u.id}`,
+        category: '用户',
+        badgeClass: 'badge-info',
+        title: u.email,
+        subtitle: `#${u.id} · ${planNameById(u.plan_id)}`,
+        keywords: `${u.email} ${u.id}`,
+        run: () => {
+          switchTab('users')
+          userSearchQuery.value = u.email
+        },
+      })
+    }
+  }
+
+  return items
+})
+
+const filteredCommandItems = computed(() => {
+  const q = cmdkQuery.value.trim().toLowerCase()
+  if (!q) {
+    return commandItems.value.slice(0, 14)
+  }
+  const tokens = q.split(/\s+/).filter(Boolean)
+  return commandItems.value
+    .filter((item) => {
+      const hay = `${item.category} ${item.title} ${item.subtitle || ''} ${item.keywords}`.toLowerCase()
+      return tokens.every((tk) => hay.includes(tk))
+    })
+    .slice(0, 20)
+})
+
+watch(cmdkQuery, () => {
+  cmdkActiveIndex.value = 0
+})
+
+function moveCmdkSelection(delta: number) {
+  const len = filteredCommandItems.value.length
+  if (len === 0) return
+  cmdkActiveIndex.value = (cmdkActiveIndex.value + delta + len) % len
+}
+
+function runCommandItem(item: CommandItem) {
+  showCommandPalette.value = false
+  item.run()
+}
+
+function executeCmdkSelection() {
+  const item = filteredCommandItems.value[cmdkActiveIndex.value]
+  if (item) {
+    runCommandItem(item)
+  }
+}
+
 function isAnyModalOpen(): boolean {
   return (
+    showCommandPalette.value ||
+    showTicketDetailModal.value ||
+    showCreateTicketModal.value ||
+    showWithdrawModal.value ||
+    showCouponModal.value ||
+    showCheckoutModal.value ||
     showRuleModal.value ||
     showLineModal.value ||
     showNodeModal.value ||
@@ -1936,6 +3174,106 @@ function isAnyModalOpen(): boolean {
   )
 }
 
+function closeTopModal(): boolean {
+  if (showCommandPalette.value) {
+    showCommandPalette.value = false
+    return true
+  }
+  if (showTicketDetailModal.value) {
+    showTicketDetailModal.value = false
+    return true
+  }
+  if (showCreateTicketModal.value) {
+    showCreateTicketModal.value = false
+    return true
+  }
+  if (showWithdrawModal.value) {
+    showWithdrawModal.value = false
+    return true
+  }
+  if (showCouponModal.value) {
+    showCouponModal.value = false
+    return true
+  }
+  if (showCheckoutModal.value) {
+    showCheckoutModal.value = false
+    return true
+  }
+  if (showRechargeModal.value) {
+    showRechargeModal.value = false
+    return true
+  }
+  if (showRedeemGenModal.value) {
+    showRedeemGenModal.value = false
+    return true
+  }
+  if (showAdminResetPwdModal.value) {
+    showAdminResetPwdModal.value = false
+    return true
+  }
+  if (showPasswordModal.value) {
+    showPasswordModal.value = false
+    return true
+  }
+  if (showUserModal.value) {
+    showUserModal.value = false
+    return true
+  }
+  if (showPlanModal.value) {
+    showPlanModal.value = false
+    return true
+  }
+  if (showRoleModal.value) {
+    showRoleModal.value = false
+    return true
+  }
+  if (showBatchModal.value) {
+    showBatchModal.value = false
+    return true
+  }
+  if (showInstallModal.value) {
+    showInstallModal.value = false
+    return true
+  }
+  if (showNodeModal.value) {
+    showNodeModal.value = false
+    return true
+  }
+  if (showLineModal.value) {
+    showLineModal.value = false
+    return true
+  }
+  if (showRuleModal.value) {
+    showRuleModal.value = false
+    return true
+  }
+  if (showMobileNav.value) {
+    showMobileNav.value = false
+    return true
+  }
+  return false
+}
+
+function handleGlobalKeydown(e: KeyboardEvent) {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+    if (token.value) {
+      e.preventDefault()
+      if (showCommandPalette.value) {
+        showCommandPalette.value = false
+      } else {
+        openCommandPalette()
+      }
+    }
+    return
+  }
+  if (e.key === 'Escape') {
+    if (closeTopModal()) {
+      e.preventDefault()
+    }
+  }
+}
+
+const isPageVisible = ref(typeof document === 'undefined' ? true : !document.hidden)
 let telemetryInFlight = false
 async function pollTelemetryRealtime() {
   if (!autoRefresh.value || !token.value || document.hidden || isAnyModalOpen() || telemetryInFlight) {
@@ -1949,6 +3287,9 @@ async function pollTelemetryRealtime() {
       user.value.quota_bytes = t.user.quota_bytes
       user.value.status = t.user.status
       if (t.user.balance_cents !== undefined) user.value.balance_cents = t.user.balance_cents
+      if (t.user.commission_balance_cents !== undefined) {
+        user.value.commission_balance_cents = t.user.commission_balance_cents
+      }
       if (t.user.expire_at !== undefined) user.value.expire_at = t.user.expire_at
       if (t.user.max_rules !== undefined) user.value.max_rules = t.user.max_rules
       if (t.user.speed_mbps !== undefined) user.value.speed_mbps = t.user.speed_mbps
@@ -1957,19 +3298,19 @@ async function pollTelemetryRealtime() {
       if (t.user.allowed_tunnels !== undefined) user.value.allowed_tunnels = t.user.allowed_tunnels
     }
     if (Array.isArray(t.nodes)) {
-      const nodeMap = new Map(nodes.value.map((n) => [n.id, n]))
+      const nMap = nodeMap.value
       for (const nd of t.nodes) {
         if (!nd.id) continue
-        const target = nodeMap.get(nd.id)
+        const target = nMap.get(nd.id)
         if (target) {
           Object.assign(target, nd)
         }
       }
     }
     if (Array.isArray(t.rules)) {
-      const ruleMap = new Map(rules.value.map((r) => [r.id, r]))
+      const rMap = new Map(rules.value.map((r) => [r.id, r]))
       for (const rd of t.rules) {
-        const target = ruleMap.get(rd.id)
+        const target = rMap.get(rd.id)
         if (target) {
           target.upload_bytes = rd.upload_bytes
           target.down_bytes = rd.down_bytes
@@ -1988,6 +3329,7 @@ async function pollTelemetryRealtime() {
 
 let telemetryTimer: ReturnType<typeof setInterval> | null = null
 function handleVisibilityChange() {
+  isPageVisible.value = !document.hidden
   if (!document.hidden && autoRefresh.value && token.value) {
     pollTelemetryRealtime()
   }
@@ -1999,7 +3341,17 @@ function handleUnauthorized() {
 }
 
 onMounted(() => {
+  try {
+    const params = new URLSearchParams(window.location.search)
+    const refCode = (params.get('ref') || params.get('invite') || params.get('aff') || '').trim()
+    if (refCode) {
+      inviteCodeInput.value = refCode.slice(0, 32).toUpperCase()
+    }
+  } catch {
+    // ignore URL parse errors
+  }
   window.addEventListener('nexus-unauthorized', handleUnauthorized)
+  window.addEventListener('keydown', handleGlobalKeydown)
   refreshAll()
   telemetryTimer = setInterval(pollTelemetryRealtime, 3000)
   document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -2007,6 +3359,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('nexus-unauthorized', handleUnauthorized)
+  window.removeEventListener('keydown', handleGlobalKeydown)
   if (telemetryTimer) clearInterval(telemetryTimer)
   document.removeEventListener('visibilitychange', handleVisibilityChange)
 })
@@ -2016,27 +3369,70 @@ onUnmounted(() => {
   <div>
     <div v-if="toastMsg" class="toast">{{ toastMsg }}</div>
 
-    <!-- 登录页 -->
+    <!-- 登录 / 注册页 -->
     <div
       v-if="!token"
       style="min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px;"
     >
-      <div class="card" style="width: 100%; max-width: 390px; padding: 28px;">
-        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 20px;">
-          <div class="brand-logo">{{ siteConfig.site_logo || 'ZP' }}</div>
-          <span style="font-size: 16px; font-weight: 600;">{{ siteConfig.site_name || 'Zachary Panel' }}</span>
+      <div class="card" style="width: 100%; max-width: 400px; padding: 28px;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 20px;">
+          <div style="display: flex; align-items: center; gap: 11px; min-width: 0;">
+            <div class="brand-logo">{{ siteConfig.site_logo || 'ZP' }}</div>
+            <div>
+              <h1 style="font-size: 16.5px; font-weight: 700; line-height: 1.25;">{{ siteConfig.site_name || 'Zachary Panel' }}</h1>
+              <div style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">分布式多引擎流量转发控制台</div>
+            </div>
+          </div>
+          <button type="button" @click="toggleTheme" class="btn btn-outline btn-sm" :title="isDark ? '切换浅色主题' : '切换深色主题'">
+            {{ isDark ? '浅色' : '深色' }}
+          </button>
+        </div>
+
+        <div v-if="siteConfig.allow_register" class="grid-2" style="margin-bottom: 14px;">
+          <div
+            class="mode-card"
+            :class="{ active: !isRegisterMode }"
+            @click="isRegisterMode = false; authError = ''"
+          >
+            账号登录
+          </div>
+          <div
+            class="mode-card"
+            :class="{ active: isRegisterMode }"
+            @click="isRegisterMode = true; totpRequired = false; authError = ''"
+          >
+            新用户注册
+          </div>
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 14px;">
           <div>
             <label class="form-label">邮箱</label>
-            <input v-model="emailInput" type="email" class="input" autocomplete="username" />
+            <input v-model="emailInput" type="email" class="input" placeholder="name@example.com" autocomplete="username" />
           </div>
           <div>
-            <label class="form-label">密码</label>
-            <input v-model="passwordInput" type="password" class="input" autocomplete="current-password" @keyup.enter="handleAuth" />
+            <label class="form-label">{{ isRegisterMode ? '设置密码（8-72 位）' : '密码' }}</label>
+            <input
+              v-model="passwordInput"
+              type="password"
+              class="input"
+              :placeholder="isRegisterMode ? '至少 8 位字符' : '输入登录密码'"
+              :autocomplete="isRegisterMode ? 'new-password' : 'current-password'"
+              @keyup.enter="handleAuth"
+            />
           </div>
-          <div v-if="totpRequired">
+          <div v-if="isRegisterMode">
+            <label class="form-label">专属邀请码（选填）</label>
+            <input
+              v-model="inviteCodeInput"
+              type="text"
+              maxlength="32"
+              class="input mono"
+              placeholder="如有推荐邀请码请填写"
+              @keyup.enter="handleAuth"
+            />
+          </div>
+          <div v-if="!isRegisterMode && totpRequired">
             <label class="form-label">双因素认证 (2FA) 6 位动态验证码</label>
             <input
               v-model="totpInput"
@@ -2049,24 +3445,31 @@ onUnmounted(() => {
             />
           </div>
           <p v-if="authError" style="font-size: 12px; color: var(--danger-text);">{{ authError }}</p>
-          <button @click="handleAuth" class="btn btn-primary" style="width: 100%; padding: 8px;">登录</button>
+          <button @click="handleAuth" class="btn btn-primary" style="width: 100%; padding: 9px;">
+            {{ isRegisterMode ? '注册并进入控制台' : '登录进入控制台' }}
+          </button>
         </div>
       </div>
     </div>
 
     <div v-else class="app-shell">
-      <aside class="sidebar">
+      <div v-if="showMobileNav" class="sidebar-backdrop" @click="showMobileNav = false"></div>
+
+      <aside class="sidebar" :class="{ 'mobile-open': showMobileNav }">
         <div class="sidebar-brand">
-          <div class="brand-logo">{{ siteConfig.site_logo || 'ZP' }}</div>
-          <div class="brand-title-wrap">
-            <span class="brand-title">{{ siteConfig.site_name || 'Zachary Panel' }}</span>
-            <span class="brand-subtitle">Cloud Relay OS</span>
+          <div class="sidebar-brand-left">
+            <div class="brand-logo">{{ siteConfig.site_logo || 'ZP' }}</div>
+            <div class="brand-title-wrap">
+              <span class="brand-title">{{ siteConfig.site_name || 'Zachary Panel' }}</span>
+              <span class="brand-subtitle">Cloud Relay OS</span>
+            </div>
           </div>
+          <button type="button" class="sidebar-close-btn" aria-label="关闭侧边菜单" @click="showMobileNav = false">✕</button>
         </div>
 
         <nav class="sidebar-nav">
           <div class="nav-group-label">业务中心</div>
-          <button class="nav-item" :class="{ active: activeTab === 'dashboard' }" @click="activeTab = 'dashboard'">
+          <button class="nav-item" :class="{ active: activeTab === 'dashboard' }" @click="switchTab('dashboard')">
             <span class="nav-item-left">
               <span class="nav-icon">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2080,7 +3483,7 @@ onUnmounted(() => {
             </span>
           </button>
 
-          <button class="nav-item" :class="{ active: activeTab === 'rules' }" @click="activeTab = 'rules'">
+          <button class="nav-item" :class="{ active: activeTab === 'rules' }" @click="switchTab('rules')">
             <span class="nav-item-left">
               <span class="nav-icon">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2096,7 +3499,7 @@ onUnmounted(() => {
             <span class="nav-badge">{{ visibleRules.length }}</span>
           </button>
 
-          <button class="nav-item" :class="{ active: activeTab === 'store' }" @click="activeTab = 'store'">
+          <button class="nav-item" :class="{ active: activeTab === 'store' }" @click="switchTab('store')">
             <span class="nav-item-left">
               <span class="nav-icon">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2110,9 +3513,39 @@ onUnmounted(() => {
             <span class="nav-badge">{{ plans.length }}</span>
           </button>
 
+          <button class="nav-item" :class="{ active: activeTab === 'affiliate' }" @click="switchTab('affiliate')">
+            <span class="nav-item-left">
+              <span class="nav-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="18" cy="5" r="3"></circle>
+                  <circle cx="6" cy="12" r="3"></circle>
+                  <circle cx="18" cy="19" r="3"></circle>
+                  <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                  <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+                </svg>
+              </span>
+              <span>推广返利</span>
+            </span>
+            <span class="nav-badge">
+              {{ (user?.commission_balance_cents || 0) > 0 ? '¥' + ((user?.commission_balance_cents || 0) / 100).toFixed(0) : (affiliateOverview?.commission_rate ?? siteConfig.affiliate_commission_rate ?? 10) + '%' }}
+            </span>
+          </button>
+
+          <button class="nav-item" :class="{ active: activeTab === 'tickets' }" @click="switchTab('tickets')">
+            <span class="nav-item-left">
+              <span class="nav-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </span>
+              <span>工单客服</span>
+            </span>
+            <span class="nav-badge">{{ pendingTicketCount > 0 ? pendingTicketCount : ticketsList.length }}</span>
+          </button>
+
           <template v-if="isAdmin">
             <div class="nav-group-label" style="margin-top: 8px;">基础设施</div>
-            <button class="nav-item" :class="{ active: activeTab === 'lines' }" @click="activeTab = 'lines'">
+            <button class="nav-item" :class="{ active: activeTab === 'lines' }" @click="switchTab('lines')">
               <span class="nav-item-left">
                 <span class="nav-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2125,7 +3558,7 @@ onUnmounted(() => {
               <span class="nav-badge">{{ lines.length }}</span>
             </button>
 
-            <button class="nav-item" :class="{ active: activeTab === 'nodes' }" @click="activeTab = 'nodes'">
+            <button class="nav-item" :class="{ active: activeTab === 'nodes' }" @click="switchTab('nodes')">
               <span class="nav-item-left">
                 <span class="nav-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2141,7 +3574,7 @@ onUnmounted(() => {
             </button>
 
             <div class="nav-group-label" style="margin-top: 8px;">权限与系统</div>
-            <button class="nav-item" :class="{ active: activeTab === 'roles' }" @click="activeTab = 'roles'">
+            <button class="nav-item" :class="{ active: activeTab === 'roles' }" @click="switchTab('roles')">
               <span class="nav-item-left">
                 <span class="nav-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2154,7 +3587,7 @@ onUnmounted(() => {
               <span class="nav-badge">{{ rolesList.length }}</span>
             </button>
 
-            <button class="nav-item" :class="{ active: activeTab === 'users' }" @click="activeTab = 'users'">
+            <button class="nav-item" :class="{ active: activeTab === 'users' }" @click="switchTab('users')">
               <span class="nav-item-left">
                 <span class="nav-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2169,11 +3602,7 @@ onUnmounted(() => {
               <span class="nav-badge">{{ usersList.length }}</span>
             </button>
 
-            <button
-              class="nav-item"
-              :class="{ active: activeTab === 'settings' }"
-              @click="activeTab = 'settings'; syncSettingsForm()"
-            >
+            <button class="nav-item" :class="{ active: activeTab === 'settings' }" @click="switchTab('settings')">
               <span class="nav-item-left">
                 <span class="nav-icon">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
@@ -2190,7 +3619,7 @@ onUnmounted(() => {
         <div class="sidebar-footer">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
             <span style="font-weight: 600; color: #f8fafc;">{{ isAdmin ? '管理员配额' : planNameById(user?.plan_id) }}</span>
-            <span style="font-weight: 700; color: #60a5fa;">{{ quotaPercent }}%</span>
+            <span style="font-weight: 700; color: #7dd3fc;">{{ quotaPercent }}%</span>
           </div>
           <div class="progress-track" style="background: rgba(255, 255, 255, 0.1); margin-top: 4px;">
             <div class="progress-fill" :style="{ width: quotaPercent + '%' }"></div>
@@ -2205,18 +3634,42 @@ onUnmounted(() => {
       <div class="main-area">
         <header class="topbar">
           <div class="topbar-title-group">
-            <span class="topbar-title">{{ currentTabTitle }}</span>
-            <span class="topbar-pill">
+            <button type="button" class="mobile-nav-btn" aria-label="打开导航菜单" @click="showMobileNav = true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </svg>
+            </button>
+            <h1 class="topbar-title">{{ currentTabTitle }}</h1>
+            <button
+              type="button"
+              class="topbar-pill"
+              :class="{ paused: !autoRefresh || !isPageVisible }"
+              :title="autoRefresh ? '点击可暂停 3 秒实时轮询（后台标签页自动暂停）' : '点击恢复 3 秒实时轮询'"
+              style="cursor: pointer;"
+              @click="autoRefresh = !autoRefresh"
+            >
               <span class="pulse-dot"></span>
-              <span>实时同步</span>
-            </span>
+              <span>{{ !autoRefresh ? '轮询已暂停' : isPageVisible ? '实时同步' : '后台休眠' }}</span>
+            </button>
           </div>
-          <div style="display: flex; align-items: center; gap: 10px;">
-            <button @click="openPasswordModal" class="btn btn-soft btn-sm">修改密码</button>
-            <button @click="toggleTheme" class="btn btn-outline btn-sm">{{ isDark ? '浅色' : '深色' }}</button>
+          <div class="topbar-actions">
+            <button type="button" class="cmdk-trigger" @click="openCommandPalette" title="快速搜索与跳转 (Ctrl/Cmd + K)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <span class="cmdk-trigger-label">快速检索</span>
+              <kbd class="kbd-shortcut">⌘K</kbd>
+            </button>
+            <button @click="openPasswordModal" class="btn btn-soft btn-sm">安全 / 2FA</button>
+            <button @click="toggleTheme" class="btn btn-outline btn-sm" :title="isDark ? '切换浅色主题' : '切换深色主题'">
+              {{ isDark ? '浅色' : '深色' }}
+            </button>
             <div class="user-chip">
               <span class="user-avatar">{{ (user?.email || 'U').charAt(0) }}</span>
-              <span style="font-size: 12.5px; font-weight: 600;">{{ user?.email }}</span>
+              <span class="user-chip-email">{{ user?.email }}</span>
               <span class="badge" :class="isAdmin ? 'badge-purple' : 'badge-primary'">
                 {{ isAdmin ? '管理员' : roleNameById(user?.role_group_id) }}
               </span>
@@ -2533,6 +3986,7 @@ onUnmounted(() => {
                 <button @click="exportRulesToClipboard" class="btn btn-outline">
                   {{ validSelectedRuleIds.length > 0 ? `导出已选 (${validSelectedRuleIds.length})` : '导出规则' }}
                 </button>
+                <button @click="exportRulesToCSV" class="btn btn-outline">导出 CSV</button>
                 <button @click="openBatchModal" class="btn btn-soft">批量导入</button>
                 <button @click="openCreateRuleModal" class="btn btn-primary">+ 新增转发</button>
               </div>
@@ -2574,9 +4028,9 @@ onUnmounted(() => {
                       <input
                         type="checkbox"
                         :checked="allVisibleSelected"
-                        :disabled="filteredRules.length === 0"
+                        :disabled="pagedRules.length === 0"
                         @change="toggleSelectAllRules"
-                        title="全选 / 取消全选"
+                        title="全选 / 取消全选当前页"
                         style="cursor: pointer;"
                       />
                     </th>
@@ -2592,7 +4046,7 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="rule in filteredRules" :key="rule.id">
+                  <tr v-for="rule in pagedRules" :key="rule.id">
                     <td style="text-align: center;">
                       <input
                         type="checkbox"
@@ -2640,7 +4094,7 @@ onUnmounted(() => {
                         :key="idx"
                         style="display: flex; align-items: center; gap: 6px;"
                       >
-                        <span>{{ t.address }}</span>
+                        <span class="mono" style="font-size: 12.5px;">{{ t.address }}</span>
                         <span
                           v-if="probeResults[rule.id]?.latencies?.[t.address] !== undefined"
                           class="badge"
@@ -2676,8 +4130,45 @@ onUnmounted(() => {
                       <button @click="handleDeleteRule(rule.id)" class="btn btn-danger btn-sm">删除</button>
                     </td>
                   </tr>
+                  <tr v-if="filteredRules.length === 0">
+                    <td :colspan="isAdmin ? 10 : 9" style="padding: 0;">
+                      <div class="empty-state">
+                        <div class="empty-state-icon">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="16 3 21 3 21 8"></polyline>
+                            <line x1="4" y1="20" x2="21" y2="3"></line>
+                            <polyline points="21 16 21 21 16 21"></polyline>
+                            <line x1="15" y1="15" x2="21" y2="21"></line>
+                            <line x1="4" y1="4" x2="9" y2="9"></line>
+                          </svg>
+                        </div>
+                        <div class="empty-state-title">
+                          {{ visibleRules.length === 0 ? '暂无转发规则' : '没有匹配筛选条件的规则' }}
+                        </div>
+                        <div class="empty-state-desc">
+                          {{
+                            visibleRules.length === 0
+                              ? '点击右上角「+ 新增转发」或「批量导入」立即创建第一条转发规则'
+                              : '请调整关键词、隧道或状态筛选条件后重试'
+                          }}
+                        </div>
+                      </div>
+                    </td>
+                  </tr>
                 </tbody>
               </table>
+              <div v-if="filteredRules.length > 0" class="pagination-bar">
+                <span>第 {{ rulesPage }} / {{ rulesTotalPages }} 页 · 共 {{ filteredRules.length }} 条规则</span>
+                <div class="pagination-controls">
+                  <select v-model.number="rulesPageSize" class="select pagination-select">
+                    <option :value="20">20 条/页</option>
+                    <option :value="50">50 条/页</option>
+                    <option :value="100">100 条/页</option>
+                  </select>
+                  <button class="btn btn-outline btn-sm" :disabled="rulesPage <= 1" @click="rulesPage--">上一页</button>
+                  <button class="btn btn-outline btn-sm" :disabled="rulesPage >= rulesTotalPages" @click="rulesPage++">下一页</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -2718,7 +4209,7 @@ onUnmounted(() => {
                     </td>
                     <td>{{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x</td>
                     <td>
-                      {{ rules.filter((r) => r.tunnel_line_id === line.id).length }} / {{ line.max_port_count || 50 }}
+                      {{ lineRuleCountMap.get(line.id) || 0 }} / {{ line.max_port_count || 50 }}
                       <div v-if="line.port_range" style="font-size: 12px; color: var(--text-muted);">端口 {{ line.port_range }}</div>
                     </td>
                     <td style="text-align: right; white-space: nowrap;">
@@ -2733,6 +4224,14 @@ onUnmounted(() => {
                         编辑
                       </button>
                       <button @click="deleteLine(line.id)" class="btn btn-danger btn-sm">删除</button>
+                    </td>
+                  </tr>
+                  <tr v-if="lines.length === 0">
+                    <td colspan="8" style="padding: 0;">
+                      <div class="empty-state">
+                        <div class="empty-state-title">暂无隧道线路</div>
+                        <div class="empty-state-desc">点击右上角「+ 新增隧道」配置端口转发或加密对接隧道</div>
+                      </div>
                     </td>
                   </tr>
                 </tbody>
@@ -2773,8 +4272,8 @@ onUnmounted(() => {
                         {{ node.connect_ip || node.public_host }}
                       </button>
                     </td>
-                    <td style="color: var(--text-secondary);">{{ node.server_ip }}</td>
-                    <td style="color: var(--text-secondary);">{{ node.port_range }}</td>
+                    <td class="mono" style="color: var(--text-secondary);">{{ node.server_ip }}</td>
+                    <td class="mono" style="color: var(--text-secondary);">{{ node.port_range }}</td>
                     <td>{{ node.traffic_rate || 1 }}x</td>
                     <td>
                       <div>
@@ -2809,6 +4308,14 @@ onUnmounted(() => {
                       <button @click="deleteNode(node.id)" class="btn btn-danger btn-sm">删除</button>
                     </td>
                   </tr>
+                  <tr v-if="nodes.length === 0">
+                    <td colspan="8" style="padding: 0;">
+                      <div class="empty-state">
+                        <div class="empty-state-title">暂无转发节点</div>
+                        <div class="empty-state-desc">点击右上角「+ 新增节点」添加转发服务器并获取一键对接命令</div>
+                      </div>
+                    </td>
+                  </tr>
                 </tbody>
               </table>
             </div>
@@ -2816,7 +4323,7 @@ onUnmounted(() => {
 
           <!-- 角色管理 (仅管理员：角色决定可用哪些隧道) -->
           <div v-if="activeTab === 'roles' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
               <span style="font-size: 12.5px; color: var(--text-secondary);">
                 角色决定了可以使用哪些隧道；套餐绑定角色后，分配了对应套餐与角色的用户即获得相应隧道的转发权限。
               </span>
@@ -2851,8 +4358,8 @@ onUnmounted(() => {
                         未分配隧道
                       </span>
                     </td>
-                    <td>{{ plans.filter((p) => p.role_group_id === rg.id).length }} 个套餐</td>
-                    <td>{{ usersList.filter((u) => u.role !== 'admin' && u.role_group_id === rg.id).length }} 人</td>
+                    <td>{{ rolePlanCountMap.get(rg.id) || 0 }} 个套餐</td>
+                    <td>{{ roleUserCountMap.get(rg.id) || 0 }} 人</td>
                     <td style="text-align: right; white-space: nowrap;">
                       <button @click="openEditRoleModal(rg)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
                         配置隧道
@@ -2914,7 +4421,7 @@ onUnmounted(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="u in filteredUsersList" :key="u.id">
+                  <tr v-for="u in pagedUsersList" :key="u.id">
                     <td style="font-weight: 500;">{{ u.email }}</td>
                     <td>
                       <span class="badge" :class="u.role === 'admin' ? 'badge-purple' : 'badge-neutral'">
@@ -3008,8 +4515,28 @@ onUnmounted(() => {
                       </button>
                     </td>
                   </tr>
+                  <tr v-if="filteredUsersList.length === 0">
+                    <td colspan="10" style="padding: 0;">
+                      <div class="empty-state">
+                        <div class="empty-state-title">未找到符合条件的用户</div>
+                        <div class="empty-state-desc">请尝试清空筛选条件，或点击右上角「+ 新增用户」创建账号</div>
+                      </div>
+                    </td>
+                  </tr>
                 </tbody>
               </table>
+              <div v-if="filteredUsersList.length > 0" class="pagination-bar">
+                <span>第 {{ usersPage }} / {{ usersTotalPages }} 页 · 共 {{ filteredUsersList.length }} 位用户</span>
+                <div class="pagination-controls">
+                  <select v-model.number="usersPageSize" class="select pagination-select">
+                    <option :value="20">20 条/页</option>
+                    <option :value="50">50 条/页</option>
+                    <option :value="100">100 条/页</option>
+                  </select>
+                  <button class="btn btn-outline btn-sm" :disabled="usersPage <= 1" @click="usersPage--">上一页</button>
+                  <button class="btn btn-outline btn-sm" :disabled="usersPage >= usersTotalPages" @click="usersPage++">下一页</button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -3134,7 +4661,7 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <div class="table-wrap" style="max-height: 320px; overflow-y: auto;">
+              <div class="table-wrap">
                 <table>
                   <thead>
                     <tr>
@@ -3146,12 +4673,12 @@ onUnmounted(() => {
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="rc in filteredRedeemCodes" :key="rc.id">
+                    <tr v-for="rc in pagedRedeemCodes" :key="rc.id">
                       <td>
                         <button
                           @click="copyConnectAddr(rc.code)"
-                          class="btn btn-soft btn-sm"
-                          style="font-family: monospace; font-weight: 600;"
+                          class="btn btn-soft btn-sm mono"
+                          style="font-weight: 600;"
                         >
                           {{ rc.code }}
                         </button>
@@ -3185,12 +4712,150 @@ onUnmounted(() => {
                       </td>
                     </tr>
                     <tr v-if="filteredRedeemCodes.length === 0">
-                      <td colspan="5" style="text-align: center; padding: 20px; color: var(--text-muted);">
-                        暂无符合条件的兑换码记录
+                      <td colspan="5" style="padding: 0;">
+                        <div class="empty-state">
+                          <div class="empty-state-title">暂无符合条件的兑换码记录</div>
+                          <div class="empty-state-desc">可点击右上角「+ 生成卡密」批量创建套餐卡、充值卡或流量卡</div>
+                        </div>
                       </td>
                     </tr>
                   </tbody>
                 </table>
+                <div v-if="filteredRedeemCodes.length > 0" class="pagination-bar">
+                  <span>第 {{ redeemPage }} / {{ redeemTotalPages }} 页 · 共 {{ filteredRedeemCodes.length }} 条卡密</span>
+                  <div class="pagination-controls">
+                    <select v-model.number="redeemPageSize" class="select pagination-select">
+                      <option :value="20">20 条/页</option>
+                      <option :value="50">50 条/页</option>
+                      <option :value="100">100 条/页</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" :disabled="redeemPage <= 1" @click="redeemPage--">上一页</button>
+                    <button class="btn btn-outline btn-sm" :disabled="redeemPage >= redeemTotalPages" @click="redeemPage++">下一页</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 管理员视角：优惠券 / 折扣码管理中心 -->
+            <div v-if="isAdmin" class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <div>
+                  <div style="font-weight: 600; font-size: 14px;">优惠券 / 折扣码管理中心</div>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    支持百分比折扣券与固定满减券、限定套餐、有效期、总次数与单用户限用次数，结账时实时试算抵扣
+                  </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <input
+                    v-model="couponSearchQuery"
+                    class="input"
+                    style="width: 190px; height: 32px; font-size: 12.5px;"
+                    placeholder="搜索优惠券码 / 名称"
+                  />
+                  <button @click="openCreateCouponModal" class="btn btn-primary btn-sm">+ 新增优惠券</button>
+                </div>
+              </div>
+
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>优惠券码 (点击复制)</th>
+                      <th>名称 / 抵扣规则</th>
+                      <th>适用套餐</th>
+                      <th>有效期</th>
+                      <th>已用 / 限额</th>
+                      <th>状态</th>
+                      <th style="text-align: right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="cp in pagedCoupons" :key="cp.id">
+                      <td>
+                        <button
+                          @click="copyConnectAddr(cp.code)"
+                          class="btn btn-soft btn-sm mono"
+                          style="font-weight: 600;"
+                        >
+                          {{ cp.code }}
+                        </button>
+                      </td>
+                      <td style="font-size: 12.5px;">
+                        <div style="font-weight: 600;">{{ cp.name }}</div>
+                        <div style="color: var(--text-secondary); margin-top: 2px;">
+                          <span v-if="cp.type === 'percent'" class="badge badge-info" style="margin-right: 6px;">
+                            减免 {{ cp.value }}% ({{ ((100 - cp.value) / 10).toFixed(1).replace(/\.0$/, '') }}折)
+                          </span>
+                          <span v-else class="badge badge-success" style="margin-right: 6px;">
+                            立减 ¥{{ (cp.value / 100).toFixed(2) }}
+                          </span>
+                          <span v-if="cp.min_spend_cents > 0" style="font-size: 11.5px;">
+                            满 ¥{{ (cp.min_spend_cents / 100).toFixed(2) }} 可用
+                          </span>
+                          <span v-if="cp.type === 'percent' && cp.max_discount_cents > 0" style="font-size: 11.5px; margin-left: 6px;">
+                            封顶 ¥{{ (cp.max_discount_cents / 100).toFixed(2) }}
+                          </span>
+                        </div>
+                      </td>
+                      <td style="font-size: 12px;">
+                        <span v-if="!cp.allowed_plan_ids" class="badge badge-neutral">全场套餐通用</span>
+                        <span
+                          v-for="pid in parseAllowedIds(cp.allowed_plan_ids)"
+                          :key="pid"
+                          class="badge badge-purple"
+                          style="margin-right: 4px;"
+                        >
+                          {{ planNameById(pid) }}
+                        </span>
+                      </td>
+                      <td class="mono" style="font-size: 11.5px; color: var(--text-secondary);">
+                        <div v-if="cp.starts_at || cp.ends_at">
+                          {{ formatDateDisplay(cp.starts_at) }} ~ {{ formatDateDisplay(cp.ends_at) }}
+                        </div>
+                        <span v-else>长期有效</span>
+                      </td>
+                      <td class="mono" style="font-size: 12px;">
+                        <div>{{ cp.used_count }} / {{ cp.max_uses > 0 ? cp.max_uses : '∞' }}</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">
+                          每人限 {{ cp.per_user_limit > 0 ? cp.per_user_limit + ' 次' : '不限' }}
+                        </div>
+                      </td>
+                      <td>
+                        <span class="badge" :class="cp.active ? 'badge-success' : 'badge-neutral'">
+                          {{ cp.active ? '生效中' : '已停用' }}
+                        </span>
+                      </td>
+                      <td style="text-align: right; white-space: nowrap;">
+                        <button @click="toggleCouponActive(cp)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                          {{ cp.active ? '停用' : '启用' }}
+                        </button>
+                        <button @click="openEditCouponModal(cp)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                          编辑
+                        </button>
+                        <button @click="deleteCouponItem(cp)" class="btn btn-danger btn-sm">删除</button>
+                      </td>
+                    </tr>
+                    <tr v-if="filteredCoupons.length === 0">
+                      <td colspan="7" style="padding: 0;">
+                        <div class="empty-state">
+                          <div class="empty-state-title">暂无优惠券与折扣码配置</div>
+                          <div class="empty-state-desc">点击右上角「+ 新增优惠券」可发放百分比折扣券或满减促销码</div>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div v-if="filteredCoupons.length > 0" class="pagination-bar">
+                  <span>第 {{ couponsPage }} / {{ couponsTotalPages }} 页 · 共 {{ filteredCoupons.length }} 张优惠券</span>
+                  <div class="pagination-controls">
+                    <select v-model.number="couponsPageSize" class="select pagination-select">
+                      <option :value="20">20 条/页</option>
+                      <option :value="50">50 条/页</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" :disabled="couponsPage <= 1" @click="couponsPage--">上一页</button>
+                    <button class="btn btn-outline btn-sm" :disabled="couponsPage >= couponsTotalPages" @click="couponsPage++">下一页</button>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -3231,24 +4896,38 @@ onUnmounted(() => {
                   </div>
                 </div>
                 <button @click="handleBuyPlan(plan.id)" class="btn btn-primary" style="width: 100%;">
-                  {{ user?.plan_id === plan.id ? '续费 / 重新激活该套餐' : '购买并激活套餐角色' }}
+                  {{ user?.plan_id === plan.id ? '续费 / 重新激活该套餐（支持优惠券）' : '购买并激活套餐（支持优惠券）' }}
                 </button>
               </div>
             </div>
 
             <!-- 账单与订单明细 -->
             <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
-              <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
                 <div>
                   <div style="font-weight: 600; font-size: 14px;">{{ isAdmin ? '全站账单与充值订单明细' : '我的账单与充值记录' }}</div>
                   <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
-                    自动记录在线充值、套餐购买、周期重置与卡密核销流水
+                    自动记录在线充值、套餐购买、周期重置、优惠券抵扣与佣金划转流水（超时未支付订单自动关闭）
                   </div>
                 </div>
-                <button @click="openRechargeModal" class="btn btn-soft btn-sm">+ 创建充值订单</button>
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <input
+                    v-model="orderSearchQuery"
+                    class="input"
+                    style="width: 190px; height: 32px; font-size: 12.5px;"
+                    placeholder="搜索订单号 / 邮箱 / 套餐"
+                  />
+                  <select v-model="orderFilterStatus" class="select" style="width: 116px; height: 32px; font-size: 12.5px;">
+                    <option value="all">全部状态</option>
+                    <option value="paid">已入账</option>
+                    <option value="pending">待支付</option>
+                    <option value="cancelled">已取消</option>
+                  </select>
+                  <button @click="openRechargeModal" class="btn btn-soft btn-sm">+ 创建充值订单</button>
+                </div>
               </div>
 
-              <div class="table-wrap" style="max-height: 300px; overflow-y: auto;">
+              <div class="table-wrap">
                 <table>
                   <thead>
                     <tr>
@@ -3264,24 +4943,33 @@ onUnmounted(() => {
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="ord in ordersList" :key="ord.id">
-                      <td style="font-family: monospace; font-size: 12px;">{{ ord.order_no }}</td>
+                    <tr v-for="ord in pagedOrders" :key="ord.id">
+                      <td class="mono" style="font-size: 12px;">{{ ord.order_no }}</td>
                       <td v-if="isAdmin" style="font-size: 12.5px;">{{ ord.user_email || '#' + ord.user_id }}</td>
                       <td>
                         <span class="badge badge-neutral">{{ orderTypeLabel(ord.type) }}</span>
                       </td>
-                      <td style="font-size: 12.5px;">{{ ord.plan_name || '-' }}</td>
-                      <td style="font-weight: 600;">¥{{ ((ord.amount_cents || 0) / 100).toFixed(2) }}</td>
+                      <td style="font-size: 12.5px;">
+                        <span>{{ ord.plan_name || '-' }}</span>
+                        <span
+                          v-if="ord.coupon_code && (ord.discount_cents || 0) > 0"
+                          class="badge badge-success mono"
+                          style="margin-left: 6px;"
+                        >
+                          {{ ord.coupon_code }} -¥{{ ((ord.discount_cents || 0) / 100).toFixed(2) }}
+                        </span>
+                      </td>
+                      <td class="mono" style="font-weight: 600;">¥{{ ((ord.amount_cents || 0) / 100).toFixed(2) }}</td>
                       <td style="font-size: 12px; color: var(--text-secondary);">{{ ord.gateway.toUpperCase() }}</td>
                       <td>
                         <span
                           class="badge"
-                          :class="ord.status === 'paid' ? 'badge-success' : ord.status === 'pending' ? 'badge-primary' : 'badge-neutral'"
+                          :class="ord.status === 'paid' ? 'badge-success' : ord.status === 'pending' ? 'badge-warning' : 'badge-neutral'"
                         >
-                          {{ ord.status === 'paid' ? '已入账' : ord.status === 'pending' ? '待支付' : '已取消' }}
+                          {{ ord.status === 'paid' ? '已入账' : ord.status === 'pending' ? '待支付' : '已关闭' }}
                         </span>
                       </td>
-                      <td style="font-size: 12px; color: var(--text-muted);">{{ formatDateDisplay(ord.created_at) }}</td>
+                      <td class="mono" style="font-size: 12px; color: var(--text-muted);">{{ formatDateDisplay(ord.created_at) }}</td>
                       <td v-if="isAdmin" style="text-align: right;">
                         <button
                           v-if="ord.type === 'recharge' && ord.status === 'pending'"
@@ -3293,13 +4981,396 @@ onUnmounted(() => {
                         <span v-else style="color: var(--text-muted); font-size: 12px;">-</span>
                       </td>
                     </tr>
-                    <tr v-if="ordersList.length === 0">
-                      <td :colspan="isAdmin ? 9 : 7" style="text-align: center; padding: 18px; color: var(--text-muted);">
-                        暂无账单与订单记录
+                    <tr v-if="filteredOrders.length === 0">
+                      <td :colspan="isAdmin ? 9 : 8" style="padding: 0;">
+                        <div class="empty-state">
+                          <div class="empty-state-title">暂无匹配的账单与订单记录</div>
+                          <div class="empty-state-desc">购买套餐、在线充值或核销兑换码后会自动生成账单流水</div>
+                        </div>
                       </td>
                     </tr>
                   </tbody>
                 </table>
+                <div v-if="filteredOrders.length > 0" class="pagination-bar">
+                  <span>第 {{ ordersPage }} / {{ ordersTotalPages }} 页 · 共 {{ filteredOrders.length }} 笔订单</span>
+                  <div class="pagination-controls">
+                    <select v-model.number="ordersPageSize" class="select pagination-select">
+                      <option :value="20">20 条/页</option>
+                      <option :value="50">50 条/页</option>
+                      <option :value="100">100 条/页</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" :disabled="ordersPage <= 1" @click="ordersPage--">上一页</button>
+                    <button class="btn btn-outline btn-sm" :disabled="ordersPage >= ordersTotalPages" @click="ordersPage++">下一页</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 推广返利 / 邀请分销中心 (所有用户均可生成邀请链接与管理佣金；管理员可审核全站提现) -->
+          <div v-if="activeTab === 'affiliate'" style="display: flex; flex-direction: column; gap: 16px;">
+            <div
+              class="card"
+              style="display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap;"
+            >
+              <div style="display: flex; flex-direction: column; gap: 6px; min-width: 240px;">
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <span style="font-weight: 700; font-size: 15px;">专属邀请码与推广链接</span>
+                  <span class="badge" :class="affiliateOverview?.enabled !== false ? 'badge-success' : 'badge-neutral'">
+                    {{ affiliateOverview?.enabled !== false ? '返佣计划开启中' : '返佣计划已暂停' }}
+                  </span>
+                </div>
+                <div style="font-size: 12.5px; color: var(--text-secondary);">
+                  好友通过您的推广链接或邀请码完成注册后，充值或购买套餐将自动按
+                  <strong>{{ affiliateOverview?.commission_rate ?? siteConfig.affiliate_commission_rate ?? 10 }}%</strong>
+                  实时结算佣金至您的推广账户。
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px;">
+                  <button
+                    @click="copyConnectAddr(affiliateOverview?.invite_code || user?.invite_code || '')"
+                    class="copy-pill"
+                  >
+                    邀请码：{{ affiliateOverview?.invite_code || user?.invite_code || '-' }}
+                  </button>
+                  <button
+                    v-if="affiliateOverview?.invite_url"
+                    @click="copyConnectAddr(affiliateOverview.invite_url)"
+                    class="btn btn-soft btn-sm"
+                  >
+                    复制专属推广链接
+                  </button>
+                </div>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <button
+                  @click="handleTransferCommission"
+                  class="btn btn-primary"
+                  :disabled="(affiliateOverview?.commission_balance_cents || 0) <= 0"
+                >
+                  一键划转至账户余额
+                </button>
+                <button
+                  @click="openWithdrawModal"
+                  class="btn btn-outline"
+                  :disabled="(affiliateOverview?.commission_balance_cents || 0) < (affiliateOverview?.min_withdraw_cents || 1000)"
+                >
+                  申请佣金提现 (满 ¥{{ ((affiliateOverview?.min_withdraw_cents || 1000) / 100).toFixed(0) }})
+                </button>
+              </div>
+            </div>
+
+            <div class="grid-4">
+              <div class="card">
+                <div class="metric-label">当前返佣比例</div>
+                <div class="metric-value">{{ affiliateOverview?.commission_rate ?? siteConfig.affiliate_commission_rate ?? 10 }}%</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">充值与套餐消费自动结算</div>
+              </div>
+              <div class="card">
+                <div class="metric-label">累计邀请用户</div>
+                <div class="metric-value">{{ affiliateOverview?.invited_count ?? 0 }}</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">已绑定永久邀请返佣关系</div>
+              </div>
+              <div class="card">
+                <div class="metric-label">累计获得佣金</div>
+                <div class="metric-value">¥{{ ((affiliateOverview?.total_commission_cents || 0) / 100).toFixed(2) }}</div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">历史结算佣金总额</div>
+              </div>
+              <div class="card">
+                <div class="metric-label">可用佣金余额</div>
+                <div class="metric-value" style="color: var(--primary-text);">
+                  ¥{{ ((affiliateOverview?.commission_balance_cents || 0) / 100).toFixed(2) }}
+                </div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
+                  提现审核冻结：¥{{ ((affiliateOverview?.pending_withdraw_cents || 0) / 100).toFixed(2) }}
+                </div>
+              </div>
+            </div>
+
+            <!-- 管理员视角：全站佣金提现审核工作台 -->
+            <div v-if="isAdmin" class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <div>
+                  <div style="font-weight: 600; font-size: 14px;">全站推广佣金提现审核台（管理员）</div>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    审核通过后标记已打款；驳回申请将自动把冻结佣金原路退回申请人可用佣金余额
+                  </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                  <input
+                    v-model="withdrawSearchQuery"
+                    class="input"
+                    style="width: 190px; height: 32px; font-size: 12.5px;"
+                    placeholder="搜索提现单号 / 邮箱 / 收款账号"
+                  />
+                  <select v-model="withdrawFilterStatus" class="select" style="width: 120px; height: 32px; font-size: 12.5px;">
+                    <option value="all">全部状态</option>
+                    <option value="pending">待审核</option>
+                    <option value="approved">已打款</option>
+                    <option value="rejected">已驳回</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>提现单号</th>
+                      <th>申请人</th>
+                      <th>提现金额</th>
+                      <th>收款方式 / 账号</th>
+                      <th>状态 / 备注</th>
+                      <th>申请时间</th>
+                      <th style="text-align: right;">审核操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="wd in filteredAdminWithdrawals" :key="wd.id">
+                      <td class="mono" style="font-size: 12px;">{{ wd.withdraw_no }}</td>
+                      <td style="font-size: 12.5px;">{{ wd.user_email }}</td>
+                      <td class="mono" style="font-weight: 700;">¥{{ (wd.amount_cents / 100).toFixed(2) }}</td>
+                      <td style="font-size: 12px;">
+                        <span class="badge badge-info" style="margin-right: 6px;">{{ withdrawMethodLabel(wd.method) }}</span>
+                        <span class="mono">{{ wd.account }}</span>
+                        <span v-if="wd.real_name" style="color: var(--text-muted); margin-left: 6px;">({{ wd.real_name }})</span>
+                      </td>
+                      <td style="font-size: 12px;">
+                        <span
+                          class="badge"
+                          :class="wd.status === 'approved' ? 'badge-success' : wd.status === 'pending' ? 'badge-warning' : 'badge-danger'"
+                        >
+                          {{ wd.status === 'approved' ? '已打款' : wd.status === 'pending' ? '待审核' : '已驳回' }}
+                        </span>
+                        <span v-if="wd.admin_remark" style="color: var(--text-muted); margin-left: 6px;">{{ wd.admin_remark }}</span>
+                      </td>
+                      <td class="mono" style="font-size: 12px; color: var(--text-muted);">{{ formatDateTimeDisplay(wd.created_at) }}</td>
+                      <td style="text-align: right; white-space: nowrap;">
+                        <template v-if="wd.status === 'pending'">
+                          <button @click="reviewWithdrawalAdmin(wd, 'approve')" class="btn btn-primary btn-sm" style="margin-right: 4px;">
+                            通过打款
+                          </button>
+                          <button @click="reviewWithdrawalAdmin(wd, 'reject')" class="btn btn-danger btn-sm">
+                            驳回退回
+                          </button>
+                        </template>
+                        <span v-else style="font-size: 12px; color: var(--text-muted);">已处理</span>
+                      </td>
+                    </tr>
+                    <tr v-if="filteredAdminWithdrawals.length === 0">
+                      <td colspan="7" style="padding: 0;">
+                        <div class="empty-state">
+                          <div class="empty-state-title">暂无匹配的提现申请记录</div>
+                          <div class="empty-state-desc">用户发起推广佣金提现申请后将在此处展示待审核工单</div>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="grid-2">
+              <!-- 返佣结算明细 -->
+              <div class="card" style="display: flex; flex-direction: column; gap: 10px;">
+                <div style="font-weight: 600; font-size: 14px;">我的返佣结算流水</div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>受邀用户</th>
+                        <th>触发场景</th>
+                        <th>实付基数</th>
+                        <th>返佣入账</th>
+                        <th>时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="cm in (affiliateOverview?.commissions || [])" :key="cm.id">
+                        <td class="mono" style="font-size: 12px;">{{ cm.invitee_email }}</td>
+                        <td>
+                          <span class="badge badge-primary">{{ affiliateSceneLabel(cm.scene) }}</span>
+                        </td>
+                        <td class="mono">¥{{ (cm.base_amount_cents / 100).toFixed(2) }}</td>
+                        <td class="mono" style="font-weight: 700; color: var(--success-text);">
+                          +¥{{ (cm.commission_cents / 100).toFixed(2) }} ({{ cm.rate_percent }}%)
+                        </td>
+                        <td class="mono" style="font-size: 11.5px; color: var(--text-muted);">
+                          {{ formatDateTimeDisplay(cm.created_at) }}
+                        </td>
+                      </tr>
+                      <tr v-if="!(affiliateOverview?.commissions?.length)">
+                        <td colspan="5" style="padding: 0;">
+                          <div class="empty-state" style="padding: 24px 14px;">
+                            <div class="empty-state-title">暂无返佣结算记录</div>
+                            <div class="empty-state-desc">复制上方专属推广链接邀请好友注册消费后自动结算</div>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- 我的提现申请记录 -->
+              <div class="card" style="display: flex; flex-direction: column; gap: 10px;">
+                <div style="font-weight: 600; font-size: 14px;">我的佣金提现记录</div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>单号</th>
+                        <th>金额</th>
+                        <th>收款方式</th>
+                        <th>状态 / 备注</th>
+                        <th>时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="wd in (affiliateOverview?.withdrawals || [])" :key="wd.id">
+                        <td class="mono" style="font-size: 12px;">{{ wd.withdraw_no }}</td>
+                        <td class="mono" style="font-weight: 600;">¥{{ (wd.amount_cents / 100).toFixed(2) }}</td>
+                        <td style="font-size: 12px;">{{ withdrawMethodLabel(wd.method) }}</td>
+                        <td style="font-size: 12px;">
+                          <span
+                            class="badge"
+                            :class="wd.status === 'approved' ? 'badge-success' : wd.status === 'pending' ? 'badge-warning' : 'badge-danger'"
+                          >
+                            {{ wd.status === 'approved' ? '已打款' : wd.status === 'pending' ? '审核中' : '已驳回退回' }}
+                          </span>
+                          <div v-if="wd.admin_remark" style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+                            {{ wd.admin_remark }}
+                          </div>
+                        </td>
+                        <td class="mono" style="font-size: 11.5px; color: var(--text-muted);">
+                          {{ formatDateTimeDisplay(wd.created_at) }}
+                        </td>
+                      </tr>
+                      <tr v-if="!(affiliateOverview?.withdrawals?.length)">
+                        <td colspan="5" style="padding: 0;">
+                          <div class="empty-state" style="padding: 24px 14px;">
+                            <div class="empty-state-title">暂无提现申请记录</div>
+                            <div class="empty-state-desc">可将佣金一键零损耗划转至账户余额，或满额申请提现</div>
+                          </div>
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 工单客服中心 (支持关联转发规则、对话式追问回复、后台处理流转与 Telegram/Webhook 联动提醒) -->
+          <div v-if="activeTab === 'tickets'" style="display: flex; flex-direction: column; gap: 16px;">
+            <div
+              class="card"
+              style="display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;"
+            >
+              <div>
+                <div style="font-weight: 600; font-size: 14.5px;">
+                  {{ isAdmin ? '全站客服工单调度台' : '我的技术支持与客服工单' }}
+                </div>
+                <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                  {{ isAdmin ? '支持查看用户关联转发规则、对话回复、调整优先级与结单关闭' : '遇到线路波动、转发规则排障或账单问题可随时提交工单跟进' }}
+                </div>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <input
+                  v-model="ticketSearchQuery"
+                  class="input"
+                  style="width: 190px; height: 32px; font-size: 12.5px;"
+                  placeholder="搜索工单号 / 标题 / 规则"
+                />
+                <select v-model="ticketFilterCategory" class="select" style="width: 124px; height: 32px; font-size: 12.5px;">
+                  <option value="all">全部分类</option>
+                  <option value="network">线路与网络</option>
+                  <option value="rule">转发规则</option>
+                  <option value="billing">账单与支付</option>
+                  <option value="account">账号与权限</option>
+                  <option value="general">综合咨询</option>
+                </select>
+                <select v-model="ticketFilterStatus" class="select" style="width: 122px; height: 32px; font-size: 12.5px;">
+                  <option value="all">全部状态</option>
+                  <option value="open">待受理</option>
+                  <option value="customer_reply">用户追问中</option>
+                  <option value="answered">客服已回复</option>
+                  <option value="closed">已结单</option>
+                </select>
+                <button @click="openCreateTicketModal" class="btn btn-primary btn-sm">+ 提交新工单</button>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>工单号</th>
+                    <th v-if="isAdmin">提交用户</th>
+                    <th>工单标题 / 关联规则</th>
+                    <th>分类</th>
+                    <th>优先级</th>
+                    <th>状态</th>
+                    <th>最近更新</th>
+                    <th style="text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="tk in pagedTickets" :key="tk.id">
+                    <td class="mono" style="font-size: 12px;">{{ tk.ticket_no }}</td>
+                    <td v-if="isAdmin" style="font-size: 12.5px;">{{ tk.user_email }}</td>
+                    <td>
+                      <div style="font-weight: 600; font-size: 13px;">{{ tk.subject }}</div>
+                      <div v-if="tk.rule_name" style="margin-top: 3px;">
+                        <span class="badge badge-primary mono" style="font-size: 11px;">关联规则: {{ tk.rule_name }}</span>
+                      </div>
+                    </td>
+                    <td>
+                      <span class="badge badge-neutral">{{ ticketCategoryText(tk.category) }}</span>
+                    </td>
+                    <td>
+                      <span class="badge" :class="ticketPriorityBadge(tk.priority)">{{ ticketPriorityText(tk.priority) }}</span>
+                    </td>
+                    <td>
+                      <span class="badge" :class="ticketStatusBadge(tk.status)">{{ ticketStatusText(tk.status) }}</span>
+                    </td>
+                    <td class="mono" style="font-size: 12px; color: var(--text-muted);">
+                      {{ formatDateTimeDisplay(tk.last_message_at || tk.created_at) }}
+                    </td>
+                    <td style="text-align: right; white-space: nowrap;">
+                      <button @click="openTicketDetail(tk)" class="btn btn-soft btn-sm" style="margin-right: 4px;">
+                        查看对话
+                      </button>
+                      <button
+                        v-if="tk.status !== 'closed'"
+                        @click="handleCloseActiveTicket(tk)"
+                        class="btn btn-outline btn-sm"
+                      >
+                        结单
+                      </button>
+                    </td>
+                  </tr>
+                  <tr v-if="filteredTickets.length === 0">
+                    <td :colspan="isAdmin ? 8 : 7" style="padding: 0;">
+                      <div class="empty-state">
+                        <div class="empty-state-title">暂无符合条件的客服工单</div>
+                        <div class="empty-state-desc">点击右上角「+ 提交新工单」可选择问题分类并关联名下转发规则发起咨询</div>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <div v-if="filteredTickets.length > 0" class="pagination-bar">
+                <span>第 {{ ticketsPage }} / {{ ticketsTotalPages }} 页 · 共 {{ filteredTickets.length }} 张工单</span>
+                <div class="pagination-controls">
+                  <select v-model.number="ticketsPageSize" class="select pagination-select">
+                    <option :value="20">20 条/页</option>
+                    <option :value="50">50 条/页</option>
+                  </select>
+                  <button class="btn btn-outline btn-sm" :disabled="ticketsPage <= 1" @click="ticketsPage--">上一页</button>
+                  <button class="btn btn-outline btn-sm" :disabled="ticketsPage >= ticketsTotalPages" @click="ticketsPage++">下一页</button>
+                </div>
               </div>
             </div>
           </div>
@@ -3356,8 +5427,44 @@ onUnmounted(() => {
               <div>
                 <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
                   <input type="checkbox" v-model="settingsForm.allow_register" />
-                  <span>开放新用户注册</span>
+                  <span>开放新用户注册（支持邀请码绑定推荐关系）</span>
                 </label>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: 600; font-size: 14px;">推广返利与邀请分销设置 (Affiliate)</span>
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                  <input type="checkbox" v-model="settingsForm.affiliate_enabled" />
+                  <span>启用邀请返佣自动结算</span>
+                </label>
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">返佣结算比例 (% ，0-50)</label>
+                  <input
+                    v-model.number="settingsForm.affiliate_commission_rate"
+                    type="number"
+                    min="0"
+                    max="50"
+                    step="0.5"
+                    class="input"
+                    placeholder="10"
+                  />
+                </div>
+                <div>
+                  <label class="form-label">单笔最低提现门槛 (元)</label>
+                  <input
+                    v-model.number="settingsForm.affiliate_min_withdraw_yuan"
+                    type="number"
+                    min="1"
+                    step="1"
+                    class="input"
+                    placeholder="10"
+                  />
+                </div>
               </div>
             </div>
 
@@ -3385,9 +5492,20 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <div>
-                <label class="form-label">USDT-TRC20 收款地址（选填，供加密货币或人工审核入账）</label>
-                <input v-model="settingsForm.usdt_address" class="input" placeholder="T..." />
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">USDT-TRC20 收款地址（选填）</label>
+                  <input v-model="settingsForm.usdt_address" class="input" placeholder="T..." />
+                </div>
+                <div>
+                  <label class="form-label">USDT Webhook 回调密钥 (HMAC-SHA256)</label>
+                  <input
+                    v-model="settingsForm.usdt_webhook_secret"
+                    type="password"
+                    class="input"
+                    placeholder="回调地址: /api/v1/pay/usdt/notify"
+                  />
+                </div>
               </div>
 
               <div>
@@ -3403,8 +5521,8 @@ onUnmounted(() => {
 
             <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
               <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
-                <span style="font-weight: 600; font-size: 14px;">运维告警通知中心 (Telegram Bot / 通用 Webhook)</span>
-                <div style="display: flex; gap: 16px; align-items: center;">
+                <span style="font-weight: 600; font-size: 14px;">运维与客服通知中心 (Telegram Bot / 通用 Webhook)</span>
+                <div style="display: flex; gap: 14px; align-items: center; flex-wrap: wrap;">
                   <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
                     <input type="checkbox" v-model="settingsForm.notify_on_node_events" />
                     <span>节点上下线告警</span>
@@ -3412,6 +5530,10 @@ onUnmounted(() => {
                   <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
                     <input type="checkbox" v-model="settingsForm.notify_on_quota_events" />
                     <span>流量超额 / 套餐到期告警</span>
+                  </label>
+                  <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
+                    <input type="checkbox" v-model="settingsForm.notify_on_ticket_events" />
+                    <span>新工单 / 工单回复推送</span>
                   </label>
                 </div>
               </div>
@@ -3516,7 +5638,7 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <div class="table-wrap" style="max-height: 300px; overflow-y: auto;">
+              <div class="table-wrap">
                 <table class="table">
                   <thead>
                     <tr>
@@ -3529,7 +5651,7 @@ onUnmounted(() => {
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="log in filteredAuditLogs" :key="log.id">
+                    <tr v-for="log in pagedAuditLogs" :key="log.id">
                       <td class="mono" style="font-size: 12px; color: var(--text-secondary);">
                         {{ formatDateDisplay(log.created_at) }}
                       </td>
@@ -3542,12 +5664,29 @@ onUnmounted(() => {
                       <td class="mono" style="font-size: 12px; color: var(--text-muted);">{{ log.client_ip || log.ip || '-' }}</td>
                     </tr>
                     <tr v-if="filteredAuditLogs.length === 0">
-                      <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 18px;">
-                        暂无匹配的审计日志记录
+                      <td colspan="6" style="padding: 0;">
+                        <div class="empty-state">
+                          <div class="empty-state-title">暂无匹配的审计日志记录</div>
+                          <div class="empty-state-desc">当前筛选条件下没有安全审计事件</div>
+                        </div>
                       </td>
                     </tr>
                   </tbody>
                 </table>
+                <div v-if="filteredAuditLogs.length > 0" class="pagination-bar">
+                  <span>
+                    第 {{ auditPage }} / {{ auditTotalPages }} 页 · 共 {{ filteredAuditLogs.length }} 条记录
+                  </span>
+                  <div class="pagination-controls">
+                    <select v-model.number="auditPageSize" class="select pagination-select">
+                      <option :value="20">20 条/页</option>
+                      <option :value="50">50 条/页</option>
+                      <option :value="100">100 条/页</option>
+                    </select>
+                    <button class="btn btn-outline btn-sm" :disabled="auditPage <= 1" @click="auditPage--">上一页</button>
+                    <button class="btn btn-outline btn-sm" :disabled="auditPage >= auditTotalPages" @click="auditPage++">下一页</button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -4444,8 +6583,8 @@ onUnmounted(() => {
             style="padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color); font-size: 12.5px;"
           >
             <div>已创建订单：<code>{{ lastCreatedOrder.order_no }}</code></div>
-            <div v-if="lastCreatedOrder.pay_url" style="margin-top: 6px;">
-              <a :href="lastCreatedOrder.pay_url" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">
+            <div v-if="safeCreatedOrderPayUrl" style="margin-top: 6px;">
+              <a :href="safeCreatedOrderPayUrl" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">
                 前往支付收银台
               </a>
             </div>
@@ -4455,6 +6594,521 @@ onUnmounted(() => {
             <button @click="showRechargeModal = false" class="btn btn-outline">关闭</button>
             <button @click="submitRechargeOrder" class="btn btn-primary">生成充值订单</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 套餐购买 / 周期重置结算台（支持优惠券实时试算抵扣） -->
+    <div v-if="showCheckoutModal && checkoutPlan" class="modal-backdrop" @click.self="showCheckoutModal = false">
+      <div class="modal-box" style="max-width: 480px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">
+            {{ checkoutScene === 'plan_reset' ? '重置订阅周期与流量结算' : '购买套餐结算台' }}
+          </span>
+          <button @click="showCheckoutModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div
+            style="padding: 12px 14px; border-radius: var(--radius-md); background: var(--bg-subtle); border: 1px solid var(--border-color); display: flex; flex-direction: column; gap: 6px;"
+          >
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <span style="font-weight: 700; font-size: 14.5px;">{{ checkoutPlan.name }}</span>
+                <span class="badge badge-purple">{{ roleNameById(checkoutPlan.role_group_id) }}</span>
+              </div>
+              <span class="mono" style="font-weight: 700; color: var(--text-main);">
+                ¥{{ (checkoutPlan.price_cents / 100).toFixed(2) }}
+              </span>
+            </div>
+            <div style="font-size: 12px; color: var(--text-secondary); display: flex; gap: 14px; flex-wrap: wrap;">
+              <span>周期 {{ checkoutPlan.duration_days }} 天</span>
+              <span>流量 {{ formatBytes(checkoutPlan.quota_bytes) }}</span>
+              <span>规则 {{ checkoutPlan.max_rules }} 条</span>
+              <span>限速 {{ checkoutPlan.speed_mbps }} Mbps</span>
+            </div>
+            <div v-if="checkoutScene === 'plan_reset'" style="font-size: 11.5px; color: var(--text-muted);">
+              支付后将立即清零已用流量、顺延 {{ checkoutPlan.duration_days }} 天有效期并自动恢复超额暂停规则。
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">优惠券 / 折扣码（选填，实时试算抵扣）</label>
+            <div style="display: flex; gap: 8px;">
+              <input
+                v-model="checkoutCouponInput"
+                type="text"
+                maxlength="48"
+                class="input mono"
+                placeholder="输入优惠券码，例如 ZP88 / NEW20"
+                @keyup.enter="handlePreviewCheckoutCoupon"
+              />
+              <button
+                type="button"
+                @click="handlePreviewCheckoutCoupon"
+                class="btn btn-soft"
+                :disabled="checkoutPreviewLoading"
+              >
+                {{ checkoutPreviewLoading ? '试算中...' : '试算抵扣' }}
+              </button>
+              <button
+                v-if="checkoutCouponPreview || checkoutCouponInput"
+                type="button"
+                @click="clearCheckoutCoupon"
+                class="btn btn-outline btn-sm"
+              >
+                清除
+              </button>
+            </div>
+            <div v-if="checkoutCouponError" style="font-size: 12px; color: var(--danger-text); margin-top: 5px;">
+              {{ checkoutCouponError }}
+            </div>
+          </div>
+
+          <div v-if="checkoutCouponPreview" class="coupon-preview-box">
+            <div>
+              <div style="font-weight: 700;">
+                已应用「{{ checkoutCouponPreview.name }}」({{ checkoutCouponPreview.coupon_code }})
+              </div>
+              <div style="font-size: 11.5px; opacity: 0.9; margin-top: 2px;">
+                原价 ¥{{ (checkoutCouponPreview.original_cents / 100).toFixed(2) }} · 已减免 -¥{{ (checkoutCouponPreview.discount_cents / 100).toFixed(2) }}
+              </div>
+            </div>
+            <span class="mono" style="font-weight: 700; font-size: 15px;">
+              实付 ¥{{ (checkoutCouponPreview.payable_cents / 100).toFixed(2) }}
+            </span>
+          </div>
+
+          <div
+            style="padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; font-size: 13px;"
+          >
+            <span style="color: var(--text-secondary);">
+              当前账户余额：<strong class="mono" style="color: var(--text-main);">¥{{ ((user?.balance_cents || 0) / 100).toFixed(2) }}</strong>
+            </span>
+            <span>
+              应付金额：<strong class="mono" style="font-size: 16px; color: var(--primary-text);">¥{{ (checkoutPayableCents / 100).toFixed(2) }}</strong>
+            </span>
+          </div>
+
+          <div
+            v-if="!isAdmin && (user?.balance_cents || 0) < checkoutPayableCents"
+            style="display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--radius-md); background: var(--warning-soft); border: 1px solid var(--warning-border); color: var(--warning-text); font-size: 12px;"
+          >
+            <span>当前账户余额不足以支付实付金额</span>
+            <button
+              type="button"
+              @click="showCheckoutModal = false; openRechargeModal()"
+              class="btn btn-outline btn-sm"
+            >
+              前往充值
+            </button>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showCheckoutModal = false" class="btn btn-outline">取消</button>
+            <button
+              @click="confirmCheckoutPayment"
+              class="btn btn-primary"
+              :disabled="checkoutSubmitting || (!isAdmin && (user?.balance_cents || 0) < checkoutPayableCents)"
+            >
+              {{ checkoutSubmitting ? '处理中...' : `确认扣款支付 ¥${(checkoutPayableCents / 100).toFixed(2)}` }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 管理员新增 / 编辑优惠券弹窗 -->
+    <div v-if="showCouponModal && isAdmin" class="modal-backdrop" @click.self="showCouponModal = false">
+      <div class="modal-box" style="max-width: 540px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">{{ editingCouponId ? '编辑优惠券 / 折扣码' : '新增优惠券 / 折扣码' }}</span>
+          <button @click="showCouponModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div class="grid-2">
+            <div
+              class="mode-card"
+              :class="{ active: couponForm.type === 'percent' }"
+              @click="couponForm.type = 'percent'"
+            >
+              <div class="mode-title">百分比折扣券</div>
+              <div class="mode-desc">按比例减免，可设最高封顶</div>
+            </div>
+            <div
+              class="mode-card"
+              :class="{ active: couponForm.type === 'fixed' }"
+              @click="couponForm.type = 'fixed'"
+            >
+              <div class="mode-title">固定金额满减券</div>
+              <div class="mode-desc">满足门槛直接立减固定金额</div>
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">优惠券码（留空自动生成）</label>
+              <input
+                v-model="couponForm.code"
+                :disabled="!!editingCouponId"
+                class="input mono"
+                maxlength="48"
+                placeholder="例如：VIP80 / SAVE10"
+              />
+            </div>
+            <div>
+              <label class="form-label">优惠券名称</label>
+              <input v-model="couponForm.name" class="input" placeholder="例如：春季专线 8 折券" />
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div v-if="couponForm.type === 'percent'">
+              <label class="form-label">减免比例 (% , 如 20=8折)</label>
+              <input v-model.number="couponForm.percent_value" type="number" min="1" max="100" class="input" />
+            </div>
+            <div v-else>
+              <label class="form-label">立减金额 (元)</label>
+              <input v-model.number="couponForm.fixed_yuan" type="number" min="0.01" step="0.5" class="input" />
+            </div>
+            <div>
+              <label class="form-label">最低消费门槛 (元, 0=无门槛)</label>
+              <input v-model.number="couponForm.min_spend_yuan" type="number" min="0" step="1" class="input" />
+            </div>
+            <div v-if="couponForm.type === 'percent'">
+              <label class="form-label">最高减免封顶 (元, 0=不封顶)</label>
+              <input v-model.number="couponForm.max_discount_yuan" type="number" min="0" step="1" class="input" />
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">生效日期（选填）</label>
+              <input v-model="couponForm.starts_at" type="date" class="input" />
+            </div>
+            <div>
+              <label class="form-label">失效日期（选填）</label>
+              <input v-model="couponForm.ends_at" type="date" class="input" />
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">总可用次数（0 = 不限总次数）</label>
+              <input v-model.number="couponForm.max_uses" type="number" min="0" class="input" />
+            </div>
+            <div>
+              <label class="form-label">单用户限用次数（0 = 不限）</label>
+              <input v-model.number="couponForm.per_user_limit" type="number" min="0" class="input" />
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">限定适用套餐（不勾选代表全场付费套餐通用）</label>
+            <div
+              style="display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 12px; border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-subtle);"
+            >
+              <label
+                v-for="p in plans"
+                :key="p.id"
+                style="display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; cursor: pointer;"
+              >
+                <input type="checkbox" :value="p.id" v-model="couponForm.allowedPlanIds" />
+                <span>{{ p.name }} (¥{{ (p.price_cents / 100).toFixed(2) }})</span>
+              </label>
+            </div>
+          </div>
+
+          <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+            <input type="checkbox" v-model="couponForm.active" />
+            <span>立即启用该优惠券</span>
+          </label>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showCouponModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitCouponForm" class="btn btn-primary">保存优惠券</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 申请推广佣金提现弹窗 -->
+    <div v-if="showWithdrawModal" class="modal-backdrop" @click.self="showWithdrawModal = false">
+      <div class="modal-box" style="max-width: 440px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">申请推广佣金提现</span>
+          <button @click="showWithdrawModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div
+            style="padding: 10px 12px; border-radius: var(--radius-md); background: var(--bg-subtle); border: 1px solid var(--border-color); font-size: 12.5px; display: flex; justify-content: space-between;"
+          >
+            <span>可提现佣金：<strong class="mono">¥{{ ((affiliateOverview?.commission_balance_cents || 0) / 100).toFixed(2) }}</strong></span>
+            <span style="color: var(--text-muted);">最低 ¥{{ ((affiliateOverview?.min_withdraw_cents || 1000) / 100).toFixed(2) }}</span>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">提现金额 (元)</label>
+              <input v-model.number="withdrawForm.amount_yuan" type="number" min="1" step="0.01" class="input" />
+            </div>
+            <div>
+              <label class="form-label">收款方式</label>
+              <select v-model="withdrawForm.method" class="select">
+                <option value="usdt">USDT-TRC20 钱包</option>
+                <option value="alipay">支付宝 (Alipay)</option>
+                <option value="wechat">微信收款</option>
+                <option value="bank">银行卡转账</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">收款地址 / 收款账号</label>
+            <input
+              v-model="withdrawForm.account"
+              class="input mono"
+              placeholder="请输入准确的 TRC20 地址或收款账号"
+            />
+          </div>
+
+          <div>
+            <label class="form-label">收款人姓名备注（选填，支付宝 / 银行卡建议填写）</label>
+            <input v-model="withdrawForm.real_name" class="input" placeholder="用于财务核对收款人" />
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showWithdrawModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitWithdrawRequest" class="btn btn-primary">提交提现申请</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 提交新客服工单弹窗 -->
+    <div v-if="showCreateTicketModal" class="modal-backdrop" @click.self="showCreateTicketModal = false">
+      <div class="modal-box" style="max-width: 520px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">提交技术支持与客服工单</span>
+          <button @click="showCreateTicketModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div>
+            <label class="form-label">工单标题</label>
+            <input
+              v-model="ticketCreateForm.subject"
+              class="input"
+              maxlength="160"
+              placeholder="简要描述您遇到的问题，例如：深港专线端口连通性排查"
+            />
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">问题分类</label>
+              <select v-model="ticketCreateForm.category" class="select">
+                <option value="network">线路与网络</option>
+                <option value="rule">转发规则排障</option>
+                <option value="billing">账单与支付</option>
+                <option value="account">账号与权限</option>
+                <option value="general">综合咨询</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">紧急程度</label>
+              <select v-model="ticketCreateForm.priority" class="select">
+                <option value="low">低优（一般建议）</option>
+                <option value="normal">常规</option>
+                <option value="high">高优（影响业务）</option>
+                <option value="urgent">紧急（线路中断）</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">关联名下转发规则（选填，便于技术快速定位端口与节点）</label>
+            <select v-model.number="ticketCreateForm.rule_id" class="select">
+              <option :value="0">不关联特定转发规则</option>
+              <option v-for="r in visibleRules" :key="r.id" :value="r.id">
+                #{{ r.id }} {{ r.name }} ({{ nodeConnectIPById(r.ingress_node_id) }}:{{ r.listen_port }} · {{ r.protocol.toUpperCase() }})
+              </option>
+            </select>
+          </div>
+
+          <div>
+            <label class="form-label">详细问题描述</label>
+            <textarea
+              v-model="ticketCreateForm.message"
+              rows="4"
+              class="textarea"
+              placeholder="请详细说明故障现象、测试时间、源端地区或相关订单号..."
+            ></textarea>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showCreateTicketModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitCreateTicket" class="btn btn-primary">提交工单</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 工单对话详情与流转处理弹窗 -->
+    <div v-if="showTicketDetailModal && activeTicket" class="modal-backdrop" @click.self="showTicketDetailModal = false">
+      <div class="modal-box" style="max-width: 640px;">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 12px;">
+          <div>
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <span class="mono" style="font-size: 12px; color: var(--text-muted);">{{ activeTicket.ticket_no }}</span>
+              <span class="badge badge-neutral">{{ ticketCategoryText(activeTicket.category) }}</span>
+              <span class="badge" :class="ticketPriorityBadge(activeTicket.priority)">
+                {{ ticketPriorityText(activeTicket.priority) }}
+              </span>
+              <span class="badge" :class="ticketStatusBadge(activeTicket.status)">
+                {{ ticketStatusText(activeTicket.status) }}
+              </span>
+            </div>
+            <div style="font-weight: 700; font-size: 15px; margin-top: 6px;">{{ activeTicket.subject }}</div>
+            <div style="font-size: 12px; color: var(--text-secondary); margin-top: 3px; display: flex; gap: 12px; flex-wrap: wrap;">
+              <span v-if="isAdmin">提交人：{{ activeTicket.user_email }}</span>
+              <span v-if="activeTicket.rule_name" class="mono">关联规则：{{ activeTicket.rule_name }}</span>
+            </div>
+          </div>
+          <button @click="showTicketDetailModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <!-- 管理员快捷流转栏 -->
+        <div
+          v-if="isAdmin"
+          style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 10px; border-radius: var(--radius-md); background: var(--bg-subtle); border: 1px solid var(--border-color); font-size: 12px;"
+        >
+          <span style="font-weight: 600; color: var(--text-secondary);">客服工单流转操作：</span>
+          <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+            <button
+              type="button"
+              @click="handleAdminTicketStatusChange('open')"
+              class="btn btn-outline btn-sm"
+              :disabled="activeTicket.status === 'open'"
+            >
+              设为待受理
+            </button>
+            <button
+              type="button"
+              @click="handleAdminTicketStatusChange('answered')"
+              class="btn btn-soft btn-sm"
+              :disabled="activeTicket.status === 'answered'"
+            >
+              标记已回复
+            </button>
+            <button
+              type="button"
+              @click="handleAdminTicketStatusChange('closed')"
+              class="btn btn-danger btn-sm"
+              :disabled="activeTicket.status === 'closed'"
+            >
+              直接结单
+            </button>
+          </div>
+        </div>
+
+        <div ref="ticketThreadRef" class="chat-thread">
+          <div
+            v-for="msg in activeTicketMessages"
+            :key="msg.id"
+            class="chat-msg"
+            :class="(isAdmin && msg.sender_role === 'admin') || (!isAdmin && msg.sender_id === user?.id) ? 'self' : 'peer'"
+          >
+            <div class="chat-meta">
+              <span class="badge" :class="msg.sender_role === 'admin' ? 'badge-purple' : 'badge-info'">
+                {{ msg.sender_role === 'admin' ? '技术客服' : '用户' }}
+              </span>
+              <span>{{ msg.sender_email }}</span>
+              <span class="mono">{{ formatDateTimeDisplay(msg.created_at) }}</span>
+            </div>
+            <div class="chat-bubble">{{ msg.content }}</div>
+          </div>
+        </div>
+
+        <div v-if="activeTicket.status !== 'closed' || isAdmin" style="margin-top: 12px; display: flex; flex-direction: column; gap: 8px;">
+          <textarea
+            v-model="ticketReplyInput"
+            rows="3"
+            class="textarea"
+            :placeholder="isAdmin ? '输入客服处理回复（发送后将自动标记为已回复并触发通知）...' : '继续补充说明或追问客服...'"
+          ></textarea>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
+            <button
+              v-if="activeTicket.status !== 'closed'"
+              type="button"
+              @click="handleCloseActiveTicket()"
+              class="btn btn-outline btn-sm"
+            >
+              已解决，关闭工单
+            </button>
+            <span v-else style="font-size: 12px; color: var(--text-muted);">管理员回复将自动重新激活该已关闭工单</span>
+            <button type="button" @click="submitTicketReply" class="btn btn-primary">发送回复</button>
+          </div>
+        </div>
+        <div
+          v-else
+          style="margin-top: 12px; padding: 10px 12px; border-radius: var(--radius-md); background: var(--bg-subtle); text-align: center; font-size: 12.5px; color: var(--text-muted);"
+        >
+          该工单已结单关闭，如有新的技术或账单问题请点击「+ 提交新工单」。
+        </div>
+      </div>
+    </div>
+
+    <!-- 全局快速检索与跳转面板 (Ctrl / Cmd + K) -->
+    <div v-if="showCommandPalette && token" class="cmdk-backdrop" @click.self="showCommandPalette = false">
+      <div class="cmdk-modal" role="dialog" aria-modal="true" aria-label="快速检索与跳转面板">
+        <div class="cmdk-input-wrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input
+            ref="cmdkInputRef"
+            v-model="cmdkQuery"
+            type="text"
+            class="cmdk-input"
+            placeholder="输入关键字搜索页面、操作、转发规则、端口、节点或用户..."
+            @keydown.down.prevent="moveCmdkSelection(1)"
+            @keydown.up.prevent="moveCmdkSelection(-1)"
+            @keydown.enter.prevent="executeCmdkSelection"
+          />
+          <button type="button" class="btn btn-outline btn-sm" @click="showCommandPalette = false">Esc</button>
+        </div>
+
+        <div class="cmdk-list">
+          <button
+            v-for="(item, idx) in filteredCommandItems"
+            :key="item.id"
+            type="button"
+            class="cmdk-item"
+            :class="{ active: idx === cmdkActiveIndex }"
+            @mouseenter="cmdkActiveIndex = idx"
+            @click="runCommandItem(item)"
+          >
+            <div class="cmdk-item-main">
+              <span class="badge" :class="item.badgeClass || 'badge-neutral'">{{ item.category }}</span>
+              <span class="cmdk-item-title">{{ item.title }}</span>
+              <span v-if="item.subtitle" class="cmdk-item-sub">{{ item.subtitle }}</span>
+            </div>
+            <span class="kbd-shortcut">↵</span>
+          </button>
+
+          <div v-if="filteredCommandItems.length === 0" class="empty-state" style="padding: 26px 16px;">
+            <div class="empty-state-title">未找到匹配的页面、规则或快捷操作</div>
+            <div class="empty-state-desc">请尝试搜索端口、目标 IP、隧道名称或导航模块</div>
+          </div>
+        </div>
+
+        <div class="cmdk-footer">
+          <span>支持搜索：导航视图 · 快捷动作 · 转发规则 · 套餐 · 节点 · 用户</span>
+          <span>↑↓ 选择 · Enter 执行 · Esc 关闭</span>
         </div>
       </div>
     </div>
