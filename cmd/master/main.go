@@ -74,6 +74,7 @@ func main() {
 				}
 			}
 			orch.PruneOldTrafficStats(now)
+			orch.EvaluateDNSFailoverGroups(now)
 			orch.ReconcileAllOnlineNodes()
 		}
 	}()

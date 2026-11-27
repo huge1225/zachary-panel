@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -110,29 +112,50 @@ func (r *RealmEngine) reloadLocked() error {
 		if len(spec.Targets) == 0 {
 			continue
 		}
-		listenHost := spec.ListenHost
+		listenHost := strings.Trim(strings.TrimSpace(spec.ListenHost), "[]")
 		if listenHost == "" {
 			listenHost = "0.0.0.0"
 		}
-		listenAddr := fmt.Sprintf("%s:%d", listenHost, spec.ListenPort)
+		listenAddr := net.JoinHostPort(listenHost, strconv.Itoa(spec.ListenPort))
 
 		var extraRemotes []string
 		for i := 1; i < len(spec.Targets); i++ {
 			extraRemotes = append(extraRemotes, spec.Targets[i].Address)
 		}
 
+		netCfg := map[string]any{
+			"no_tcp":      spec.Protocol == "udp",
+			"use_udp":     spec.Protocol == "udp" || spec.Protocol == "both",
+			"udp_timeout": 30,
+		}
+		pp := spec.ProxyProto
+		if pp == 0 && spec.Tunnel != nil {
+			pp = spec.Tunnel.ProxyProto
+		}
+		if pp == 1 || pp == 2 {
+			netCfg["send_proxy"] = true
+			netCfg["send_proxy_version"] = pp
+		}
+
 		ep := map[string]any{
-			"listen": listenAddr,
-			"remote": spec.Targets[0].Address,
-			"network": map[string]any{
-				"no_tcp":      spec.Protocol == "udp",
-				"use_udp":     spec.Protocol == "udp" || spec.Protocol == "both",
-				"udp_timeout": 30,
-			},
+			"listen":  listenAddr,
+			"remote":  spec.Targets[0].Address,
+			"network": netCfg,
+		}
+		if outIP := strings.Trim(strings.TrimSpace(spec.OutboundIP), "[]"); outIP != "" {
+			ep["through"] = net.JoinHostPort(outIP, "0")
 		}
 		if len(extraRemotes) > 0 {
 			ep["extra_remotes"] = extraRemotes
-			ep["balance"] = "roundrobin: " + strings.Repeat("1, ", len(extraRemotes)) + "1"
+			var weights []string
+			for _, t := range spec.Targets {
+				w := t.Weight
+				if w <= 0 {
+					w = 1
+				}
+				weights = append(weights, fmt.Sprintf("%d", w))
+			}
+			ep["balance"] = "roundrobin: " + strings.Join(weights, ", ")
 		}
 		endpoints = append(endpoints, ep)
 	}

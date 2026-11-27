@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,13 +33,18 @@ type nativeRuleInstance struct {
 	spec           protocol.RuleSpec
 	cancel         context.CancelFunc
 	tcpListener    net.Listener
+	sniBindAddr    string // non-empty when attached to a shared sniHostRouter
 	udpConn        *net.UDPConn
 	tracker        *limiter.RuleStatsTracker
 	rrIndex        uint64
-	clientTLS      *tls.Config // Ingress only: pinned Egress certificate
-	aclMode        string      // "off" | "allow" | "deny"
+	clientTLS      *tls.Config   // default pinned next-hop/egress TLS config
+	targetTLS      []*tls.Config // per-target pinned TLS configs for multi-egress bandwidth aggregation
+	aclMode        string        // "off" | "allow" | "deny"
 	aclNets        []*net.IPNet
 	unhealthyUntil []int64 // atomic UnixNano per target index
+	rttNanos       []int64 // atomic smoothed RTT (ns) per target index for least_rtt selection
+	muxPool        *muxClientPool
+	bondHub        *bondServerHub
 }
 
 func parseACLCIDRs(raw string) []*net.IPNet {
@@ -103,13 +109,10 @@ func (inst *nativeRuleInstance) isAllowedRemoteAddr(addr net.Addr) bool {
 }
 
 // NativeEngine implements EngineDriver in pure Go with zero external binary dependencies.
-// It also serves as the base framework for self-developed tunnel protocols.
-//
-// Tunnel security model (Ingress <-> Egress):
-//   - every tunnel transport is carried over TLS 1.2+; the Egress presents its persistent node certificate and
-//     the Ingress verifies it against the PEM pinned by Master (no InsecureSkipVerify, fail closed);
-//   - inside TLS the Ingress sends an HMAC auth header (rule secret + timestamp + nonce, replay-protected);
-//   - UDP is framed inside the same encrypted tunnel instead of being sent as plaintext datagrams.
+// It supports single-hop direct relay, arbitrary N-hop encrypted tunnel chains (RoleIngress -> RoleHop -> RoleEgress),
+// multi-egress bandwidth aggregation (weighted / least_rtt / failover), multiplexed connection pooling (EnableMux),
+// single-stream multi-link chunk striping (EnableBonding), end-to-end PROXY Protocol v1/v2 client IP preservation,
+// non-decrypting TLS SNI / HTTP Host shared-port routing (MatchDomains), and OutboundIP source binding.
 type NativeEngine struct {
 	mu                 sync.RWMutex
 	policy             security.Policy
@@ -118,12 +121,13 @@ type NativeEngine struct {
 	egressHandshakeSem chan struct{}
 	activeUDPSessions  int64
 	rules              map[string]*nativeRuleInstance
+	sniRouters         map[string]*sniHostRouter
 	serverTLSConf      *tls.Config
 	customWrapper      CustomTunnelWrapper
 }
 
 // NewNativeEngine creates a ready-to-use NativeEngine. cert is the node's persistent tunnel identity used when
-// acting as an Egress; if nil, Egress tunnel rules are rejected.
+// acting as a Hop or Egress; if nil, Hop/Egress tunnel rules are rejected.
 func NewNativeEngine(pol security.Policy, cert *security.TunnelCert) *NativeEngine {
 	var tlsCfg *tls.Config
 	if cert != nil {
@@ -142,6 +146,7 @@ func NewNativeEngine(pol security.Policy, cert *security.TunnelCert) *NativeEngi
 		udpIPGuard:         security.NewIPConnGuard(maxUDPIPs),
 		egressHandshakeSem: make(chan struct{}, 512),
 		rules:              make(map[string]*nativeRuleInstance),
+		sniRouters:         make(map[string]*sniHostRouter),
 		serverTLSConf:      tlsCfg,
 	}
 }
@@ -164,7 +169,15 @@ func (e *NativeEngine) Name() protocol.EngineType {
 }
 
 func (e *NativeEngine) Available() bool {
-	return true // Always available on all platforms
+	return true
+}
+
+func isTunnelServer(spec protocol.RuleSpec) bool {
+	return protocol.IsTunnelServerRole(spec.Role) && spec.Tunnel != nil
+}
+
+func isTunnelClient(spec protocol.RuleSpec) bool {
+	return protocol.IsTunnelClientRole(spec.Role) && spec.Tunnel != nil
 }
 
 func isTunnelEgress(spec protocol.RuleSpec) bool {
@@ -173,6 +186,16 @@ func isTunnelEgress(spec protocol.RuleSpec) bool {
 
 func isTunnelIngress(spec protocol.RuleSpec) bool {
 	return spec.Role == protocol.RoleIngress && spec.Tunnel != nil
+}
+
+func effectiveProxyProto(spec protocol.RuleSpec) int {
+	if spec.ProxyProto == 1 || spec.ProxyProto == 2 {
+		return spec.ProxyProto
+	}
+	if spec.Tunnel != nil && (spec.Tunnel.ProxyProto == 1 || spec.Tunnel.ProxyProto == 2) {
+		return spec.Tunnel.ProxyProto
+	}
+	return 0
 }
 
 func wantsTCP(spec protocol.RuleSpec) bool {
@@ -192,7 +215,7 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 	if len(spec.Targets) == 0 {
 		return fmt.Errorf("rule %s has no targets configured", key)
 	}
-	if (isTunnelEgress(spec) || isTunnelIngress(spec)) && spec.Tunnel.SecretKey == "" {
+	if (isTunnelServer(spec) || isTunnelClient(spec)) && spec.Tunnel.SecretKey == "" {
 		return fmt.Errorf("rule %s: tunnel secret key missing", key)
 	}
 
@@ -206,16 +229,41 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 		aclMode:        aclMode,
 		aclNets:        aclNets,
 		unhealthyUntil: make([]int64, len(spec.Targets)),
+		rttNanos:       make([]int64, len(spec.Targets)),
 	}
-	if isTunnelIngress(spec) {
-		clientTLS, err := security.TunnelClientTLSConfig(spec.Tunnel.CertPEM)
-		if err != nil {
-			return fmt.Errorf("rule %s: %w", key, err)
+	if isTunnelClient(spec) {
+		inst.targetTLS = make([]*tls.Config, len(spec.Targets))
+		if strings.TrimSpace(spec.Tunnel.CertPEM) != "" {
+			clientTLS, err := security.TunnelClientTLSConfig(spec.Tunnel.CertPEM)
+			if err != nil {
+				return fmt.Errorf("rule %s: %w", key, err)
+			}
+			inst.clientTLS = clientTLS
 		}
-		inst.clientTLS = clientTLS
+		for i, t := range spec.Targets {
+			pemStr := strings.TrimSpace(t.CertPEM)
+			if pemStr == "" {
+				if inst.clientTLS == nil {
+					return fmt.Errorf("rule %s target #%d (%s): pinned tunnel certificate missing", key, i, t.Address)
+				}
+				inst.targetTLS[i] = inst.clientTLS
+				continue
+			}
+			tTLS, err := security.TunnelClientTLSConfig(pemStr)
+			if err != nil {
+				return fmt.Errorf("rule %s target #%d: %w", key, i, err)
+			}
+			inst.targetTLS[i] = tTLS
+		}
+		if spec.Tunnel.EnableMux {
+			inst.muxPool = newMuxClientPool()
+		}
 	}
-	if isTunnelEgress(spec) && e.serverTLSConf == nil {
-		return fmt.Errorf("rule %s: local tunnel certificate unavailable, refusing to start egress", key)
+	if isTunnelServer(spec) {
+		if e.serverTLSConf == nil {
+			return fmt.Errorf("rule %s: local tunnel certificate unavailable, refusing to start %s", key, spec.Role)
+		}
+		inst.bondHub = newBondServerHub()
 	}
 
 	ruleCtx, cancel := context.WithCancel(ctx)
@@ -227,11 +275,46 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 	}
 	bindAddr := net.JoinHostPort(listenHost, fmt.Sprintf("%d", spec.ListenPort))
 
-	// TCP listener: relay/ingress when protocol includes tcp; egress tunnels always (UDP is framed inside TLS)
-	if isTunnelEgress(spec) || wantsTCP(spec) {
+	// Shared-port SNI / HTTP Host L7 demux routing (available on user-facing TCP rules: Relay or Ingress)
+	if !isTunnelServer(spec) && strings.TrimSpace(spec.MatchDomains) != "" {
+		e.mu.Lock()
+		rt, exists := e.sniRouters[bindAddr]
+		if !exists {
+			var err error
+			rt, err = newSNIHostRouter(bindAddr, e)
+			if err != nil {
+				e.mu.Unlock()
+				cancel()
+				return err
+			}
+			e.sniRouters[bindAddr] = rt
+		}
+		if err := rt.Register(key, ruleCtx, inst); err != nil {
+			if len(rt.routes) == 0 {
+				rt.Unregister(key)
+				delete(e.sniRouters, bindAddr)
+			}
+			e.mu.Unlock()
+			cancel()
+			return err
+		}
+		inst.sniBindAddr = bindAddr
+		e.rules[key] = inst
+		e.mu.Unlock()
+
+		if len(spec.Targets) > 1 {
+			go e.healthProbeLoop(ruleCtx, inst)
+		}
+		log.Printf("[NativeEngine] Applied SNI/Host shared-port rule %s (%s) on %s (domains=%s)",
+			key, spec.Name, bindAddr, spec.MatchDomains)
+		return nil
+	}
+
+	// Dedicated TCP listener: relay/ingress when protocol includes tcp; hop/egress tunnels always (UDP is framed inside TLS)
+	if isTunnelServer(spec) || wantsTCP(spec) {
 		var ln net.Listener
 		var err error
-		if isTunnelEgress(spec) {
+		if isTunnelServer(spec) {
 			ln, err = tls.Listen("tcp", bindAddr, e.serverTLSConf)
 		} else {
 			ln, err = net.Listen("tcp", bindAddr)
@@ -244,8 +327,8 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 		go e.serveTCP(ruleCtx, inst)
 	}
 
-	// UDP listener only on the user-facing side (relay / ingress)
-	if !isTunnelEgress(spec) && wantsUDP(spec) {
+	// UDP listener only on the user-facing edge (relay / ingress)
+	if !isTunnelServer(spec) && wantsUDP(spec) {
 		udpAddr, err := net.ResolveUDPAddr("udp", bindAddr)
 		if err != nil {
 			if inst.tcpListener != nil {
@@ -266,8 +349,8 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 		go e.serveUDP(ruleCtx, inst)
 	}
 
-	// Background active health probe for multi-target TCP rules
-	if !isTunnelIngress(spec) && len(spec.Targets) > 1 && wantsTCP(spec) {
+	// Background active health & RTT probe for multi-target TCP / multi-egress tunnel rules
+	if len(spec.Targets) > 1 && (wantsTCP(spec) || isTunnelClient(spec)) {
 		go e.healthProbeLoop(ruleCtx, inst)
 	}
 
@@ -275,11 +358,12 @@ func (e *NativeEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) er
 	e.rules[key] = inst
 	e.mu.Unlock()
 
-	log.Printf("[NativeEngine] Applied rule %s (%s) listening on %s -> %d targets (limit=%d Mbps, acl=%s)",
-		key, spec.Name, bindAddr, len(spec.Targets), spec.SpeedLimitMbps, aclMode)
+	log.Printf("[NativeEngine] Applied rule %s (%s, role=%s) listening on %s -> %d targets (limit=%d Mbps, acl=%s)",
+		key, spec.Name, spec.Role, bindAddr, len(spec.Targets), spec.SpeedLimitMbps, aclMode)
 	return nil
 }
 
+// Also hook goutils in gost.go where caPath is created: check gost.go!
 func setTCPKeepAlive(c net.Conn) {
 	var tc *net.TCPConn
 	switch v := c.(type) {
@@ -296,11 +380,49 @@ func setTCPKeepAlive(c net.Conn) {
 	}
 }
 
-func (e *NativeEngine) serveTCP(ctx context.Context, inst *nativeRuleInstance) {
+// dispatchMatchedTCPConn runs ACL, MaxConns, IPConnGuard, and stream forwarding on an already-accepted (or SNI-routed) edge connection.
+func (e *NativeEngine) dispatchMatchedTCPConn(ctx context.Context, inst *nativeRuleInstance, conn net.Conn, preRelease ...func()) {
+	var releaseIP func()
+	if len(preRelease) > 0 && preRelease[0] != nil {
+		releaseIP = preRelease[0]
+	}
+	if !isTunnelServer(inst.spec) && !inst.isAllowedRemoteAddr(conn.RemoteAddr()) {
+		if releaseIP != nil {
+			releaseIP()
+		}
+		_ = conn.Close()
+		return
+	}
+
 	maxConns := inst.spec.MaxConns
 	if maxConns <= 0 {
 		maxConns = 8192
 	}
+	if maxConns > 0 && atomic.LoadInt64(&inst.tracker.ActiveConns) >= int64(maxConns) {
+		if releaseIP != nil {
+			releaseIP()
+		}
+		_ = conn.Close()
+		return
+	}
+
+	if releaseIP == nil {
+		releaseIP = func() {}
+		if !isTunnelServer(inst.spec) {
+			var allowed bool
+			releaseIP, allowed = e.connGuard.Acquire(conn.RemoteAddr())
+			if !allowed {
+				_ = conn.Close()
+				return
+			}
+		}
+	}
+
+	atomic.AddInt64(&inst.tracker.ActiveConns, 1)
+	go e.handleTCPConn(ctx, inst, conn, releaseIP)
+}
+
+func (e *NativeEngine) serveTCP(ctx context.Context, inst *nativeRuleInstance) {
 	for {
 		conn, err := inst.tcpListener.Accept()
 		if err != nil {
@@ -313,40 +435,21 @@ func (e *NativeEngine) serveTCP(ctx context.Context, inst *nativeRuleInstance) {
 			}
 		}
 		setTCPKeepAlive(conn)
-
-		if !isTunnelEgress(inst.spec) && !inst.isAllowedRemoteAddr(conn.RemoteAddr()) {
-			_ = conn.Close()
-			continue
-		}
-
-		if maxConns > 0 && atomic.LoadInt64(&inst.tracker.ActiveConns) >= int64(maxConns) {
-			_ = conn.Close()
-			continue
-		}
-
-		releaseIP := func() {}
-		if !isTunnelEgress(inst.spec) {
-			var allowed bool
-			releaseIP, allowed = e.connGuard.Acquire(conn.RemoteAddr())
-			if !allowed {
-				_ = conn.Close()
-				continue
-			}
-		}
-
-		atomic.AddInt64(&inst.tracker.ActiveConns, 1)
-		go e.handleTCPConn(ctx, inst, conn, releaseIP)
+		e.dispatchMatchedTCPConn(ctx, inst, conn)
 	}
 }
 
 func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstance, clientConn net.Conn, releaseIP func()) {
+	ownershipTransferred := false
 	defer func() {
 		releaseIP()
-		_ = clientConn.Close()
+		if !ownershipTransferred {
+			_ = clientConn.Close()
+		}
 		atomic.AddInt64(&inst.tracker.ActiveConns, -1)
 	}()
 
-	if isTunnelEgress(inst.spec) {
+	if isTunnelServer(inst.spec) {
 		if e.egressHandshakeSem != nil {
 			select {
 			case e.egressHandshakeSem <- struct{}{}:
@@ -363,7 +466,6 @@ func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstan
 		})
 		defer releaseHS()
 
-		// Complete the TLS handshake explicitly with a deadline so idle scanners cannot pin goroutines
 		if tc, ok := clientConn.(*tls.Conn); ok {
 			hsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			err := tc.HandshakeContext(hsCtx)
@@ -372,7 +474,6 @@ func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstan
 				return
 			}
 		}
-		// Optional self-developed obfuscation layer inside TLS
 		if inst.spec.Tunnel.Transport == "custom" {
 			if w := e.getCustomWrapper(); w != nil {
 				wrapped, err := w.WrapServerConn(clientConn, inst.spec.Tunnel)
@@ -382,43 +483,149 @@ func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstan
 				clientConn = wrapped
 			}
 		}
-		// HMAC pre-shared key tunnel authentication (replay-protected) blocks port scanners & traffic theft
 		mode, err := security.VerifyTunnelAuthHeader(clientConn, inst.spec.RuleID, inst.spec.Tunnel.SecretKey)
 		if err != nil {
-			log.Printf("[NativeEngine] Blocked unauthorized Egress connection from %s on rule #%d: %v",
-				clientConn.RemoteAddr().String(), inst.spec.RuleID, err)
+			log.Printf("[NativeEngine] Blocked unauthorized %s connection from %s on rule #%d: %v",
+				inst.spec.Role, clientConn.RemoteAddr().String(), inst.spec.RuleID, err)
 			return
 		}
-		// Release pre-auth handshake slot once authenticated so long-lived legitimate tunnels never exhaust it
 		releaseHS()
-		if mode == security.TunnelModeUDP {
-			if wantsUDP(inst.spec) {
-				e.serveTunnelUDP(ctx, inst, clientConn)
+
+		switch mode {
+		case security.TunnelModeMux:
+			ownershipTransferred = true
+			muxSess := newMuxSession(clientConn, false, func(st *muxStream, subMode byte, origClientAddr string) {
+				atomic.AddInt64(&inst.tracker.ActiveConns, 1)
+				defer func() {
+					_ = st.Close()
+					atomic.AddInt64(&inst.tracker.ActiveConns, -1)
+				}()
+				e.serveAuthenticatedTunnelStream(ctx, inst, st, subMode, origClientAddr)
+			})
+			select {
+			case <-ctx.Done():
+				_ = muxSess.Close()
+			case <-muxSess.closedCh:
 			}
 			return
-		}
-		if !wantsTCP(inst.spec) {
+
+		case security.TunnelModeBond:
+			if inst.bondHub == nil {
+				return
+			}
+			bc, subMode, origClientAddr, ready, bErr := inst.bondHub.AcceptMember(clientConn)
+			if bErr != nil {
+				return
+			}
+			ownershipTransferred = true
+			if !ready {
+				// Non-final member link is now owned by pendingBondGroup / bondedConn
+				return
+			}
+			defer bc.Close()
+			e.serveAuthenticatedTunnelStream(ctx, inst, bc, subMode, origClientAddr)
+			return
+
+		case security.TunnelModeTCPMeta:
+			origAddr, mErr := security.ReadTunnelClientMeta(clientConn)
+			if mErr != nil {
+				return
+			}
+			e.serveAuthenticatedTunnelStream(ctx, inst, clientConn, security.TunnelModeTCP, origAddr)
+			return
+
+		case security.TunnelModeUDPMeta:
+			origAddr, mErr := security.ReadTunnelClientMeta(clientConn)
+			if mErr != nil {
+				return
+			}
+			e.serveAuthenticatedTunnelStream(ctx, inst, clientConn, security.TunnelModeUDP, origAddr)
+			return
+
+		default:
+			e.serveAuthenticatedTunnelStream(ctx, inst, clientConn, mode, "")
 			return
 		}
 	}
 
-	targetConn, err := e.dialUpstream(ctx, inst, security.TunnelModeTCP)
+	// Edge Relay or Ingress connection
+	origClientAddr := ""
+	if clientConn.RemoteAddr() != nil {
+		origClientAddr = clientConn.RemoteAddr().String()
+	}
+
+	targetConn, err := e.dialUpstream(ctx, inst, security.TunnelModeTCP, origClientAddr)
 	if err != nil {
 		return
 	}
 	defer targetConn.Close()
 
+	// Direct Relay PROXY Protocol injection (for Tunnel rules, Egress injects PROXY Protocol at the final hop)
+	if !isTunnelClient(inst.spec) {
+		if ppVer := effectiveProxyProto(inst.spec); ppVer > 0 {
+			if err := WriteProxyProtocolHeader(targetConn, ppVer, "tcp", origClientAddr); err != nil {
+				return
+			}
+		}
+	}
+
+	e.spliceBidirectional(ctx, inst, clientConn, targetConn)
+}
+
+func (e *NativeEngine) serveAuthenticatedTunnelStream(
+	ctx context.Context,
+	inst *nativeRuleInstance,
+	streamConn net.Conn,
+	subMode byte,
+	origClientAddr string,
+) {
+	// Intermediate Hop Role: relay encrypted stream onward to next hop / egress pool without plaintext exposure!
+	if isTunnelClient(inst.spec) {
+		nextConn, err := e.dialUpstream(ctx, inst, subMode, origClientAddr)
+		if err != nil {
+			return
+		}
+		defer nextConn.Close()
+		e.spliceBidirectional(ctx, inst, streamConn, nextConn)
+		return
+	}
+
+	// Final Egress Role: unpack UDP or forward TCP to final target (injecting PROXY Protocol if configured)
+	if subMode == security.TunnelModeUDP {
+		if wantsUDP(inst.spec) {
+			e.serveTunnelUDP(ctx, inst, streamConn)
+		}
+		return
+	}
+	if !wantsTCP(inst.spec) {
+		return
+	}
+
+	targetConn, err := e.dialUpstream(ctx, inst, security.TunnelModeTCP, origClientAddr)
+	if err != nil {
+		return
+	}
+	defer targetConn.Close()
+
+	if ppVer := effectiveProxyProto(inst.spec); ppVer > 0 {
+		if err := WriteProxyProtocolHeader(targetConn, ppVer, "tcp", origClientAddr); err != nil {
+			return
+		}
+	}
+
+	e.spliceBidirectional(ctx, inst, streamConn, targetConn)
+}
+
+func (e *NativeEngine) spliceBidirectional(ctx context.Context, inst *nativeRuleInstance, clientConn, targetConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Upload direction: client -> upstream
 	go func() {
 		defer wg.Done()
 		_ = limiter.CopyWithStats(ctx, targetConn, clientConn, inst.tracker.Limiter, &inst.tracker.UploadBytes)
 		closeWrite(targetConn)
 	}()
 
-	// Download direction: upstream -> client
 	go func() {
 		defer wg.Done()
 		_ = limiter.CopyWithStats(ctx, clientConn, targetConn, inst.tracker.Limiter, &inst.tracker.DownBytes)
@@ -428,25 +635,34 @@ func (e *NativeEngine) handleTCPConn(ctx context.Context, inst *nativeRuleInstan
 	wg.Wait()
 }
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
 func closeWrite(c net.Conn) {
-	switch tc := c.(type) {
-	case *net.TCPConn:
-		_ = tc.CloseWrite()
-	case *tls.Conn:
-		_ = tc.CloseWrite()
+	if cw, ok := c.(closeWriter); ok {
+		_ = cw.CloseWrite()
 	}
 }
 
 func (e *NativeEngine) healthProbeLoop(ctx context.Context, inst *nativeRuleInstance) {
-	allowPrivate := e.policy.AllowPrivateTargets || (inst.spec.Role == protocol.RoleIngress)
+	allowPrivate := e.policy.AllowPrivateTargets || isTunnelClient(inst.spec)
 	probeOnce := func() {
 		for idx, t := range inst.spec.Targets {
-			c, err := security.SafeDialTCP(ctx, t.Address, 1500*time.Millisecond, allowPrivate)
+			t0 := time.Now()
+			c, err := security.SafeDialTCPWithSource(ctx, t.Address, inst.spec.OutboundIP, 1500*time.Millisecond, allowPrivate)
 			if err != nil {
 				atomic.StoreInt64(&inst.unhealthyUntil[idx], time.Now().Add(15*time.Second).UnixNano())
 			} else {
+				rtt := time.Since(t0).Nanoseconds()
 				_ = c.Close()
 				atomic.StoreInt64(&inst.unhealthyUntil[idx], 0)
+				old := atomic.LoadInt64(&inst.rttNanos[idx])
+				if old <= 0 {
+					atomic.StoreInt64(&inst.rttNanos[idx], rtt)
+				} else {
+					atomic.StoreInt64(&inst.rttNanos[idx], (old*3+rtt)/4)
+				}
 			}
 		}
 	}
@@ -463,88 +679,283 @@ func (e *NativeEngine) healthProbeLoop(ctx context.Context, inst *nativeRuleInst
 	}
 }
 
-// dialUpstream connects to the next target. For Ingress tunnel rules it establishes the pinned TLS tunnel to the
-// Egress node and authenticates with the given stream mode.
-func (e *NativeEngine) dialUpstream(ctx context.Context, inst *nativeRuleInstance, mode byte) (net.Conn, error) {
+// orderedTargetCandidates returns target indices ordered according to health, primary vs backup role, and LoadBalance strategy.
+func (e *NativeEngine) orderedTargetCandidates(inst *nativeRuleInstance) []int {
 	targets := inst.spec.Targets
 	n := len(targets)
-	if n == 0 {
+	if n == 1 {
+		return []int{0}
+	}
+	nowNano := time.Now().UnixNano()
+	var healthyPrimary, healthyBackup, unhealthy []int
+	for i := 0; i < n; i++ {
+		isHealthy := i >= len(inst.unhealthyUntil) || atomic.LoadInt64(&inst.unhealthyUntil[i]) <= nowNano
+		if !isHealthy {
+			unhealthy = append(unhealthy, i)
+		} else if targets[i].Backup {
+			healthyBackup = append(healthyBackup, i)
+		} else {
+			healthyPrimary = append(healthyPrimary, i)
+		}
+	}
+	// If all non-backup targets were marked Backup, treat healthyBackup as primary
+	if len(healthyPrimary) == 0 && len(healthyBackup) > 0 {
+		healthyPrimary = healthyBackup
+		healthyBackup = nil
+	}
+
+	orderGroup := func(group []int) []int {
+		if len(group) <= 1 {
+			return group
+		}
+		out := make([]int, len(group))
+		copy(out, group)
+		switch inst.spec.LoadBalance {
+		case "failover":
+			return out
+
+		case "least_rtt":
+			sort.SliceStable(out, func(i, j int) bool {
+				ri := atomic.LoadInt64(&inst.rttNanos[out[i]])
+				rj := atomic.LoadInt64(&inst.rttNanos[out[j]])
+				if ri == 0 && rj > 0 {
+					return true
+				}
+				if rj == 0 && ri > 0 {
+					return false
+				}
+				return ri < rj
+			})
+			return out
+
+		case "weighted":
+			totalW := uint64(0)
+			for _, idx := range out {
+				w := targets[idx].Weight
+				if w <= 0 {
+					w = 100
+				}
+				if w > 10000 {
+					w = 10000
+				}
+				totalW += uint64(w)
+			}
+			pick := (atomic.AddUint64(&inst.rrIndex, 1) - 1) % totalW
+			chosenPos := 0
+			acc := uint64(0)
+			for pos, idx := range out {
+				w := targets[idx].Weight
+				if w <= 0 {
+					w = 100
+				}
+				if w > 10000 {
+					w = 10000
+				}
+				acc += uint64(w)
+				if pick < acc {
+					chosenPos = pos
+					break
+				}
+			}
+			rotated := make([]int, 0, len(out))
+			for i := 0; i < len(out); i++ {
+				rotated = append(rotated, out[(chosenPos+i)%len(out)])
+			}
+			return rotated
+
+		case "random":
+			start := int(atomic.AddUint64(&inst.rrIndex, 2654435761) % uint64(len(out)))
+			rotated := make([]int, 0, len(out))
+			for i := 0; i < len(out); i++ {
+				rotated = append(rotated, out[(start+i)%len(out)])
+			}
+			return rotated
+
+		default: // round_robin
+			start := int((atomic.AddUint64(&inst.rrIndex, 1) - 1) % uint64(len(out)))
+			rotated := make([]int, 0, len(out))
+			for i := 0; i < len(out); i++ {
+				rotated = append(rotated, out[(start+i)%len(out)])
+			}
+			return rotated
+		}
+	}
+
+	candidates := make([]int, 0, n)
+	candidates = append(candidates, orderGroup(healthyPrimary)...)
+	candidates = append(candidates, orderGroup(healthyBackup)...)
+	candidates = append(candidates, unhealthy...)
+	return candidates
+}
+
+// dialRawAuthenticatedTunnel opens a single TLS-pinned, HMAC-authenticated tunnel connection to target[idx] with wireMode.
+func (e *NativeEngine) dialRawAuthenticatedTunnel(ctx context.Context, inst *nativeRuleInstance, idx int, wireMode byte) (net.Conn, error) {
+	allowPrivate := e.policy.AllowPrivateTargets || isTunnelClient(inst.spec)
+	addr := inst.spec.Targets[idx].Address
+
+	t0 := time.Now()
+	rawConn, err := security.SafeDialTCPWithSource(ctx, addr, inst.spec.OutboundIP, 5*time.Second, allowPrivate)
+	if err != nil {
+		if idx < len(inst.unhealthyUntil) {
+			atomic.StoreInt64(&inst.unhealthyUntil[idx], time.Now().Add(12*time.Second).UnixNano())
+		}
+		return nil, err
+	}
+	rtt := time.Since(t0).Nanoseconds()
+	if idx < len(inst.unhealthyUntil) {
+		atomic.StoreInt64(&inst.unhealthyUntil[idx], 0)
+	}
+	if idx < len(inst.rttNanos) {
+		old := atomic.LoadInt64(&inst.rttNanos[idx])
+		if old <= 0 {
+			atomic.StoreInt64(&inst.rttNanos[idx], rtt)
+		} else {
+			atomic.StoreInt64(&inst.rttNanos[idx], (old*3+rtt)/4)
+		}
+	}
+
+	var tlsConf *tls.Config
+	if idx < len(inst.targetTLS) && inst.targetTLS[idx] != nil {
+		tlsConf = inst.targetTLS[idx]
+	} else {
+		tlsConf = inst.clientTLS
+	}
+	if tlsConf == nil {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("missing pinned TLS config for target #%d", idx)
+	}
+
+	tlsConn := tls.Client(rawConn, tlsConf.Clone())
+	hsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err = tlsConn.HandshakeContext(hsCtx)
+	cancel()
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, fmt.Errorf("tunnel TLS verification failed: %w", err)
+	}
+	var conn net.Conn = tlsConn
+
+	if inst.spec.Tunnel.Transport == "custom" {
+		if w := e.getCustomWrapper(); w != nil {
+			wrapped, wErr := w.WrapClientConn(conn, inst.spec.Tunnel)
+			if wErr != nil {
+				_ = conn.Close()
+				return nil, wErr
+			}
+			conn = wrapped
+		}
+	}
+
+	if err := security.WriteTunnelAuthHeader(conn, inst.spec.RuleID, inst.spec.Tunnel.SecretKey, wireMode); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// dialUpstream connects to the next upstream target (plain socket for Relay/Egress, or authenticated TLS/Mux/Bonded
+// tunnel stream for Ingress/Hop).
+func (e *NativeEngine) dialUpstream(ctx context.Context, inst *nativeRuleInstance, subMode byte, origClientAddr string) (net.Conn, error) {
+	if len(inst.spec.Targets) == 0 {
 		return nil, fmt.Errorf("no targets")
 	}
+	candidates := e.orderedTargetCandidates(inst)
+	allowPrivate := e.policy.AllowPrivateTargets || isTunnelClient(inst.spec)
 
-	startIdx := int(atomic.AddUint64(&inst.rrIndex, 1)-1) % n
-	if inst.spec.LoadBalance == "failover" {
-		startIdx = 0
-	}
-
-	allowPrivate := e.policy.AllowPrivateTargets || (inst.spec.Role == protocol.RoleIngress)
-	nowNano := time.Now().UnixNano()
-
-	// Order candidates: healthy targets first (starting from startIdx), then unhealthy targets as fallback
-	candidates := make([]int, 0, n)
-	for i := 0; i < n; i++ {
-		idx := (startIdx + i) % n
-		if idx < len(inst.unhealthyUntil) && atomic.LoadInt64(&inst.unhealthyUntil[idx]) <= nowNano {
-			candidates = append(candidates, idx)
-		}
-	}
-	for i := 0; i < n; i++ {
-		idx := (startIdx + i) % n
-		if idx < len(inst.unhealthyUntil) && atomic.LoadInt64(&inst.unhealthyUntil[idx]) > nowNano {
-			candidates = append(candidates, idx)
-		}
-	}
-
-	var lastErr error
-	for _, idx := range candidates {
-		addr := targets[idx].Address
-
-		// Use Anti-SSRF & Anti-DNS-Rebinding safe dialer
-		rawConn, err := security.SafeDialTCP(ctx, addr, 5*time.Second, allowPrivate)
-		if err != nil {
-			if idx < len(inst.unhealthyUntil) {
-				atomic.StoreInt64(&inst.unhealthyUntil[idx], time.Now().Add(12*time.Second).UnixNano())
+	if !isTunnelClient(inst.spec) {
+		var lastErr error
+		for _, idx := range candidates {
+			addr := inst.spec.Targets[idx].Address
+			t0 := time.Now()
+			rawConn, err := security.SafeDialTCPWithSource(ctx, addr, inst.spec.OutboundIP, 5*time.Second, allowPrivate)
+			if err != nil {
+				if idx < len(inst.unhealthyUntil) {
+					atomic.StoreInt64(&inst.unhealthyUntil[idx], time.Now().Add(12*time.Second).UnixNano())
+				}
+				lastErr = err
+				continue
 			}
-			lastErr = err
-			continue
-		}
-		if idx < len(inst.unhealthyUntil) {
-			atomic.StoreInt64(&inst.unhealthyUntil[idx], 0)
-		}
-		if !isTunnelIngress(inst.spec) {
+			rtt := time.Since(t0).Nanoseconds()
+			if idx < len(inst.unhealthyUntil) {
+				atomic.StoreInt64(&inst.unhealthyUntil[idx], 0)
+			}
+			if idx < len(inst.rttNanos) {
+				old := atomic.LoadInt64(&inst.rttNanos[idx])
+				if old <= 0 {
+					atomic.StoreInt64(&inst.rttNanos[idx], rtt)
+				} else {
+					atomic.StoreInt64(&inst.rttNanos[idx], (old*3+rtt)/4)
+				}
+			}
 			return rawConn, nil
 		}
+		return nil, lastErr
+	}
 
-		// Ingress: every tunnel transport is wrapped in TLS that only trusts the pinned Egress certificate
-		tlsConn := tls.Client(rawConn, inst.clientTLS.Clone())
-		hsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = tlsConn.HandshakeContext(hsCtx)
-		cancel()
-		if err != nil {
-			_ = rawConn.Close()
-			lastErr = fmt.Errorf("tunnel TLS verification failed: %w", err)
-			continue
+	clientMeta := ""
+	if effectiveProxyProto(inst.spec) > 0 && origClientAddr != "" {
+		clientMeta = origClientAddr
+	}
+
+	// Mode A: Single-stream multi-link chunk striping (EnableBonding)
+	// Note: All member links of a single bonded stream MUST land on the SAME next-hop/egress node so bondServerHub reassembles them!
+	if inst.spec.Tunnel.EnableBonding {
+		links := inst.spec.Tunnel.BondLinks
+		if links <= 0 {
+			links = 4
 		}
-		var conn net.Conn = tlsConn
-
-		// Optional self-developed protocol layer inside TLS
-		if inst.spec.Tunnel.Transport == "custom" {
-			if w := e.getCustomWrapper(); w != nil {
-				wrapped, wErr := w.WrapClientConn(conn, inst.spec.Tunnel)
-				if wErr != nil {
-					_ = conn.Close()
-					lastErr = wErr
-					continue
-				}
-				conn = wrapped
+		var lastErr error
+		for _, idx := range candidates {
+			targetIdx := idx
+			bc, err := dialBondedStream(ctx, links, subMode, clientMeta, func(dCtx context.Context, _ int) (net.Conn, error) {
+				return e.dialRawAuthenticatedTunnel(dCtx, inst, targetIdx, security.TunnelModeBond)
+			})
+			if err == nil {
+				return bc, nil
 			}
+			lastErr = err
 		}
+		return nil, lastErr
+	}
 
-		// Write HMAC pre-shared key tunnel auth header to authenticate with Egress
-		if err := security.WriteTunnelAuthHeader(conn, inst.spec.RuleID, inst.spec.Tunnel.SecretKey, mode); err != nil {
-			_ = conn.Close()
+	// Mode B: Persistent multiplexed connection pool (EnableMux)
+	if inst.spec.Tunnel.EnableMux && inst.muxPool != nil {
+		var lastErr error
+		for _, idx := range candidates {
+			targetIdx := idx
+			st, err := inst.muxPool.OpenStream(ctx, targetIdx, subMode, clientMeta, func(dCtx context.Context) (net.Conn, error) {
+				return e.dialRawAuthenticatedTunnel(dCtx, inst, targetIdx, security.TunnelModeMux)
+			})
+			if err == nil {
+				return st, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	}
+
+	// Mode C: Standard dedicated TLS tunnel connection
+	wireMode := subMode
+	if clientMeta != "" {
+		if subMode == security.TunnelModeUDP {
+			wireMode = security.TunnelModeUDPMeta
+		} else {
+			wireMode = security.TunnelModeTCPMeta
+		}
+	}
+	var lastErr error
+	for _, idx := range candidates {
+		conn, err := e.dialRawAuthenticatedTunnel(ctx, inst, idx, wireMode)
+		if err != nil {
 			lastErr = err
 			continue
+		}
+		if clientMeta != "" {
+			if err := security.WriteTunnelClientMeta(conn, clientMeta); err != nil {
+				_ = conn.Close()
+				lastErr = err
+				continue
+			}
 		}
 		return conn, nil
 	}
@@ -584,7 +995,6 @@ func (e *NativeEngine) ActiveUDPSessions() int64 {
 	return atomic.LoadInt64(&e.activeUDPSessions)
 }
 
-// udpUpstream abstracts a plain UDP socket or a UDP-over-TLS framed tunnel stream.
 type udpUpstream interface {
 	WritePacket(p []byte) error
 	ReadPacket(buf []byte) (int, error)
@@ -624,7 +1034,6 @@ func (f *framedUpstream) WritePacket(p []byte) error {
 func (f *framedUpstream) ReadPacket(buf []byte) (int, error) {
 	var hdr [2]byte
 	_ = f.c.SetReadDeadline(time.Now().Add(udpReadPollWindow))
-	// Read first byte so a poll timeout never leaves a half-consumed frame header on the stream.
 	if _, err := io.ReadFull(f.c, hdr[:1]); err != nil {
 		return 0, err
 	}
@@ -644,23 +1053,30 @@ func (f *framedUpstream) ReadPacket(buf []byte) (int, error) {
 
 func (f *framedUpstream) Close() error { return f.c.Close() }
 
-func (e *NativeEngine) resolveSafeUDP(ctx context.Context, inst *nativeRuleInstance, addr string) (*net.UDPAddr, error) {
-	allowPrivate := e.policy.AllowPrivateTargets || (inst.spec.Role == protocol.RoleIngress)
+func (e *NativeEngine) resolveSafeUDP(ctx context.Context, inst *nativeRuleInstance, addr string) (*net.UDPAddr, *net.UDPAddr, error) {
+	allowPrivate := e.policy.AllowPrivateTargets || isTunnelClient(inst.spec)
 	if err := security.ValidateTargetAddress(addr, allowPrivate); err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	localIP, err := security.ValidateOutboundIP(inst.spec.OutboundIP, allowPrivate)
+	if err != nil {
+		return nil, nil, err
 	}
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	portNum, err := strconv.Atoi(portStr)
 	if err != nil || portNum < 1 || portNum > 65535 {
-		return nil, fmt.Errorf("invalid UDP target port %q", portStr)
+		return nil, nil, fmt.Errorf("invalid UDP target port %q", portStr)
 	}
 	var chosen net.IP
 	if ip := net.ParseIP(host); ip != nil {
+		if localIP != nil && (localIP.To4() != nil) != (ip.To4() != nil) {
+			return nil, nil, fmt.Errorf("UDP outbound_ip %s family mismatch with target %s", localIP.String(), ip.String())
+		}
 		if err := security.ValidateResolvedIP(ip, allowPrivate); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		chosen = ip
 	} else {
@@ -668,38 +1084,52 @@ func (e *NativeEngine) resolveSafeUDP(ctx context.Context, inst *nativeRuleInsta
 		ips, lErr := net.DefaultResolver.LookupIP(resolveCtx, "ip", host)
 		cancel()
 		if lErr != nil || len(ips) == 0 {
-			return nil, fmt.Errorf("UDP DNS resolution failed for %s: %w", host, lErr)
+			return nil, nil, fmt.Errorf("UDP DNS resolution failed for %s: %w", host, lErr)
 		}
 		for _, ip := range ips {
+			if localIP != nil && (localIP.To4() != nil) != (ip.To4() != nil) {
+				continue
+			}
 			if security.ValidateResolvedIP(ip, allowPrivate) == nil {
 				chosen = ip
 				break
 			}
 		}
 		if chosen == nil {
-			return nil, fmt.Errorf("security violation: UDP DNS resolution of %q pointed to restricted IP %s", host, ips[0].String())
+			return nil, nil, fmt.Errorf("security violation: UDP DNS resolution of %q pointed to restricted IP %s", host, ips[0].String())
 		}
 	}
-	return &net.UDPAddr{IP: chosen, Port: portNum}, nil
+	var lAddr *net.UDPAddr
+	if localIP != nil {
+		lAddr = &net.UDPAddr{IP: localIP}
+	}
+	return lAddr, &net.UDPAddr{IP: chosen, Port: portNum}, nil
 }
 
-func (e *NativeEngine) openUDPUpstream(ctx context.Context, inst *nativeRuleInstance) (udpUpstream, error) {
-	if isTunnelIngress(inst.spec) {
-		conn, err := e.dialUpstream(ctx, inst, security.TunnelModeUDP)
+func (e *NativeEngine) openUDPUpstream(ctx context.Context, inst *nativeRuleInstance, origClientAddr string) (udpUpstream, error) {
+	if isTunnelClient(inst.spec) {
+		conn, err := e.dialUpstream(ctx, inst, security.TunnelModeUDP, origClientAddr)
 		if err != nil {
 			return nil, err
 		}
 		return &framedUpstream{c: conn}, nil
 	}
-	rAddr, err := e.resolveSafeUDP(ctx, inst, inst.spec.Targets[0].Address)
-	if err != nil {
-		return nil, err
+	candidates := e.orderedTargetCandidates(inst)
+	var lastErr error
+	for _, idx := range candidates {
+		lAddr, rAddr, err := e.resolveSafeUDP(ctx, inst, inst.spec.Targets[idx].Address)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		upConn, err := net.DialUDP("udp", lAddr, rAddr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return &plainUDPUpstream{c: upConn}, nil
 	}
-	upConn, err := net.DialUDP("udp", nil, rAddr)
-	if err != nil {
-		return nil, err
-	}
-	return &plainUDPUpstream{c: upConn}, nil
+	return nil, lastErr
 }
 
 type udpSession struct {
@@ -747,8 +1177,6 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 		val, ok := sessions.Load(clientKey)
 		var sess *udpSession
 		if !ok {
-			// Enforce 3-tier UDP session caps (per-rule, node-global, per-source-IP) BEFORE charging upload bytes
-			// or blocking the shared UDP read loop on rate.Limiter.WaitN.
 			if atomic.AddInt64(&sessionCount, 1) > int64(maxRuleCap) {
 				atomic.AddInt64(&sessionCount, -1)
 				continue
@@ -782,14 +1210,13 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 					atomic.AddInt64(&e.activeUDPSessions, -1)
 					atomic.AddInt64(&sessionCount, -1)
 				}()
-				up, err := e.openUDPUpstream(ctx, inst)
+				up, err := e.openUDPUpstream(ctx, inst, key)
 				if err != nil {
 					log.Printf("[NativeEngine] UDP upstream for rule %s unavailable: %v", inst.key, err)
 					return
 				}
 				defer up.Close()
 
-				// writer: client datagrams -> upstream
 				go func() {
 					for {
 						select {
@@ -814,7 +1241,6 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 					}
 				}()
 
-				// reader: upstream datagrams -> client
 				rBufPtr := acquireUDPBuf()
 				defer releaseUDPBuf(rBufPtr)
 				rBuf := *rBufPtr
@@ -829,7 +1255,6 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 						}
 						return
 					}
-					// Even if upstream sends unilateral keepalives, evict sessions where the client left > udpIdleTimeout ago.
 					if time.Now().Unix()-atomic.LoadInt64(&s.lastSeen) >= idleSec {
 						return
 					}
@@ -856,21 +1281,31 @@ func (e *NativeEngine) serveUDP(ctx context.Context, inst *nativeRuleInstance) {
 		copy(pkt, buf[:n])
 		select {
 		case sess.queue <- pkt:
-		default: // queue full: drop datagram without charging unforwarded bytes
+		default:
 		}
 	}
 }
 
-// serveTunnelUDP runs on the Egress side for an authenticated UDP-mode tunnel stream: it unpacks framed
-// datagrams, forwards them to the rule's (SSRF-validated) target and frames the replies back.
 func (e *NativeEngine) serveTunnelUDP(ctx context.Context, inst *nativeRuleInstance, tunnelConn net.Conn) {
-	rAddr, err := e.resolveSafeUDP(ctx, inst, inst.spec.Targets[0].Address)
-	if err != nil {
-		log.Printf("[NativeEngine] Blocked unsafe UDP target on rule %s: %v", inst.key, err)
-		return
+	candidates := e.orderedTargetCandidates(inst)
+	var upConn *net.UDPConn
+	var lastErr error
+	for _, idx := range candidates {
+		lAddr, rAddr, err := e.resolveSafeUDP(ctx, inst, inst.spec.Targets[idx].Address)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		c, err := net.DialUDP("udp", lAddr, rAddr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		upConn = c
+		break
 	}
-	upConn, err := net.DialUDP("udp", nil, rAddr)
-	if err != nil {
+	if upConn == nil {
+		log.Printf("[NativeEngine] Blocked or unreachable UDP target on rule %s: %v", inst.key, lastErr)
 		return
 	}
 	defer upConn.Close()
@@ -944,6 +1379,13 @@ func (e *NativeEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol.R
 	inst, exists := e.rules[ruleKey]
 	if exists {
 		delete(e.rules, ruleKey)
+		if inst.sniBindAddr != "" {
+			if rt, ok := e.sniRouters[inst.sniBindAddr]; ok {
+				if rt.Unregister(ruleKey) {
+					delete(e.sniRouters, inst.sniBindAddr)
+				}
+			}
+		}
 	}
 	e.mu.Unlock()
 
@@ -957,6 +1399,12 @@ func (e *NativeEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol.R
 	}
 	if inst.udpConn != nil {
 		_ = inst.udpConn.Close()
+	}
+	if inst.muxPool != nil {
+		inst.muxPool.CloseAll()
+	}
+	if inst.bondHub != nil {
+		inst.bondHub.CloseAll()
 	}
 	return nil
 }

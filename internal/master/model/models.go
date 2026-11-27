@@ -1,8 +1,10 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -34,19 +36,24 @@ type SystemConfig struct {
 	PaymentEnabled     bool      `gorm:"default:false" json:"payment_enabled"`
 	EpayURL            string    `gorm:"size:255;default:''" json:"epay_url"`
 	EpayPID            string    `gorm:"size:64;default:''" json:"epay_pid"`
-	EpayKey                string    `gorm:"size:128;default:''" json:"epay_key"`
-	USDTAddress            string    `gorm:"size:128;default:''" json:"usdt_address"`
-	USDTWebhookSecret      string    `gorm:"size:128;default:''" json:"usdt_webhook_secret"`
-	RechargeNotice         string    `gorm:"size:512;default:''" json:"recharge_notice"`
-	NotifyTelegramBotToken string    `gorm:"size:128;default:''" json:"notify_telegram_bot_token"`
-	NotifyTelegramChatID   string    `gorm:"size:64;default:''" json:"notify_telegram_chat_id"`
-	NotifyWebhookURL       string    `gorm:"size:512;default:''" json:"notify_webhook_url"`
+	EpayKey                   string    `gorm:"size:128;default:''" json:"epay_key"`
+	USDTAddress               string    `gorm:"size:128;default:''" json:"usdt_address"`
+	USDTWebhookSecret         string    `gorm:"size:128;default:''" json:"usdt_webhook_secret"`
+	RechargeNotice            string    `gorm:"size:512;default:''" json:"recharge_notice"`
+	NotifyTelegramBotToken    string    `gorm:"size:128;default:''" json:"notify_telegram_bot_token"`
+	NotifyTelegramChatID      string    `gorm:"size:64;default:''" json:"notify_telegram_chat_id"`
+	NotifyWebhookURL          string    `gorm:"size:512;default:''" json:"notify_webhook_url"`
 	NotifyOnNodeEvents        bool      `gorm:"default:true" json:"notify_on_node_events"`
 	NotifyOnQuotaEvents       bool      `gorm:"default:true" json:"notify_on_quota_events"`
 	NotifyOnTicketEvents      bool      `gorm:"default:true" json:"notify_on_ticket_events"`
 	AffiliateEnabled          bool      `gorm:"default:true" json:"affiliate_enabled"`
 	AffiliateCommissionRate   float64   `gorm:"default:10" json:"affiliate_commission_rate"`
 	AffiliateMinWithdrawCents int64     `gorm:"default:1000" json:"affiliate_min_withdraw_cents"`
+	OffPeakEnabled            bool      `gorm:"default:false" json:"offpeak_enabled"`
+	OffPeakStart              string    `gorm:"size:8;default:'01:00'" json:"offpeak_start"`
+	OffPeakEnd                string    `gorm:"size:8;default:'08:00'" json:"offpeak_end"`
+	OffPeakMultiplier         float64   `gorm:"default:0.5" json:"offpeak_multiplier"`
+	OffPeakTimezone           string    `gorm:"size:64;default:'Asia/Shanghai'" json:"offpeak_timezone"`
 	AdminAPIKeyHash           string    `gorm:"size:128;default:''" json:"-"`
 	AdminAPIKeyPrefix         string    `gorm:"size:32;default:''" json:"admin_api_key_prefix"`
 	UpdatedAt                 time.Time `json:"updated_at"`
@@ -171,97 +178,401 @@ type NodeGroup struct {
 
 // Node represents a managed forwarding server running the Agent.
 type Node struct {
-	ID               uint64              `gorm:"primaryKey" json:"id"`
-	Name             string              `gorm:"size:128;not null" json:"name"`
-	GroupID          uint64              `gorm:"default:1" json:"group_id"`
-	Role             string              `gorm:"size:32;default:'all'" json:"role"`   // "relay" | "ingress" | "egress" | "all"
-	ServerIP         string              `gorm:"size:191;not null" json:"server_ip"`  // 服务器通信 IP (用于节点间隧道底层对接)
-	ConnectIP        string              `gorm:"size:191;not null" json:"connect_ip"` // 连接 IP / 入口显示地址 (用于添加转发后展示与一键复制)
-	PublicHost       string              `gorm:"size:191" json:"public_host"`         // 兼容字段 (等同于 ConnectIP)
-	InternalHost     string              `gorm:"size:191" json:"internal_host"`       // 专线内网通信 IP (选填，优先用于隧道通信)
-	PortRange        string              `gorm:"size:64;default:'10000-50000'" json:"port_range"`
-	TrafficRate      float64             `gorm:"default:1.0" json:"traffic_rate"`           // 节点倍率
-	QuotaBytes       int64               `gorm:"default:10995116277760" json:"quota_bytes"` // 节点月流量配额 (默认 10TB, 0表示不限)
-	UsedBytes        int64               `gorm:"default:0" json:"used_bytes"`               // 节点当前已用流量 (可手动设置校准)
-	ResetDay         int                 `gorm:"default:0" json:"reset_day"`                // 每月自动重置流量日 (0=不开启, 1..28=每月几号)
-	LastResetMonth   string              `gorm:"size:16;default:''" json:"last_reset_month"` // 最近一次自动重置月份 (YYYY-MM)
-	DefaultEngine    protocol.EngineType `gorm:"size:32;default:'native'" json:"default_engine"`
-	SupportedEngines string              `gorm:"size:255;default:'native'" json:"supported_engines"`       // Agent上报的可用引擎列表
-	AgentVersion     string              `gorm:"size:32;default:'1.1.0-sec'" json:"agent_version"`         // Agent 上报的当前程序版本号
-	SecretToken      string              `gorm:"size:128;not null" json:"secret_token,omitempty"`         // 仅在创建节点或生成对接脚本时读取
-	TunnelCertPEM    string              `gorm:"type:text" json:"-"`                                      // Agent 上报的隧道 TLS 证书 (入口节点据此做证书固定)
-	Status           string              `gorm:"size:32;default:'offline';index" json:"status"`           // "online" | "offline" | "maintenance"
-	CPUCores         int                 `gorm:"-" json:"cpu_cores"`
-	CPUUsage         float64             `gorm:"-" json:"cpu_usage"`
-	Load1            float64             `gorm:"-" json:"load_1"`
-	Load5            float64             `gorm:"-" json:"load_5"`
-	Load15           float64             `gorm:"-" json:"load_15"`
-	MemUsedBytes     uint64              `gorm:"-" json:"mem_used_bytes"`
-	MemTotalBytes    uint64              `gorm:"-" json:"mem_total_bytes"`
-	MemUsage         float64             `gorm:"-" json:"mem_usage"`
-	DiskUsedBytes    uint64              `gorm:"-" json:"disk_used_bytes"`
-	DiskTotalBytes   uint64              `gorm:"-" json:"disk_total_bytes"`
-	DiskUsage        float64             `gorm:"-" json:"disk_usage"`
-	NetRxBytesPerS   uint64              `gorm:"-" json:"net_rx_bytes_per_s"`
-	NetTxBytesPerS   uint64              `gorm:"-" json:"net_tx_bytes_per_s"`
-	ActiveRules      int                 `gorm:"-" json:"active_rules"`
-	ActiveConns      int64               `gorm:"-" json:"active_conns"`
-	UptimeSeconds    int64               `gorm:"-" json:"uptime_seconds"`
-	LastSeenAt       *time.Time          `json:"last_seen_at"`
-	CreatedAt        time.Time           `json:"created_at"`
-	UpdatedAt        time.Time           `json:"updated_at"`
+	ID                 uint64              `gorm:"primaryKey" json:"id"`
+	Name               string              `gorm:"size:128;not null" json:"name"`
+	GroupID            uint64              `gorm:"default:1" json:"group_id"`
+	Role               string              `gorm:"size:32;default:'all'" json:"role"`   // "relay" | "ingress" | "egress" | "all"
+	ServerIP           string              `gorm:"size:191;not null" json:"server_ip"`  // 服务器通信 IP (用于节点间隧道底层对接)
+	ConnectIP          string              `gorm:"size:191;not null" json:"connect_ip"` // 连接 IP / 入口显示地址 (用于添加转发后展示与一键复制)
+	PublicHost         string              `gorm:"size:191" json:"public_host"`         // 兼容字段 (等同于 ConnectIP)
+	InternalHost       string              `gorm:"size:191" json:"internal_host"`       // 专线内网通信 IP (选填，优先用于隧道通信)
+	OutboundIP         string              `gorm:"size:128;default:''" json:"outbound_ip"`          // 默认出站绑定源 IP (选填)
+	AllowedOutboundIPs string              `gorm:"size:512;default:''" json:"allowed_outbound_ips"` // 允许租户选用的出站源 IP 列表 (逗号分隔)
+	PortRange          string              `gorm:"size:64;default:'10000-50000'" json:"port_range"`
+	TrafficRate        float64             `gorm:"default:1.0" json:"traffic_rate"`           // 节点倍率
+	QuotaBytes         int64               `gorm:"default:10995116277760" json:"quota_bytes"` // 节点月流量配额 (默认 10TB, 0表示不限)
+	UsedBytes          int64               `gorm:"default:0" json:"used_bytes"`               // 节点当前已用流量 (可手动设置校准)
+	ResetDay           int                 `gorm:"default:0" json:"reset_day"`                // 每月自动重置流量日 (0=不开启, 1..28=每月几号)
+	LastResetMonth     string              `gorm:"size:16;default:''" json:"last_reset_month"` // 最近一次自动重置月份 (YYYY-MM)
+	DefaultEngine      protocol.EngineType `gorm:"size:32;default:'native'" json:"default_engine"`
+	SupportedEngines   string              `gorm:"size:255;default:'native'" json:"supported_engines"`       // Agent上报的可用引擎列表
+	AgentVersion       string              `gorm:"size:32;default:'1.1.0-sec'" json:"agent_version"`         // Agent 上报的当前程序版本号
+	SecretToken        string              `gorm:"size:128;not null" json:"secret_token,omitempty"`         // 仅在创建节点或生成对接脚本时读取
+	TunnelCertPEM      string              `gorm:"type:text" json:"-"`                                      // Agent 上报的隧道 TLS 证书 (入口节点据此做证书固定)
+	Status             string              `gorm:"size:32;default:'offline';index" json:"status"`           // "online" | "offline" | "maintenance"
+	CPUCores           int                 `gorm:"-" json:"cpu_cores"`
+	CPUUsage           float64             `gorm:"-" json:"cpu_usage"`
+	Load1              float64             `gorm:"-" json:"load_1"`
+	Load5              float64             `gorm:"-" json:"load_5"`
+	Load15             float64             `gorm:"-" json:"load_15"`
+	MemUsedBytes       uint64              `gorm:"-" json:"mem_used_bytes"`
+	MemTotalBytes      uint64              `gorm:"-" json:"mem_total_bytes"`
+	MemUsage           float64             `gorm:"-" json:"mem_usage"`
+	DiskUsedBytes      uint64              `gorm:"-" json:"disk_used_bytes"`
+	DiskTotalBytes     uint64              `gorm:"-" json:"disk_total_bytes"`
+	DiskUsage          float64             `gorm:"-" json:"disk_usage"`
+	NetRxBytesPerS     uint64              `gorm:"-" json:"net_rx_bytes_per_s"`
+	NetTxBytesPerS     uint64              `gorm:"-" json:"net_tx_bytes_per_s"`
+	ActiveRules        int                 `gorm:"-" json:"active_rules"`
+	ActiveConns        int64               `gorm:"-" json:"active_conns"`
+	UptimeSeconds      int64               `gorm:"-" json:"uptime_seconds"`
+	LastSeenAt         *time.Time          `json:"last_seen_at"`
+	CreatedAt          time.Time           `json:"created_at"`
+	UpdatedAt          time.Time           `json:"updated_at"`
 }
 
-// TunnelLine defines a Tunnel (借鉴 flux-panel 隧道设计):
+// PreferredTunnelHost returns the address upstream hops should dial to reach this node's tunnel listener.
+func (n *Node) PreferredTunnelHost() string {
+	for _, h := range []string{n.InternalHost, n.ServerIP, n.ConnectIP, n.PublicHost} {
+		if v := strings.TrimSpace(h); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// AllowsOutboundIP checks whether a user (admin or non-admin) may bind the given local source IP on this node.
+func (n *Node) AllowsOutboundIP(rawIP string, isAdmin bool) bool {
+	ipStr := strings.TrimSpace(rawIP)
+	if ipStr == "" {
+		return true
+	}
+	want, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return false
+	}
+	want = want.Unmap()
+	if isAdmin {
+		return true
+	}
+	candidates := []string{n.OutboundIP}
+	if strings.TrimSpace(n.AllowedOutboundIPs) != "" {
+		candidates = append(candidates, strings.Split(n.AllowedOutboundIPs, ",")...)
+	}
+	for _, cand := range candidates {
+		c := strings.TrimSpace(cand)
+		if c == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(c); err == nil && addr.Unmap() == want {
+			return true
+		}
+	}
+	return false
+}
+
+// NodePortAlloc records a persistent internal tunnel port allocated on a specific hop or egress node.
+type NodePortAlloc struct {
+	NodeID uint64 `json:"node_id"`
+	Port   int    `json:"port"`
+}
+
+// EgressMember represents one egress node in a TunnelLine's multipath egress pool.
+type EgressMember struct {
+	NodeID uint64 `json:"node_id"`
+	Weight int    `json:"weight"`
+	Backup bool   `json:"backup,omitempty"`
+}
+
+// ParseHopNodeIDs parses and validates a comma-separated list of intermediate hop node IDs (max 8, no duplicates).
+func ParseHopNodeIDs(raw string) ([]uint64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	parts := strings.Split(trimmed, ",")
+	out := make([]uint64, 0, len(parts))
+	seen := make(map[uint64]struct{}, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		id, err := strconv.ParseUint(s, 10, 64)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("无效的中间跳点节点 ID %q", s)
+		}
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("链式转发中间跳点节点 #%d 不能重复出现", id)
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	if len(out) > 8 {
+		return nil, fmt.Errorf("链式转发中间跳点最多支持 8 跳")
+	}
+	return out, nil
+}
+
+// ParseEgressNodeIDs parses a multipath egress specification like "2:200,3:100,4:100:backup" or "2,3".
+func ParseEgressNodeIDs(raw string) ([]EgressMember, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	parts := strings.Split(trimmed, ",")
+	out := make([]EgressMember, 0, len(parts))
+	seen := make(map[uint64]struct{}, len(parts))
+	for _, p := range parts {
+		s := strings.TrimSpace(p)
+		if s == "" {
+			continue
+		}
+		fields := strings.Split(s, ":")
+		if len(fields) > 3 {
+			return nil, fmt.Errorf("无效的多出口配置项 %q（格式: nodeID[:weight[:backup]]）", s)
+		}
+		id, err := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 64)
+		if err != nil || id == 0 {
+			return nil, fmt.Errorf("无效的出口节点 ID %q", fields[0])
+		}
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("多出口聚合池中出口节点 #%d 重复", id)
+		}
+		seen[id] = struct{}{}
+		weight := 100
+		backup := false
+		if len(fields) >= 2 && strings.TrimSpace(fields[1]) != "" {
+			f1 := strings.ToLower(strings.TrimSpace(fields[1]))
+			if f1 == "backup" {
+				backup = true
+			} else {
+				w, wErr := strconv.Atoi(f1)
+				if wErr != nil || w < 1 || w > 10000 {
+					return nil, fmt.Errorf("出口节点 #%d 权重无效（需为 1-10000）", id)
+				}
+				weight = w
+			}
+		}
+		if len(fields) == 3 && strings.TrimSpace(fields[2]) != "" {
+			f2 := strings.ToLower(strings.TrimSpace(fields[2]))
+			if f2 == "backup" || f2 == "true" || f2 == "1" {
+				backup = true
+			} else {
+				return nil, fmt.Errorf("出口节点 #%d 标记 %q 无效（仅支持 backup）", id, fields[2])
+			}
+		}
+		out = append(out, EgressMember{NodeID: id, Weight: weight, Backup: backup})
+	}
+	if len(out) > 16 {
+		return nil, fmt.Errorf("多出口聚合池最多支持 16 个出口节点")
+	}
+	return out, nil
+}
+
+// FormatEgressMembers serializes EgressMember items into canonical "id:weight[:backup]" notation.
+func FormatEgressMembers(members []EgressMember) string {
+	if len(members) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(members))
+	for _, m := range members {
+		w := m.Weight
+		if w <= 0 {
+			w = 100
+		}
+		if m.Backup {
+			parts = append(parts, fmt.Sprintf("%d:%d:backup", m.NodeID, w))
+		} else if w != 100 {
+			parts = append(parts, fmt.Sprintf("%d:%d", m.NodeID, w))
+		} else {
+			parts = append(parts, strconv.FormatUint(m.NodeID, 10))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+// TunnelLine defines a Tunnel (支持单端直转、双端加密、多跳链式接力与多出口带宽聚合):
 // - Type == "direct": 直接转发隧道 (适用于自带内网穿透的专线节点或单台直连节点，只需指定 IngressNodeID)
-// - Type == "encrypt": 加密对接隧道 (适用于国内入口 IngressNodeID 对接国外出口 EgressNodeID)
+// - Type == "encrypt": 加密对接隧道 (支持 Ingress -> [Hop_0..Hop_K] -> EgressPool)
 type TunnelLine struct {
-	ID             uint64              `gorm:"primaryKey" json:"id"`
-	Name           string              `gorm:"size:128;not null" json:"name"`
-	Type           string              `gorm:"size:32;default:'direct'" json:"type"` // "direct" (直接转发隧道) | "encrypt" (加密对接隧道)
-	Description    string              `gorm:"size:255" json:"description"`
-	IngressNodeID  uint64              `gorm:"not null;index" json:"ingress_node_id"`          // 入口节点 ID
-	EgressNodeID   uint64              `gorm:"default:0;index" json:"egress_node_id"`          // 出口节点 ID (仅 Type=="encrypt" 时需要)
-	Transport      string              `gorm:"size:32;default:'tls'" json:"transport"`        // "raw" | "tls" | "ws" | "wss" | "quic" | "custom"
-	Engine         protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"`        // 默认转发引擎: "native" | "gost" | "realm" | "nftables"
-	BillingMode    string              `gorm:"size:32;default:'two_way'" json:"billing_mode"` // "one_way" (单向计费) | "two_way" (双向计费)
-	RateMultiplier float64             `gorm:"default:1.0" json:"rate_multiplier"`            // 隧道计费倍率
-	MaxPortCount   int                 `gorm:"default:50" json:"max_port_count"`              // 该隧道允许的最大端口转发数
-	PortRange      string              `gorm:"size:64;default:''" json:"port_range"`          // 该隧道在入口节点上可分配的端口范围 (如 "20000-20999")，留空则使用节点端口范围
-	Enabled        bool                `gorm:"default:true" json:"enabled"`
-	CreatedAt      time.Time           `json:"created_at"`
+	ID                uint64              `gorm:"primaryKey" json:"id"`
+	Name              string              `gorm:"size:128;not null" json:"name"`
+	Type              string              `gorm:"size:32;default:'direct'" json:"type"` // "direct" (直接转发隧道) | "encrypt" (加密对接隧道)
+	Description       string              `gorm:"size:255" json:"description"`
+	IngressNodeID     uint64              `gorm:"not null;index" json:"ingress_node_id"`                 // 入口节点 ID
+	HopNodeIDs        string              `gorm:"size:512;default:''" json:"hop_node_ids"`               // 链式转发中间跳点节点 ID 列表 (如 "5,6")
+	EgressNodeID      uint64              `gorm:"default:0;index" json:"egress_node_id"`                 // 主出口节点 ID (Type=="encrypt" 时同步为出口池首节点)
+	EgressNodeIDs     string              `gorm:"size:512;default:''" json:"egress_node_ids"`            // 多出口带宽聚合池 (如 "2:200,3:100,4:100:backup")
+	LoadBalance       string              `gorm:"size:32;default:'round_robin'" json:"load_balance"`     // 多出口调度策略: "round_robin" | "weighted" | "least_rtt" | "failover" | "random"
+	EnableMux         bool                `gorm:"default:false" json:"enable_mux"`                       // 常驻 TLS 连接池多路复用
+	EnableBonding     bool                `gorm:"default:false" json:"enable_bonding"`                   // 单连接多通道条带化带宽聚合
+	BondLinks         int                 `gorm:"default:4" json:"bond_links"`                           // 条带化并发通道数 (2..8)
+	ProxyProtocol     int                 `gorm:"default:0" json:"proxy_protocol"`                       // 默认 PROXY Protocol: 0=关闭, 1=v1, 2=v2
+	OffPeakMultiplier float64             `gorm:"default:0" json:"offpeak_multiplier"`                   // 隧道专属闲时倍率 (0=继承全局闲时倍率)
+	Transport         string              `gorm:"size:32;default:'tls'" json:"transport"`                // "raw" | "tls" | "ws" | "wss" | "quic" | "custom"
+	Engine            protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"`                // 默认转发引擎: "native" | "gost" | "realm" | "nftables"
+	BillingMode       string              `gorm:"size:32;default:'two_way'" json:"billing_mode"`         // "one_way" (单向计费) | "two_way" (双向计费)
+	RateMultiplier    float64             `gorm:"default:1.0" json:"rate_multiplier"`                    // 隧道计费倍率
+	MaxPortCount      int                 `gorm:"default:50" json:"max_port_count"`                      // 该隧道允许的最大端口转发数
+	PortRange          string              `gorm:"size:64;default:''" json:"port_range"`                  // 该隧道在入口节点上可分配的端口范围，留空则使用节点端口范围
+	Enabled            bool                `gorm:"default:true" json:"enabled"`
+	CreatedAt          time.Time           `json:"created_at"`
+	AllowedOutboundIPs string              `gorm:"-" json:"allowed_outbound_ips,omitempty"`
+}
+
+// HopIDs returns the ordered intermediate relay hop node IDs configured on this tunnel line.
+func (l *TunnelLine) HopIDs() []uint64 {
+	if l == nil {
+		return nil
+	}
+	ids, err := ParseHopNodeIDs(l.HopNodeIDs)
+	if err != nil {
+		return nil
+	}
+	return ids
+}
+
+// HopIndexOf returns the 0-based hop index if nodeID is an intermediate hop on this tunnel line.
+func (l *TunnelLine) HopIndexOf(nodeID uint64) (int, bool) {
+	for i, id := range l.HopIDs() {
+		if id == nodeID {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// EgressMembers returns the effective egress pool members, falling back to EgressNodeID if EgressNodeIDs is empty.
+func (l *TunnelLine) EgressMembers() []EgressMember {
+	if l == nil {
+		return nil
+	}
+	if members, err := ParseEgressNodeIDs(l.EgressNodeIDs); err == nil && len(members) > 0 {
+		return members
+	}
+	if l.EgressNodeID > 0 {
+		return []EgressMember{{NodeID: l.EgressNodeID, Weight: 100}}
+	}
+	return nil
+}
+
+// UsesNodeAsEgress reports whether nodeID is part of this tunnel line's egress pool.
+func (l *TunnelLine) UsesNodeAsEgress(nodeID uint64) bool {
+	if l == nil || nodeID == 0 || l.Type != "encrypt" {
+		return false
+	}
+	for _, m := range l.EgressMembers() {
+		if m.NodeID == nodeID {
+			return true
+		}
+	}
+	return l.EgressNodeID == nodeID
+}
+
+// UsesNodeInTunnelLeg reports whether nodeID participates as an intermediate hop or egress node on this line.
+func (l *TunnelLine) UsesNodeInTunnelLeg(nodeID uint64) bool {
+	if l == nil || nodeID == 0 || l.Type != "encrypt" {
+		return false
+	}
+	if _, ok := l.HopIndexOf(nodeID); ok {
+		return true
+	}
+	return l.UsesNodeAsEgress(nodeID)
 }
 
 // ForwardRule represents a user-configured port/tunnel forwarding rule.
 type ForwardRule struct {
-	ID            uint64              `gorm:"primaryKey" json:"id"`
-	UserID        uint64              `gorm:"index;index:idx_rule_user_enabled,priority:1;not null" json:"user_id"`
-	Name          string              `gorm:"size:128;not null" json:"name"`
-	Mode          string              `gorm:"size:32;default:'direct'" json:"mode"` // "direct" (单端直转) | "tunnel" (入口-出口专线联动)
-	IngressNodeID uint64              `gorm:"index;not null" json:"ingress_node_id"`
-	TunnelLineID  uint64              `gorm:"default:0;index" json:"tunnel_line_id"`  // Mode == "tunnel" 时关联的专线 ID
-	Engine        protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"` // 面板可选: "native" | "gost" | "realm" | "nftables"
-	Protocol      string              `gorm:"size:16;default:'tcp'" json:"protocol"`  // "tcp" | "udp" | "both"
-	ListenPort    int                 `gorm:"not null" json:"listen_port"`            // 入口节点分配的公网端口
-	RelayPort     int                 `gorm:"default:0" json:"relay_port"`            // 双端模式下出口节点自动分配的内部隧道端口
-	RelayNodeID   uint64              `gorm:"default:0;index" json:"-"`               // RelayPort 所在的出口节点（用于中继端口唯一性约束与范围校验）
-	TunnelSecret  string              `gorm:"size:128" json:"-"`                      // 双端隧道自动生成的鉴权密钥
-	LoadBalance   string              `gorm:"size:32;default:'round_robin'" json:"load_balance"`
-	TargetsJSON   string              `gorm:"type:text;not null" json:"targets_json"` // JSON serialized []protocol.TargetEndpoint
-	SpeedMbps     int                 `gorm:"default:0" json:"speed_mbps"`            // 0 表示继承用户套餐限速
-	AccessMode    string              `gorm:"size:16;default:'off'" json:"access_mode"`   // "off" | "allow" | "deny"
-	AccessCIDRs   string              `gorm:"size:1024;default:''" json:"access_cidrs"`   // 逗号分隔的 IP 或 CIDR 列表
-	UploadBytes   int64               `gorm:"default:0" json:"upload_bytes"`
-	DownBytes     int64               `gorm:"default:0" json:"down_bytes"`
-	BilledBytes   int64               `gorm:"default:0" json:"billed_bytes"`
-	Enabled       bool                `gorm:"default:true;index:idx_rule_user_enabled,priority:2" json:"enabled"`
-	Status        string              `gorm:"size:32;default:'syncing';index" json:"status"` // "running" | "paused" | "error" | "quota_exceeded"
-	LastError     string              `gorm:"size:255" json:"last_error,omitempty"`
-	CreatedAt     time.Time           `json:"created_at"`
-	UpdatedAt     time.Time           `json:"updated_at"`
-	// EffectiveEngine is the engine the rule actually runs on (computed at read time, not persisted). It differs from
-	// Engine when a speed-limited non-admin rule falls back from gost / realm to native.
+	ID              uint64              `gorm:"primaryKey" json:"id"`
+	UserID          uint64              `gorm:"index;index:idx_rule_user_enabled,priority:1;not null" json:"user_id"`
+	Name            string              `gorm:"size:128;not null" json:"name"`
+	Mode            string              `gorm:"size:32;default:'direct'" json:"mode"` // "direct" (单端直转) | "tunnel" (入口-跳点-出口专线联动)
+	IngressNodeID   uint64              `gorm:"index;not null" json:"ingress_node_id"`
+	TunnelLineID    uint64              `gorm:"default:0;index" json:"tunnel_line_id"`  // Mode == "tunnel" 时关联的专线 ID
+	Engine          protocol.EngineType `gorm:"size:32;default:'native'" json:"engine"` // 面板可选: "native" | "gost" | "realm" | "nftables"
+	Protocol        string              `gorm:"size:16;default:'tcp'" json:"protocol"`  // "tcp" | "udp" | "both"
+	ListenPort      int                 `gorm:"not null" json:"listen_port"`            // 入口节点分配的公网端口
+	RelayPort       int                 `gorm:"default:0" json:"relay_port"`            // 双端模式下主出口节点自动分配的内部隧道端口
+	RelayNodeID     uint64              `gorm:"default:0;index" json:"-"`               // RelayPort 所在的主出口节点
+	HopPortsJSON    string              `gorm:"size:1024;default:''" json:"hop_ports_json,omitempty"`    // 中间跳点分配端口 JSON ([]NodePortAlloc)
+	EgressPortsJSON string              `gorm:"size:1024;default:''" json:"egress_ports_json,omitempty"` // 多出口节点分配端口 JSON ([]NodePortAlloc)
+	TunnelSecret    string              `gorm:"size:128" json:"-"`                      // 隧道自动生成的鉴权密钥
+	LoadBalance     string              `gorm:"size:32;default:'round_robin'" json:"load_balance"`
+	TargetsJSON     string              `gorm:"type:text;not null" json:"targets_json"` // JSON serialized []protocol.TargetEndpoint
+	SpeedMbps       int                 `gorm:"default:0" json:"speed_mbps"`            // 0 表示继承用户套餐限速
+	AccessMode      string              `gorm:"size:16;default:'off'" json:"access_mode"`   // "off" | "allow" | "deny"
+	AccessCIDRs     string              `gorm:"size:1024;default:''" json:"access_cidrs"`   // 逗号分隔的 IP 或 CIDR 列表
+	ProxyProtocol   int                 `gorm:"default:0" json:"proxy_protocol"`            // 0=继承隧道/关闭, 1=PROXY v1, 2=PROXY v2, -1=强制关闭
+	MatchDomains    string              `gorm:"size:1024;default:''" json:"match_domains"`  // SNI / HTTP Host 共享端口路由域名 (逗号分隔)
+	OutboundIP      string              `gorm:"size:128;default:''" json:"outbound_ip"`     // 指定出站绑定源 IP
+	RuleQuotaBytes  int64               `gorm:"default:0" json:"rule_quota_bytes"`          // 单规则累计计费流量上限 (0=不限)
+	DailyQuotaBytes int64               `gorm:"default:0" json:"daily_quota_bytes"`         // 单规则每日计费流量上限 (0=不限)
+	DailyUsedBytes  int64               `gorm:"default:0" json:"daily_used_bytes"`          // 今日已用计费流量
+	DailyResetDate  string              `gorm:"size:16;default:''" json:"daily_reset_date,omitempty"` // 最近一次日配额重置日期 (YYYY-MM-DD)
+	UploadBytes     int64               `gorm:"default:0" json:"upload_bytes"`
+	DownBytes       int64               `gorm:"default:0" json:"down_bytes"`
+	BilledBytes     int64               `gorm:"default:0" json:"billed_bytes"`
+	Enabled         bool                `gorm:"default:true;index:idx_rule_user_enabled,priority:2" json:"enabled"`
+	Status          string              `gorm:"size:32;default:'syncing';index" json:"status"` // "running" | "paused" | "error" | "quota_exceeded" | "rule_quota_exceeded" | "daily_quota_exceeded"
+	LastError       string              `gorm:"size:255" json:"last_error,omitempty"`
+	CreatedAt       time.Time           `json:"created_at"`
+	UpdatedAt       time.Time           `json:"updated_at"`
+	// EffectiveEngine is the engine the rule actually runs on (computed at read time, not persisted).
 	EffectiveEngine protocol.EngineType `gorm:"-" json:"effective_engine,omitempty"`
+}
+
+// HopPortAllocs parses HopPortsJSON into a slice of NodePortAlloc.
+func (r *ForwardRule) HopPortAllocs() []NodePortAlloc {
+	if r == nil || strings.TrimSpace(r.HopPortsJSON) == "" {
+		return nil
+	}
+	var out []NodePortAlloc
+	_ = json.Unmarshal([]byte(r.HopPortsJSON), &out)
+	return out
+}
+
+// EgressPortAllocs parses EgressPortsJSON into a slice of NodePortAlloc, falling back to (RelayNodeID, RelayPort).
+func (r *ForwardRule) EgressPortAllocs() []NodePortAlloc {
+	if r == nil {
+		return nil
+	}
+	if strings.TrimSpace(r.EgressPortsJSON) != "" {
+		var out []NodePortAlloc
+		if err := json.Unmarshal([]byte(r.EgressPortsJSON), &out); err == nil && len(out) > 0 {
+			return out
+		}
+	}
+	if r.RelayNodeID > 0 && r.RelayPort > 0 {
+		return []NodePortAlloc{{NodeID: r.RelayNodeID, Port: r.RelayPort}}
+	}
+	return nil
+}
+
+// EffectiveProxyProto resolves the PROXY protocol version (0, 1, or 2) after applying rule override / line inheritance.
+func (r *ForwardRule) EffectiveProxyProto(line *TunnelLine) int {
+	if r == nil {
+		return 0
+	}
+	if r.ProxyProtocol == -1 {
+		return 0
+	}
+	if r.ProxyProtocol == 1 || r.ProxyProtocol == 2 {
+		return r.ProxyProtocol
+	}
+	if line != nil && (line.ProxyProtocol == 1 || line.ProxyProtocol == 2) {
+		return line.ProxyProtocol
+	}
+	return 0
+}
+
+// WithinRuleQuotas reports whether this rule is below both its total RuleQuotaBytes and DailyQuotaBytes caps.
+func (r *ForwardRule) WithinRuleQuotas(todayStr string) bool {
+	if r == nil {
+		return false
+	}
+	if r.RuleQuotaBytes > 0 && r.BilledBytes >= r.RuleQuotaBytes {
+		return false
+	}
+	if r.DailyQuotaBytes > 0 {
+		dailyUsed := r.DailyUsedBytes
+		if todayStr != "" && r.DailyResetDate != "" && r.DailyResetDate != todayStr {
+			dailyUsed = 0
+		}
+		if dailyUsed >= r.DailyQuotaBytes {
+			return false
+		}
+	}
+	return true
 }
 
 // RedeemCode allows users to top-up balance, add quota/duration, or activate plans via gift codes.
@@ -413,6 +724,45 @@ type TrafficHourlyStat struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// IngressFailoverGroup manages multi-ingress high availability and automatic DNS A/AAAA record failover.
+type IngressFailoverGroup struct {
+	ID                  uint64     `gorm:"primaryKey" json:"id"`
+	Name                string     `gorm:"size:128;not null" json:"name"`
+	Domain              string     `gorm:"size:191;not null;index" json:"domain"`                // 完整解析域名 (如 entry.example.com)
+	RecordType          string     `gorm:"size:8;default:'A'" json:"record_type"`                // "A" | "AAAA"
+	TTL                 int        `gorm:"default:60" json:"ttl"`                                // DNS TTL 秒数 (默认 60)
+	Proxied             bool       `gorm:"default:false" json:"proxied"`                         // Cloudflare 代理开关 (端口转发默认建议 false)
+	PrimaryNodeID       uint64     `gorm:"not null;index" json:"primary_node_id"`                // 主入口节点 ID
+	BackupNodeIDs       string     `gorm:"size:512;not null" json:"backup_node_ids"`             // 备用入口节点 ID 列表 (按优先级逗号分隔，如 "2,3")
+	ActiveNodeID        uint64     `gorm:"default:0" json:"active_node_id"`                      // 当前生效的入口节点 ID
+	ActiveIP            string     `gorm:"size:128;default:''" json:"active_ip"`                 // 当前已写入 DNS 的解析 IP
+	Provider            string     `gorm:"size:32;not null" json:"provider"`                     // "cloudflare" | "dnspod" | "webhook"
+	ZoneID              string     `gorm:"size:128;default:''" json:"zone_id"`                   // Cloudflare Zone ID 或 DNSPod 主域名 (如 example.com)
+	RecordID            string     `gorm:"size:128;default:''" json:"record_id"`                 // DNS 记录 ID (留空可自动查询回填)
+	SubDomain           string     `gorm:"size:128;default:''" json:"sub_domain"`                // DNSPod 主机记录 (留空自动从 Domain 提取)
+	APIToken            string     `gorm:"size:512;default:''" json:"-"`                         // Cloudflare Token / DNSPod "ID,Token" / Webhook HMAC 密钥
+	WebhookURL          string     `gorm:"size:512;default:''" json:"webhook_url"`               // Provider == "webhook" 时的回调 URL
+	OfflineThresholdSec int        `gorm:"default:30" json:"offline_threshold_sec"`              // 判定故障切换的离线持续秒数 (0..3600)
+	CooldownSec         int        `gorm:"default:120" json:"cooldown_sec"`                      // 防抖冷却时间秒数 (0..86400)
+	AutoFailback        bool       `gorm:"default:true" json:"auto_failback"`                    // 主入口恢复在线后是否自动切回
+	Enabled             bool       `gorm:"default:true;index" json:"enabled"`                    // 是否启用自动容灾巡检
+	LastSwitchAt        *time.Time `json:"last_switch_at,omitempty"`
+	LastCheckAt         *time.Time `json:"last_check_at,omitempty"`
+	LastError           string     `gorm:"size:255;default:''" json:"last_error,omitempty"`
+	SwitchCount         int        `gorm:"default:0" json:"switch_count"`
+	HasAPIToken         bool       `gorm:"-" json:"has_api_token"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+}
+
+// ParseBackupNodeIDs returns the ordered list of backup ingress node IDs.
+func (g *IngressFailoverGroup) ParseBackupNodeIDs() ([]uint64, error) {
+	if g == nil {
+		return nil, nil
+	}
+	return ParseHopNodeIDs(g.BackupNodeIDs)
+}
+
 // AuditLog records security-sensitive and administrative operations on the panel.
 type AuditLog struct {
 	ID        uint64    `gorm:"primaryKey" json:"id"`
@@ -463,6 +813,7 @@ func InitDB(driver, dsn string) (*gorm.DB, error) {
 		&Node{},
 		&TunnelLine{},
 		&ForwardRule{},
+		&IngressFailoverGroup{},
 		&RedeemCode{},
 		&BillingOrder{},
 		&Coupon{},
@@ -568,21 +919,28 @@ func ensureUserSubTokenUniqueIndex(db *gorm.DB, driver string) {
 	}
 }
 
-// ensureRulePortUniqueIndex adds a database-level guarantee that two rules never get the same listen port on one
-// node (the in-process allocation lock only covers a single master instance). Port 0 is used transiently while a
-// rule is moved between nodes and is excluded. Existing duplicate data only produces a warning.
+// ensureRulePortUniqueIndex adds a database-level guarantee that two exclusive-port rules (match_domains == '')
+// never get the same listen port on one node. Shared-port SNI/Host rules (match_domains <> '') may share a listen
+// port and have non-overlapping domain checks enforced under WithAllocLock.
 func ensureRulePortUniqueIndex(db *gorm.DB, driver string) {
-	const name = "idx_rule_node_port"
+	const legacyName = "idx_rule_node_port"
+	if db.Migrator().HasIndex(&ForwardRule{}, legacyName) {
+		_ = db.Migrator().DropIndex(&ForwardRule{}, legacyName)
+	}
+	if driver != "mysql" {
+		_ = db.Exec("DROP INDEX IF EXISTS " + legacyName).Error
+	}
+
+	const name = "idx_rule_node_port_v2"
 	if db.Migrator().HasIndex(&ForwardRule{}, name) {
 		return
 	}
 	var stmt string
 	switch driver {
 	case "mysql":
-		// MySQL has no partial indexes: functional key parts that are NULL for port 0 (NULLs never collide). 8.0.13+.
-		stmt = "CREATE UNIQUE INDEX " + name + " ON forward_rules ((CASE WHEN listen_port > 0 THEN ingress_node_id END), (CASE WHEN listen_port > 0 THEN listen_port END))"
+		stmt = "CREATE UNIQUE INDEX " + name + " ON forward_rules ((CASE WHEN listen_port > 0 AND (match_domains = '' OR match_domains IS NULL) THEN ingress_node_id END), (CASE WHEN listen_port > 0 AND (match_domains = '' OR match_domains IS NULL) THEN listen_port END))"
 	default: // sqlite, postgres
-		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON forward_rules (ingress_node_id, listen_port) WHERE listen_port > 0"
+		stmt = "CREATE UNIQUE INDEX IF NOT EXISTS " + name + " ON forward_rules (ingress_node_id, listen_port) WHERE listen_port > 0 AND (match_domains = '' OR match_domains IS NULL)"
 	}
 	if err := db.Exec(stmt).Error; err != nil {
 		log.Printf("[DB] WARNING: could not create unique index %s (duplicate ports in existing data or unsupported database version): %v", name, err)

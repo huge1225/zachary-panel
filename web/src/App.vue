@@ -17,7 +17,10 @@ import {
   type AuditLogItem,
   type RoleGroup,
   type EngineType,
+  type LoadBalanceStrategy,
   type TargetEndpoint,
+  type ProbeLeg,
+  type IngressFailoverGroupItem,
   type SystemConfig,
   type CouponItem,
   type CouponPreviewResp,
@@ -113,6 +116,11 @@ const siteConfig = ref<SystemConfig>({
   affiliate_enabled: true,
   affiliate_commission_rate: 10,
   affiliate_min_withdraw_cents: 1000,
+  offpeak_enabled: false,
+  offpeak_start: '00:00',
+  offpeak_end: '08:00',
+  offpeak_multiplier: 0.5,
+  offpeak_timezone: 'Asia/Shanghai',
 })
 
 const user = ref<User | null>(null)
@@ -129,6 +137,7 @@ const couponsList = ref<CouponItem[]>([])
 const affiliateOverview = ref<AffiliateOverviewResp | null>(null)
 const adminWithdrawalsList = ref<AffiliateWithdrawalItem[]>([])
 const ticketsList = ref<SupportTicketItem[]>([])
+const dnsFailoverList = ref<IngressFailoverGroupItem[]>([])
 
 const isAdmin = computed(() => user.value?.role === 'admin')
 
@@ -228,12 +237,20 @@ const filteredRules = computed(() => {
     if (ruleFilterProtocol.value !== 'all' && r.protocol !== ruleFilterProtocol.value) return false
     if (ruleFilterStatus.value === 'running' && !r.enabled) return false
     if (ruleFilterStatus.value === 'paused' && r.enabled) return false
+    if (
+      ruleFilterStatus.value === 'quota_exceeded' &&
+      !['quota_exceeded', 'rule_quota_exceeded', 'daily_quota_exceeded'].includes(r.status)
+    ) {
+      return false
+    }
     if (q) {
       const matchName = (r.name || '').toLowerCase().includes(q)
       const matchPort = String(r.listen_port).includes(q)
       const matchTarget = (r.targets_json || '').toLowerCase().includes(q)
+      const matchDomain = (r.match_domains || '').toLowerCase().includes(q)
+      const matchOutIP = (r.outbound_ip || '').toLowerCase().includes(q)
       const matchUser = isAdmin.value && userEmailById(r.user_id).toLowerCase().includes(q)
-      if (!matchName && !matchPort && !matchTarget && !matchUser) return false
+      if (!matchName && !matchPort && !matchTarget && !matchDomain && !matchOutIP && !matchUser) return false
     }
     return true
   })
@@ -305,7 +322,103 @@ function copyConnectAddr(text: string) {
   }
 }
 
+function loadBalanceLabel(lb?: string): string {
+  switch (lb) {
+    case 'weighted':
+      return '加权调度'
+    case 'least_rtt':
+      return '最低延迟'
+    case 'failover':
+      return '主备容灾'
+    case 'random':
+      return '随机调度'
+    default:
+      return '轮询'
+  }
+}
+
+function parseTargetLine(rawLine: string): TargetEndpoint | null {
+  const trimmed = rawLine.trim()
+  if (!trimmed) return null
+  if (trimmed.includes('|')) {
+    const parts = trimmed.split('|').map((s) => s.trim())
+    const address = parts[0] || ''
+    if (!address) return null
+    const ep: TargetEndpoint = { address }
+    for (let i = 1; i < parts.length; i++) {
+      const tok = (parts[i] || '').toLowerCase()
+      if (tok === 'backup') ep.backup = true
+      else if (/^\d+$/.test(tok)) ep.weight = Number(tok)
+    }
+    return ep
+  }
+  const [addrPart, ...metaParts] = trimmed.split('#').map((s) => s.trim())
+  if (!addrPart) return null
+  const ep: TargetEndpoint = { address: addrPart }
+  for (const meta of metaParts) {
+    for (const token of meta.split(',').map((s) => s.trim().toLowerCase())) {
+      if (!token) continue
+      if (token === 'backup') {
+        ep.backup = true
+      } else if (token.startsWith('weight=')) {
+        const w = Number(token.slice(7))
+        if (w > 0) ep.weight = w
+      } else if (/^\d+$/.test(token)) {
+        ep.weight = Number(token)
+      }
+    }
+  }
+  return ep
+}
+
+function formatTargetLine(t: TargetEndpoint): string {
+  const tags: string[] = []
+  if (t.weight && t.weight > 0 && t.weight !== 100) tags.push(`weight=${t.weight}`)
+  if (t.backup) tags.push('backup')
+  return tags.length > 0 ? `${t.address}#${tags.join(',')}` : t.address
+}
+
+function ruleStatusLabel(rule: ForwardRule): string {
+  if (rule.enabled) return '正常'
+  switch (rule.status) {
+    case 'daily_quota_exceeded':
+      return '今日限额耗尽'
+    case 'rule_quota_exceeded':
+      return '规则限额耗尽'
+    case 'quota_exceeded':
+      return '套餐流量耗尽'
+    case 'node_quota_exceeded':
+      return '节点流量耗尽'
+    case 'error':
+      return '端口/配置异常'
+    default:
+      return '已暂停'
+  }
+}
+
+function ruleStatusBadge(rule: ForwardRule): string {
+  if (rule.enabled) return 'badge-success'
+  if (
+    ['daily_quota_exceeded', 'rule_quota_exceeded', 'quota_exceeded', 'node_quota_exceeded'].includes(
+      rule.status,
+    )
+  ) {
+    return 'badge-warning'
+  }
+  if (rule.status === 'error') return 'badge-danger'
+  return 'badge-neutral'
+}
+
+function effectiveRuleProxyProto(rule: ForwardRule): number {
+  const rpp = Number(rule.proxy_protocol || 0)
+  if (rpp < 0) return 0
+  if (rpp === 1 || rpp === 2) return rpp
+  const line = getTunnelById(rule.tunnel_line_id)
+  return Number(line?.proxy_protocol || 0)
+}
+
 // --- 转发新增与编辑 ---
+const GB = 1024 * 1024 * 1024
 const showRuleModal = ref(false)
 const editingRuleId = ref<number | null>(null)
 const ruleForm = ref({
@@ -313,19 +426,36 @@ const ruleForm = ref({
   tunnel_line_id: 1,
   protocol: 'tcp' as 'tcp' | 'udp' | 'both',
   listen_port: 0,
-  load_balance: 'round_robin' as 'round_robin' | 'failover',
+  load_balance: 'round_robin' as LoadBalanceStrategy,
   targetsText: '1.1.1.1:443',
   speed_mbps: 0,
   access_mode: 'off' as 'off' | 'allow' | 'deny',
   access_cidrs: '',
+  match_domains: '',
+  proxy_protocol: 0,
+  outbound_ip: '',
+  rule_quota_gb: 0,
+  daily_quota_gb: 0,
 })
 
 // 当前选中隧道（或其入口节点）的可用端口范围，用于监听端口输入提示
+const selectedRuleFormLine = computed(() =>
+  lines.value.find((l) => l.id === ruleForm.value.tunnel_line_id),
+)
+
 const ruleFormPortHint = computed(() => {
-  const line = lines.value.find((l) => l.id === ruleForm.value.tunnel_line_id)
+  const line = selectedRuleFormLine.value
   if (!line) return '留空自动分配'
   const range = line.port_range || nodes.value.find((n) => n.id === line.ingress_node_id)?.port_range || ''
   return range ? `留空自动分配（${range}）` : '留空自动分配'
+})
+
+const ruleFormAllowedOutboundIPs = computed(() => {
+  const raw = selectedRuleFormLine.value?.allowed_outbound_ips || ''
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
 })
 
 function openCreateRuleModal() {
@@ -344,6 +474,11 @@ function openCreateRuleModal() {
     speed_mbps: 0,
     access_mode: 'off',
     access_cidrs: '',
+    match_domains: '',
+    proxy_protocol: 0,
+    outbound_ip: '',
+    rule_quota_gb: 0,
+    daily_quota_gb: 0,
   }
   showRuleModal.value = true
 }
@@ -360,11 +495,16 @@ function openEditRuleModal(rule: ForwardRule) {
     tunnel_line_id: rule.tunnel_line_id,
     protocol: rule.protocol,
     listen_port: rule.listen_port,
-    load_balance: rule.load_balance,
-    targetsText: targets.map((t) => t.address).join('\n'),
+    load_balance: rule.load_balance || 'round_robin',
+    targetsText: targets.map((t) => formatTargetLine(t)).join('\n'),
     speed_mbps: rule.speed_mbps,
     access_mode: (rule.access_mode as 'off' | 'allow' | 'deny') || 'off',
     access_cidrs: rule.access_cidrs || '',
+    match_domains: rule.match_domains || '',
+    proxy_protocol: Number(rule.proxy_protocol || 0),
+    outbound_ip: rule.outbound_ip || '',
+    rule_quota_gb: rule.rule_quota_bytes ? Number((rule.rule_quota_bytes / GB).toFixed(2)) : 0,
+    daily_quota_gb: rule.daily_quota_bytes ? Number((rule.daily_quota_bytes / GB).toFixed(2)) : 0,
   }
   showRuleModal.value = true
 }
@@ -386,18 +526,34 @@ function quickCreateRuleForTunnel(line: TunnelLine) {
     speed_mbps: 0,
     access_mode: 'off',
     access_cidrs: '',
+    match_domains: '',
+    proxy_protocol: 0,
+    outbound_ip: '',
+    rule_quota_gb: 0,
+    daily_quota_gb: 0,
   }
   showRuleModal.value = true
 }
 
-// --- 隧道新增与编辑 ---
+// --- 隧道新增与编辑 (支持多跳链式转发 + 多出口带宽聚合池 + Mux / Bonding + PROXY Protocol + 专属闲时倍率) ---
 const showLineModal = ref(false)
 const editingLineId = ref<number | null>(null)
+const hopPickerNodeId = ref<number>(0)
+const egressPoolPickerNodeId = ref<number>(0)
+const egressPoolPickerWeight = ref<number>(100)
+const egressPoolPickerBackup = ref<boolean>(false)
 const lineForm = ref({
   name: '',
   type: 'direct' as 'direct' | 'encrypt',
   ingress_node_id: 1,
+  hop_node_ids: '',
   egress_node_id: 2,
+  egress_node_ids: '',
+  load_balance: 'round_robin' as LoadBalanceStrategy,
+  accel_mode: 'none' as 'none' | 'mux' | 'bonding',
+  bond_links: 4,
+  proxy_protocol: 0,
+  offpeak_multiplier: 0,
   transport: 'tls' as 'raw' | 'tls' | 'ws' | 'wss' | 'quic' | 'custom',
   engine: 'realm' as EngineType,
   billing_mode: 'one_way' as 'one_way' | 'two_way',
@@ -406,14 +562,87 @@ const lineForm = ref({
   port_range: '',
 })
 
+const lineHopIds = computed(() => parseAllowedIds(lineForm.value.hop_node_ids))
+
+function addHopToLineForm() {
+  const nid = Number(hopPickerNodeId.value)
+  if (!nid) return
+  if (nid === lineForm.value.ingress_node_id) {
+    showToast('中间跳点不能与入口节点相同')
+    return
+  }
+  if (lineHopIds.value.includes(nid)) {
+    showToast('该节点已在链式跳点列表中')
+    return
+  }
+  if (lineHopIds.value.length >= 8) {
+    showToast('单条隧道最多支持 8 个中间跳点')
+    return
+  }
+  lineForm.value.hop_node_ids = [...lineHopIds.value, nid].join(',')
+}
+
+function removeHopFromLineForm(idx: number) {
+  const next = lineHopIds.value.filter((_, i) => i !== idx)
+  lineForm.value.hop_node_ids = next.join(',')
+}
+
+function moveHopInLineForm(idx: number, delta: number) {
+  const arr = [...lineHopIds.value]
+  const target = idx + delta
+  if (target < 0 || target >= arr.length) return
+  const tmp = arr[idx]
+  arr[idx] = arr[target]
+  arr[target] = tmp
+  lineForm.value.hop_node_ids = arr.join(',')
+}
+
+function addMemberToEgressPool() {
+  const nid = Number(egressPoolPickerNodeId.value)
+  if (!nid) return
+  const w = Math.max(1, Math.min(10000, Math.round(Number(egressPoolPickerWeight.value) || 100)))
+  const token = egressPoolPickerBackup.value ? `${nid}:${w}:backup` : `${nid}:${w}`
+  const existing = (lineForm.value.egress_node_ids || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  if (existing.some((item) => Number(item.split(':')[0]) === nid)) {
+    showToast('该出口节点已在多出口聚合池中')
+    return
+  }
+  existing.push(token)
+  lineForm.value.egress_node_ids = existing.join(',')
+}
+
+function parseLineEgressCount(line: TunnelLine): number {
+  if (!line.egress_node_ids) return line.egress_node_id ? 1 : 0
+  return line.egress_node_ids
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean).length
+}
+
 function openCreateLineModal() {
   if (!isAdmin.value) return
   editingLineId.value = null
+  const firstId = nodes.value[0]?.id || 1
+  const lastId = nodes.value[nodes.value.length - 1]?.id || firstId
+  hopPickerNodeId.value = nodes.value[1]?.id || firstId
+  egressPoolPickerNodeId.value = lastId
+  egressPoolPickerWeight.value = 100
+  egressPoolPickerBackup.value = false
   lineForm.value = {
     name: '',
     type: 'direct',
-    ingress_node_id: nodes.value[0]?.id || 1,
-    egress_node_id: nodes.value[nodes.value.length - 1]?.id || 1,
+    ingress_node_id: firstId,
+    hop_node_ids: '',
+    egress_node_id: lastId,
+    egress_node_ids: '',
+    load_balance: 'round_robin',
+    accel_mode: 'none',
+    bond_links: 4,
+    proxy_protocol: 0,
+    offpeak_multiplier: 0,
     transport: 'tls',
     engine: 'realm',
     billing_mode: 'one_way',
@@ -427,11 +656,22 @@ function openCreateLineModal() {
 function openEditLineModal(line: TunnelLine) {
   if (!isAdmin.value) return
   editingLineId.value = line.id
+  hopPickerNodeId.value = nodes.value[0]?.id || 1
+  egressPoolPickerNodeId.value = line.egress_node_id || nodes.value[0]?.id || 1
+  egressPoolPickerWeight.value = 100
+  egressPoolPickerBackup.value = false
   lineForm.value = {
     name: line.name,
     type: line.type,
     ingress_node_id: line.ingress_node_id,
+    hop_node_ids: line.hop_node_ids || '',
     egress_node_id: line.egress_node_id || nodes.value[0]?.id || 1,
+    egress_node_ids: line.egress_node_ids || '',
+    load_balance: line.load_balance || 'round_robin',
+    accel_mode: line.enable_bonding ? 'bonding' : line.enable_mux ? 'mux' : 'none',
+    bond_links: line.bond_links || 4,
+    proxy_protocol: Number(line.proxy_protocol || 0),
+    offpeak_multiplier: Number(line.offpeak_multiplier || 0),
     transport: line.transport || 'tls',
     engine: line.engine,
     billing_mode: line.billing_mode || 'one_way',
@@ -442,14 +682,16 @@ function openEditLineModal(line: TunnelLine) {
   showLineModal.value = true
 }
 
-// --- 节点新增与编辑 ---
-const GB = 1024 * 1024 * 1024
+// --- 节点新增与编辑 (支持默认出站源 IP、授权出站 IP 白名单与维护模式) ---
 const showNodeModal = ref(false)
 const editingNodeId = ref<number | null>(null)
 const nodeForm = ref({
   name: '',
   connect_ip: '',
   server_ip: '',
+  outbound_ip: '',
+  allowed_outbound_ips: '',
+  maintenance: false,
   port_range: '10000-50000',
   traffic_rate: 1.0,
   quota_gb: 2000,
@@ -464,6 +706,9 @@ function openCreateNodeModal() {
     name: '',
     connect_ip: '',
     server_ip: '',
+    outbound_ip: '',
+    allowed_outbound_ips: '',
+    maintenance: false,
     port_range: '10000-50000',
     traffic_rate: 1.0,
     quota_gb: 2000,
@@ -480,6 +725,9 @@ function openEditNodeModal(node: NodeItem) {
     name: node.name,
     connect_ip: node.connect_ip || node.public_host,
     server_ip: node.server_ip,
+    outbound_ip: node.outbound_ip || '',
+    allowed_outbound_ips: node.allowed_outbound_ips || '',
+    maintenance: node.status === 'maintenance',
     port_range: node.port_range,
     traffic_rate: node.traffic_rate,
     quota_gb: Math.round((node.quota_bytes || 0) / GB),
@@ -489,7 +737,177 @@ function openEditNodeModal(node: NodeItem) {
   showNodeModal.value = true
 }
 
-const probeResults = ref<Record<number, { tunnel_ms?: number; latencies: Record<string, number> }>>({})
+// --- 多入口高可用与 DNS 自动容灾切换 (IngressFailoverGroup) ---
+const showFailoverModal = ref(false)
+const editingFailoverId = ref<number | null>(null)
+const failoverBackupPickerId = ref<number>(0)
+const reconcilingFailoverId = ref<number | null>(null)
+const failoverForm = ref({
+  name: '',
+  domain: '',
+  record_type: 'A' as 'A' | 'AAAA',
+  ttl: 60,
+  proxied: false,
+  primary_node_id: 1,
+  backup_node_ids: '',
+  provider: 'cloudflare' as 'cloudflare' | 'dnspod' | 'webhook',
+  zone_id: '',
+  record_id: '',
+  sub_domain: '',
+  api_token: '',
+  webhook_url: '',
+  offline_threshold_sec: 30,
+  cooldown_sec: 120,
+  auto_failback: true,
+  enabled: true,
+  has_api_token: false,
+})
+
+const failoverBackupIds = computed(() => parseAllowedIds(failoverForm.value.backup_node_ids))
+
+function addFailoverBackupNode() {
+  const nid = Number(failoverBackupPickerId.value)
+  if (!nid) return
+  if (nid === failoverForm.value.primary_node_id) {
+    showToast('备用入口节点不能与主入口节点相同')
+    return
+  }
+  if (failoverBackupIds.value.includes(nid)) {
+    showToast('该节点已在备用入口队列中')
+    return
+  }
+  failoverForm.value.backup_node_ids = [...failoverBackupIds.value, nid].join(',')
+}
+
+function removeFailoverBackupNode(idx: number) {
+  failoverForm.value.backup_node_ids = failoverBackupIds.value.filter((_, i) => i !== idx).join(',')
+}
+
+function openCreateFailoverModal() {
+  if (!isAdmin.value) return
+  editingFailoverId.value = null
+  const primaryId = nodes.value[0]?.id || 1
+  const secondId = nodes.value.find((n) => n.id !== primaryId)?.id || 0
+  failoverBackupPickerId.value = secondId || primaryId
+  failoverForm.value = {
+    name: '',
+    domain: '',
+    record_type: 'A',
+    ttl: 60,
+    proxied: false,
+    primary_node_id: primaryId,
+    backup_node_ids: secondId ? String(secondId) : '',
+    provider: 'cloudflare',
+    zone_id: '',
+    record_id: '',
+    sub_domain: '',
+    api_token: '',
+    webhook_url: '',
+    offline_threshold_sec: 30,
+    cooldown_sec: 120,
+    auto_failback: true,
+    enabled: true,
+    has_api_token: false,
+  }
+  showFailoverModal.value = true
+}
+
+function openEditFailoverModal(g: IngressFailoverGroupItem) {
+  if (!isAdmin.value) return
+  editingFailoverId.value = g.id
+  failoverBackupPickerId.value = nodes.value.find((n) => n.id !== g.primary_node_id)?.id || g.primary_node_id
+  failoverForm.value = {
+    name: g.name,
+    domain: g.domain,
+    record_type: g.record_type || 'A',
+    ttl: g.ttl || 60,
+    proxied: Boolean(g.proxied),
+    primary_node_id: g.primary_node_id,
+    backup_node_ids: g.backup_node_ids || '',
+    provider: g.provider || 'cloudflare',
+    zone_id: g.zone_id || '',
+    record_id: g.record_id || '',
+    sub_domain: g.sub_domain || '',
+    api_token: '',
+    webhook_url: g.webhook_url || '',
+    offline_threshold_sec: g.offline_threshold_sec ?? 30,
+    cooldown_sec: g.cooldown_sec ?? 120,
+    auto_failback: Boolean(g.auto_failback),
+    enabled: Boolean(g.enabled),
+    has_api_token: Boolean(g.has_api_token),
+  }
+  showFailoverModal.value = true
+}
+
+async function submitFailoverForm() {
+  if (!isAdmin.value) return
+  const f = failoverForm.value
+  const payload: Record<string, unknown> = {
+    name: f.name.trim(),
+    domain: f.domain.trim(),
+    record_type: f.record_type,
+    ttl: Math.max(1, Math.round(Number(f.ttl) || 60)),
+    proxied: Boolean(f.proxied),
+    primary_node_id: Number(f.primary_node_id) || 0,
+    backup_node_ids: f.backup_node_ids.trim(),
+    provider: f.provider,
+    zone_id: f.zone_id.trim(),
+    record_id: f.record_id.trim(),
+    sub_domain: f.sub_domain.trim(),
+    webhook_url: f.webhook_url.trim(),
+    offline_threshold_sec: Math.max(0, Math.round(Number(f.offline_threshold_sec) || 0)),
+    cooldown_sec: Math.max(0, Math.round(Number(f.cooldown_sec) || 0)),
+    auto_failback: Boolean(f.auto_failback),
+    enabled: Boolean(f.enabled),
+  }
+  if (f.api_token.trim() || !editingFailoverId.value) {
+    payload.api_token = f.api_token.trim()
+  }
+  try {
+    if (editingFailoverId.value) {
+      await api.adminUpdateDNSFailover(editingFailoverId.value, payload)
+      showToast('DNS 容灾组配置已更新')
+    } else {
+      await api.adminCreateDNSFailover(payload)
+      showToast('DNS 容灾组已创建')
+    }
+    showFailoverModal.value = false
+    dnsFailoverList.value = await api.adminListDNSFailover().catch(() => dnsFailoverList.value)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+async function reconcileFailoverGroup(g: IngressFailoverGroupItem) {
+  if (!isAdmin.value) return
+  reconcilingFailoverId.value = g.id
+  try {
+    const res = await api.adminReconcileDNSFailover(g.id)
+    const idx = dnsFailoverList.value.findIndex((x) => x.id === g.id)
+    if (idx >= 0 && res.group) {
+      dnsFailoverList.value[idx] = res.group
+    }
+    showToast(res.message || '已完成巡检与同步')
+  } catch (e: any) {
+    showToast(e.message)
+  } finally {
+    reconcilingFailoverId.value = null
+  }
+}
+
+async function deleteFailoverGroup(g: IngressFailoverGroupItem) {
+  if (!isAdmin.value) return
+  if (!window.confirm(`确定删除多入口 DNS 容灾组「${g.name}」(${g.domain}) 吗？`)) return
+  try {
+    await api.adminDeleteDNSFailover(g.id)
+    dnsFailoverList.value = dnsFailoverList.value.filter((x) => x.id !== g.id)
+    showToast(`已删除容灾组「${g.name}」`)
+  } catch (e: any) {
+    showToast(e.message)
+  }
+}
+
+const probeResults = ref<Record<number, { tunnel_ms?: number; latencies: Record<string, number>; legs?: ProbeLeg[] }>>({})
 const probingRuleId = ref<number | null>(null)
 const showInstallModal = ref(false)
 const installMode = ref<'systemd' | 'docker'>('systemd')
@@ -587,9 +1005,10 @@ function openBatchModal() {
 function parseBatchRuleItems(rawText: string): Array<{
   name: string
   listen_port: number
+  port_range?: string
   targets: TargetEndpoint[]
   protocol?: 'tcp' | 'udp' | 'both'
-  load_balance?: 'round_robin' | 'failover'
+  load_balance?: LoadBalanceStrategy
 }> {
   const trimmed = rawText.trim()
   if (!trimmed) return []
@@ -619,8 +1038,10 @@ function parseBatchRuleItems(rawText: string): Array<{
             const proto = ['tcp', 'udp', 'both'].includes(String(item.protocol || '').toLowerCase())
               ? (String(item.protocol).toLowerCase() as 'tcp' | 'udp' | 'both')
               : undefined
-            const lb = ['round_robin', 'failover'].includes(String(item.load_balance || ''))
-              ? (String(item.load_balance) as 'round_robin' | 'failover')
+            const lb = ['round_robin', 'weighted', 'least_rtt', 'failover', 'random'].includes(
+              String(item.load_balance || ''),
+            )
+              ? (String(item.load_balance) as LoadBalanceStrategy)
               : undefined
             const port_range = item.port_range ? String(item.port_range).trim() : undefined
             return { name, listen_port, port_range, targets, protocol: proto, load_balance: lb }
@@ -631,7 +1052,7 @@ function parseBatchRuleItems(rawText: string): Array<{
           port_range?: string
           targets: TargetEndpoint[]
           protocol?: 'tcp' | 'udp' | 'both'
-          load_balance?: 'round_robin' | 'failover'
+          load_balance?: LoadBalanceStrategy
         }>
       }
     } catch {
@@ -1228,6 +1649,11 @@ const settingsForm = ref({
   affiliate_enabled: true,
   affiliate_commission_rate: 10,
   affiliate_min_withdraw_yuan: 10,
+  offpeak_enabled: false,
+  offpeak_start: '00:00',
+  offpeak_end: '08:00',
+  offpeak_multiplier: 0.5,
+  offpeak_timezone: 'Asia/Shanghai',
 })
 
 function syncSettingsForm() {
@@ -1256,6 +1682,11 @@ function syncSettingsForm() {
     affiliate_enabled: siteConfig.value.affiliate_enabled ?? true,
     affiliate_commission_rate: siteConfig.value.affiliate_commission_rate ?? 10,
     affiliate_min_withdraw_yuan: Number(((siteConfig.value.affiliate_min_withdraw_cents ?? 1000) / 100).toFixed(2)),
+    offpeak_enabled: !!siteConfig.value.offpeak_enabled,
+    offpeak_start: siteConfig.value.offpeak_start || '00:00',
+    offpeak_end: siteConfig.value.offpeak_end || '08:00',
+    offpeak_multiplier: siteConfig.value.offpeak_multiplier ?? 0.5,
+    offpeak_timezone: siteConfig.value.offpeak_timezone || 'Asia/Shanghai',
   }
 }
 
@@ -1289,10 +1720,15 @@ async function saveSystemSettings() {
       affiliate_enabled: settingsForm.value.affiliate_enabled,
       affiliate_commission_rate: Math.max(0, Math.min(50, Number(settingsForm.value.affiliate_commission_rate) || 0)),
       affiliate_min_withdraw_cents: Math.round(Math.max(1, Number(settingsForm.value.affiliate_min_withdraw_yuan) || 10) * 100),
+      offpeak_enabled: settingsForm.value.offpeak_enabled,
+      offpeak_start: settingsForm.value.offpeak_start.trim() || '00:00',
+      offpeak_end: settingsForm.value.offpeak_end.trim() || '08:00',
+      offpeak_multiplier: Math.max(0, Number(settingsForm.value.offpeak_multiplier) || 0),
+      offpeak_timezone: settingsForm.value.offpeak_timezone.trim() || 'Asia/Shanghai',
     })
     siteConfig.value = updated
     document.title = siteConfig.value.site_name
-    showToast('面板基础、支付、分销与告警配置已保存')
+    showToast('面板基础、闲时倍率、支付、分销与告警配置已保存')
   } catch (e: any) {
     showToast(e.message)
   }
@@ -1576,7 +2012,7 @@ async function refreshAll() {
       affiliateOverview.value = affOv
     }
     if (dash.user.role === 'admin') {
-      const [ruleList, uList, adminCfg, rcList, ordList, aLogs, cpList, wdList, tkList] = await Promise.all([
+      const [ruleList, uList, adminCfg, rcList, ordList, aLogs, cpList, wdList, tkList, foList] = await Promise.all([
         api.getRules({ all: true }),
         api.adminListUsers().catch(() => []),
         api.adminGetSettings().catch(() => null),
@@ -1586,6 +2022,7 @@ async function refreshAll() {
         api.adminListCoupons().catch(() => []),
         api.adminListWithdrawals().catch(() => []),
         api.adminListTickets().catch(() => []),
+        api.adminListDNSFailover().catch(() => []),
       ])
       rules.value = ruleList
       usersList.value = uList
@@ -1595,6 +2032,7 @@ async function refreshAll() {
       couponsList.value = cpList
       adminWithdrawalsList.value = wdList
       ticketsList.value = tkList
+      dnsFailoverList.value = foList
       if (adminCfg) {
         siteConfig.value = adminCfg
         syncSettingsForm()
@@ -1620,9 +2058,8 @@ async function refreshAll() {
 async function submitRule() {
   const targets: TargetEndpoint[] = ruleForm.value.targetsText
     .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((addr) => ({ address: addr }))
+    .map((s) => parseTargetLine(s))
+    .filter(Boolean) as TargetEndpoint[]
 
   const tun = getTunnelById(ruleForm.value.tunnel_line_id) || authorizedLines.value[0]
   if (!ruleForm.value.name || targets.length === 0 || !tun) {
@@ -1633,6 +2070,12 @@ async function submitRule() {
     showToast('禁止越权使用未授权的隧道')
     return
   }
+
+  const matchDomains = ruleForm.value.protocol === 'tcp' ? ruleForm.value.match_domains.trim() : ''
+  const proxyProto = ruleForm.value.protocol === 'udp' ? 0 : Number(ruleForm.value.proxy_protocol || 0)
+  const outboundIP = ruleForm.value.outbound_ip.trim()
+  const ruleQuotaBytes = Math.round(Math.max(0, Number(ruleForm.value.rule_quota_gb) || 0) * GB)
+  const dailyQuotaBytes = Math.round(Math.max(0, Number(ruleForm.value.daily_quota_gb) || 0) * GB)
 
   try {
     if (editingRuleId.value) {
@@ -1646,6 +2089,11 @@ async function submitRule() {
         speed_mbps: Number(ruleForm.value.speed_mbps) || 0,
         access_mode: ruleForm.value.access_mode,
         access_cidrs: ruleForm.value.access_cidrs.trim(),
+        match_domains: matchDomains,
+        proxy_protocol: proxyProto,
+        outbound_ip: outboundIP,
+        rule_quota_bytes: ruleQuotaBytes,
+        daily_quota_bytes: dailyQuotaBytes,
       })
       showToast('修改已保存')
     } else {
@@ -1662,6 +2110,11 @@ async function submitRule() {
         speed_mbps: Number(ruleForm.value.speed_mbps) || 0,
         access_mode: ruleForm.value.access_mode,
         access_cidrs: ruleForm.value.access_cidrs.trim(),
+        match_domains: matchDomains,
+        proxy_protocol: proxyProto,
+        outbound_ip: outboundIP,
+        rule_quota_bytes: ruleQuotaBytes,
+        daily_quota_bytes: dailyQuotaBytes,
       })
       showToast('创建成功')
     }
@@ -1706,12 +2159,33 @@ async function handleDeleteRule(id: number) {
 
 async function submitLine() {
   if (!isAdmin.value) return
+  const f = lineForm.value
+  const payload: Partial<TunnelLine> = {
+    name: f.name.trim(),
+    type: f.type,
+    ingress_node_id: Number(f.ingress_node_id) || 0,
+    hop_node_ids: f.type === 'encrypt' ? f.hop_node_ids.trim() : '',
+    egress_node_id: f.type === 'encrypt' ? Number(f.egress_node_id) || 0 : 0,
+    egress_node_ids: f.type === 'encrypt' ? f.egress_node_ids.trim() : '',
+    load_balance: f.load_balance || 'round_robin',
+    enable_mux: f.type === 'encrypt' && f.accel_mode === 'mux',
+    enable_bonding: f.type === 'encrypt' && f.accel_mode === 'bonding',
+    bond_links: Math.max(2, Math.min(8, Math.round(Number(f.bond_links) || 4))),
+    proxy_protocol: Number(f.proxy_protocol || 0),
+    offpeak_multiplier: Math.max(0, Number(f.offpeak_multiplier) || 0),
+    transport: f.type === 'encrypt' ? f.transport : 'raw',
+    engine: f.engine,
+    billing_mode: f.billing_mode,
+    rate_multiplier: Number(f.rate_multiplier) ?? 1,
+    max_port_count: Number(f.max_port_count) ?? 50,
+    port_range: f.port_range.trim(),
+  }
   try {
     if (editingLineId.value) {
-      await api.adminUpdateLine(editingLineId.value, lineForm.value)
+      await api.adminUpdateLine(editingLineId.value, payload)
       showToast('隧道已更新')
     } else {
-      await api.adminCreateLine(lineForm.value)
+      await api.adminCreateLine(payload)
       showToast('隧道已创建')
     }
     showLineModal.value = false
@@ -1737,11 +2211,21 @@ async function submitNode() {
     name: nodeForm.value.name,
     connect_ip: nodeForm.value.connect_ip,
     server_ip: nodeForm.value.server_ip,
+    outbound_ip: nodeForm.value.outbound_ip.trim(),
+    allowed_outbound_ips: nodeForm.value.allowed_outbound_ips.trim(),
     port_range: nodeForm.value.port_range,
     traffic_rate: nodeForm.value.traffic_rate,
     quota_bytes: Math.max(0, Number(nodeForm.value.quota_gb) || 0) * GB,
     used_bytes: Math.max(0, Number(nodeForm.value.used_gb) || 0) * GB,
     reset_day: Math.min(28, Math.max(0, Number(nodeForm.value.reset_day) || 0)),
+  }
+  if (editingNodeId.value) {
+    const curNode = nodeMap.value.get(editingNodeId.value)
+    if (nodeForm.value.maintenance) {
+      payload.status = 'maintenance'
+    } else if (curNode?.status === 'maintenance') {
+      payload.status = 'online'
+    }
   }
   try {
     if (editingNodeId.value) {
@@ -3039,6 +3523,18 @@ const commandItems = computed<CommandItem[]>(() => {
         },
       },
       {
+        id: 'act-add-failover',
+        category: '容灾',
+        badgeClass: 'badge-info',
+        title: '+ 新增多入口 DNS 自动容灾组',
+        subtitle: '监控主备入口节点在线状态并自动切换 Cloudflare / DNSPod / Webhook 解析',
+        keywords: 'dns failover ha cloudflare dnspod 容灾 主备 多入口 切换 解析',
+        run: () => {
+          switchTab('nodes')
+          openCreateFailoverModal()
+        },
+      },
+      {
         id: 'act-backup-db',
         category: '运维',
         badgeClass: 'badge-info',
@@ -3055,10 +3551,10 @@ const commandItems = computed<CommandItem[]>(() => {
     items.push({
       id: `rule-${r.id}`,
       category: '规则',
-      badgeClass: r.enabled ? 'badge-success' : 'badge-neutral',
+      badgeClass: ruleStatusBadge(r),
       title: `${r.name} (${addr})`,
-      subtitle: `${r.protocol.toUpperCase()} · ${getTunnelById(r.tunnel_line_id)?.name || '直连'}`,
-      keywords: `${r.name} ${r.listen_port} ${r.targets_json} ${addr}`,
+      subtitle: `${r.protocol.toUpperCase()} · ${getTunnelById(r.tunnel_line_id)?.name || '直连'}${r.match_domains ? ' · SNI:' + r.match_domains : ''}`,
+      keywords: `${r.name} ${r.listen_port} ${r.targets_json} ${r.match_domains || ''} ${r.outbound_ip || ''} ${addr}`,
       run: () => {
         switchTab('rules')
         ruleSearchQuery.value = String(r.listen_port || r.name)
@@ -3082,13 +3578,27 @@ const commandItems = computed<CommandItem[]>(() => {
   }
 
   if (isAdmin.value) {
+    for (const fg of dnsFailoverList.value.slice(0, 20)) {
+      items.push({
+        id: `failover-${fg.id}`,
+        category: '容灾',
+        badgeClass: fg.enabled ? 'badge-success' : 'badge-neutral',
+        title: `${fg.name} (${fg.domain})`,
+        subtitle: `${fg.provider.toUpperCase()} · 当前生效: ${fg.active_node_id ? nodeNameById(fg.active_node_id) : '待同步'}`,
+        keywords: `dns failover ${fg.name} ${fg.domain} ${fg.provider} 容灾`,
+        run: () => {
+          switchTab('nodes')
+          openEditFailoverModal(fg)
+        },
+      })
+    }
     for (const n of nodes.value.slice(0, 30)) {
       items.push({
         id: `node-${n.id}`,
         category: '节点',
-        badgeClass: n.status === 'online' ? 'badge-success' : 'badge-danger',
+        badgeClass: n.status === 'online' ? 'badge-success' : n.status === 'maintenance' ? 'badge-warning' : 'badge-danger',
         title: n.name,
-        subtitle: `${n.connect_ip || n.server_ip} · ${n.status === 'online' ? '在线' : '离线'}`,
+        subtitle: `${n.connect_ip || n.server_ip} · ${n.status === 'online' ? '在线' : n.status === 'maintenance' ? '维护中' : '离线'}`,
         keywords: `${n.name} ${n.connect_ip} ${n.server_ip}`,
         run: () => {
           switchTab('nodes')
@@ -3154,6 +3664,7 @@ function executeCmdkSelection() {
 function isAnyModalOpen(): boolean {
   return (
     showCommandPalette.value ||
+    showFailoverModal.value ||
     showTicketDetailModal.value ||
     showCreateTicketModal.value ||
     showWithdrawModal.value ||
@@ -3177,6 +3688,10 @@ function isAnyModalOpen(): boolean {
 function closeTopModal(): boolean {
   if (showCommandPalette.value) {
     showCommandPalette.value = false
+    return true
+  }
+  if (showFailoverModal.value) {
+    showFailoverModal.value = false
     return true
   }
   if (showTicketDetailModal.value) {
@@ -3315,6 +3830,10 @@ async function pollTelemetryRealtime() {
           target.upload_bytes = rd.upload_bytes
           target.down_bytes = rd.down_bytes
           target.billed_bytes = rd.billed_bytes
+          if (rd.daily_used_bytes !== undefined) target.daily_used_bytes = rd.daily_used_bytes
+          if (rd.daily_reset_date !== undefined) target.daily_reset_date = rd.daily_reset_date
+          if (rd.rule_quota_bytes !== undefined) target.rule_quota_bytes = rd.rule_quota_bytes
+          if (rd.daily_quota_bytes !== undefined) target.daily_quota_bytes = rd.daily_quota_bytes
           target.enabled = rd.enabled
           target.status = rd.status
         }
@@ -3690,6 +4209,21 @@ onUnmounted(() => {
               <span style="font-size: 13px; color: var(--text-main);">{{ siteConfig.announcement }}</span>
             </div>
 
+            <div
+              v-if="siteConfig.offpeak_enabled"
+              class="card"
+              style="padding: 10px 16px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; background: var(--bg-soft);"
+            >
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px;">
+                <span class="badge badge-success">闲时优惠已开启</span>
+                <span>
+                  每日 <strong class="mono">{{ siteConfig.offpeak_start || '00:00' }} ~ {{ siteConfig.offpeak_end || '08:00' }}</strong>
+                  ({{ siteConfig.offpeak_timezone || 'Asia/Shanghai' }}) 转发流量自动按
+                  <strong class="mono">×{{ siteConfig.offpeak_multiplier ?? 0.5 }}</strong> 折算计费
+                </span>
+              </div>
+            </div>
+
             <div class="grid-4">
               <div class="card">
                 <div class="metric-label">已用流量</div>
@@ -3864,8 +4398,12 @@ onUnmounted(() => {
               >
                 <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
                   <span style="font-weight: 600; font-size: 14px;">{{ node.name }}</span>
-                  <span class="badge" :class="node.status === 'online' ? 'badge-success' : 'badge-danger'">
-                    <span class="dot"></span> {{ node.status === 'online' ? '在线' : '离线' }}
+                  <span
+                    class="badge"
+                    :class="node.status === 'online' ? 'badge-success' : node.status === 'maintenance' ? 'badge-warning' : 'badge-danger'"
+                  >
+                    <span class="dot"></span>
+                    {{ node.status === 'online' ? '在线' : node.status === 'maintenance' ? '维护中' : '离线' }}
                   </span>
                 </div>
 
@@ -3933,7 +4471,7 @@ onUnmounted(() => {
                 <thead>
                   <tr>
                     <th>授权隧道</th>
-                    <th>类型</th>
+                    <th>类型与增强能力</th>
                     <th>转发方式</th>
                     <th>入口地址</th>
                     <th>计费</th>
@@ -3944,13 +4482,27 @@ onUnmounted(() => {
                   <tr v-for="line in authorizedLines" :key="line.id">
                     <td style="font-weight: 500;">{{ line.name }}</td>
                     <td>
-                      <span class="badge" :class="line.type === 'encrypt' ? 'badge-purple' : 'badge-primary'">
-                        {{ line.type === 'encrypt' ? '隧道转发' : '端口转发' }}
-                      </span>
+                      <div style="display: flex; align-items: center; gap: 4px; flex-wrap: wrap;">
+                        <span class="badge" :class="line.type === 'encrypt' ? 'badge-purple' : 'badge-primary'">
+                          {{ line.type === 'encrypt' ? '隧道转发' : '端口转发' }}
+                        </span>
+                        <span v-if="line.enable_mux" class="badge badge-info">Mux复用</span>
+                        <span v-if="line.enable_bonding" class="badge badge-success">聚合×{{ line.bond_links || 4 }}</span>
+                        <span v-if="line.proxy_protocol" class="badge badge-neutral">PROXY v{{ line.proxy_protocol }}</span>
+                      </div>
                     </td>
                     <td><span class="badge badge-neutral">{{ line.engine }}</span></td>
                     <td>{{ nodeConnectIPById(line.ingress_node_id) }}</td>
-                    <td>{{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x</td>
+                    <td>
+                      {{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x
+                      <span
+                        v-if="siteConfig.offpeak_enabled && (line.offpeak_multiplier || 0) > 0"
+                        class="badge badge-success"
+                        style="margin-left: 4px;"
+                      >
+                        闲时×{{ line.offpeak_multiplier }}
+                      </span>
+                    </td>
                     <td style="text-align: right;">
                       <button @click="quickCreateRuleForTunnel(line)" class="btn btn-soft btn-sm">创建转发</button>
                     </td>
@@ -3997,8 +4549,8 @@ onUnmounted(() => {
               <input
                 v-model="ruleSearchQuery"
                 class="input"
-                style="width: 240px;"
-                :placeholder="isAdmin ? '搜索规则名称 / 端口 / 目标 / 邮箱' : '搜索规则名称 / 端口 / 目标地址'"
+                style="width: 260px;"
+                :placeholder="isAdmin ? '搜索名称 / 端口 / SNI域名 / 目标 / 邮箱' : '搜索名称 / 端口 / SNI域名 / 目标地址'"
               />
               <select v-model="ruleFilterTunnelId" class="select" style="width: 150px;">
                 <option :value="0">全部隧道</option>
@@ -4010,10 +4562,11 @@ onUnmounted(() => {
                 <option value="udp">UDP</option>
                 <option value="both">TCP+UDP</option>
               </select>
-              <select v-model="ruleFilterStatus" class="select" style="width: 120px;">
+              <select v-model="ruleFilterStatus" class="select" style="width: 135px;">
                 <option value="all">全部状态</option>
                 <option value="running">正常运行</option>
                 <option value="paused">已暂停</option>
+                <option value="quota_exceeded">限额耗尽</option>
               </select>
               <span style="font-size: 12px; color: var(--text-muted); margin-left: auto;">
                 共 {{ filteredRules.length }} / {{ visibleRules.length }} 条规则
@@ -4034,13 +4587,13 @@ onUnmounted(() => {
                         style="cursor: pointer;"
                       />
                     </th>
-                    <th>名称</th>
+                    <th>名称 / 路由增强</th>
                     <th v-if="isAdmin">所属用户</th>
                     <th>隧道</th>
                     <th>转发方式</th>
                     <th>连接地址</th>
-                    <th>目标地址</th>
-                    <th>流量</th>
+                    <th>目标地址与分段诊断</th>
+                    <th>流量 / 限额</th>
                     <th>状态</th>
                     <th style="text-align: right;">操作</th>
                   </tr>
@@ -4057,7 +4610,41 @@ onUnmounted(() => {
                     </td>
                     <td>
                       <div style="font-weight: 500;">{{ rule.name }}</div>
-                      <div style="font-size: 12px; color: var(--text-muted);">{{ rule.protocol.toUpperCase() }}</div>
+                      <div style="display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 3px;">
+                        <span style="font-size: 11.5px; color: var(--text-muted);">{{ rule.protocol.toUpperCase() }}</span>
+                        <span
+                          v-if="parseTargets(rule.targets_json).length > 1"
+                          class="badge badge-neutral"
+                          style="font-size: 10.5px;"
+                        >
+                          {{ loadBalanceLabel(rule.load_balance) }}
+                        </span>
+                        <span
+                          v-if="effectiveRuleProxyProto(rule) > 0"
+                          class="badge badge-info"
+                          style="font-size: 10.5px;"
+                          title="向下游注入真实客户端源 IP"
+                        >
+                          PROXY v{{ effectiveRuleProxyProto(rule) }}
+                        </span>
+                        <span
+                          v-if="rule.outbound_ip"
+                          class="badge badge-neutral mono"
+                          style="font-size: 10.5px;"
+                          title="绑定指定出口网卡源 IP"
+                        >
+                          源:{{ rule.outbound_ip }}
+                        </span>
+                      </div>
+                      <div v-if="rule.match_domains" style="margin-top: 3px;">
+                        <span
+                          class="badge badge-primary mono"
+                          style="font-size: 10.5px;"
+                          title="TLS SNI / HTTP Host 共享端口路由域名"
+                        >
+                          SNI: {{ rule.match_domains }}
+                        </span>
+                      </div>
                     </td>
                     <td v-if="isAdmin" style="font-size: 12.5px; color: var(--text-secondary);">
                       {{ userEmailById(rule.user_id) }}
@@ -4073,10 +4660,10 @@ onUnmounted(() => {
                     <td>
                       <span
                         class="badge badge-neutral"
-                        :title="ruleEngineFallback(rule) ? '已设置限速，gost/realm 无法限速，实际以 native 引擎运行' : ''"
+                        :title="ruleEngineFallback(rule) ? '已开启限速或高级隧道特性，实际以 native 引擎运行' : ''"
                       >
                         {{ rule.effective_engine || getTunnelById(rule.tunnel_line_id)?.engine || rule.engine }}
-                        <template v-if="ruleEngineFallback(rule)">（限速回退）</template>
+                        <template v-if="ruleEngineFallback(rule)">（自动切换）</template>
                       </span>
                     </td>
                     <td>
@@ -4090,11 +4677,30 @@ onUnmounted(() => {
                     </td>
                     <td>
                       <div
+                        v-if="probeResults[rule.id]?.legs && probeResults[rule.id].legs!.length > 0"
+                        style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px;"
+                      >
+                        <span
+                          v-for="(leg, lIdx) in probeResults[rule.id].legs"
+                          :key="lIdx"
+                          class="badge"
+                          :class="leg.latency_ms > 0 ? 'badge-info' : 'badge-danger'"
+                          style="font-size: 10.5px;"
+                        >
+                          {{ leg.from_name }}→{{ leg.to_name }}:
+                          {{ leg.latency_ms > 0 ? leg.latency_ms + 'ms' : '超时' }}
+                        </span>
+                      </div>
+                      <div
                         v-for="(t, idx) in parseTargets(rule.targets_json)"
                         :key="idx"
-                        style="display: flex; align-items: center; gap: 6px;"
+                        style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;"
                       >
                         <span class="mono" style="font-size: 12.5px;">{{ t.address }}</span>
+                        <span v-if="t.weight && t.weight !== 100" class="badge badge-neutral" style="font-size: 10px;">
+                          w={{ t.weight }}
+                        </span>
+                        <span v-if="t.backup" class="badge badge-warning" style="font-size: 10px;">备</span>
                         <span
                           v-if="probeResults[rule.id]?.latencies?.[t.address] !== undefined"
                           class="badge"
@@ -4103,7 +4709,7 @@ onUnmounted(() => {
                           <template v-if="probeResults[rule.id].latencies[t.address] > 0">
                             {{
                               (probeResults[rule.id].tunnel_ms || 0) > 0
-                                ? `隧道 ${probeResults[rule.id].tunnel_ms}ms + 落地 ${probeResults[rule.id].latencies[t.address]}ms`
+                                ? `链路 ${probeResults[rule.id].tunnel_ms}ms + 落地 ${probeResults[rule.id].latencies[t.address]}ms`
                                 : `${probeResults[rule.id].latencies[t.address]}ms`
                             }}
                           </template>
@@ -4111,10 +4717,28 @@ onUnmounted(() => {
                         </span>
                       </div>
                     </td>
-                    <td>{{ formatBytes(rule.billed_bytes) }}</td>
                     <td>
-                      <span class="badge" :class="rule.enabled ? 'badge-success' : 'badge-neutral'">
-                        <span class="dot"></span> {{ rule.enabled ? '正常' : '暂停' }}
+                      <div class="mono">
+                        {{ formatBytes(rule.billed_bytes) }}
+                        <span v-if="(rule.rule_quota_bytes || 0) > 0" style="font-size: 11.5px; color: var(--text-muted);">
+                          / {{ formatBytes(rule.rule_quota_bytes || 0) }}
+                        </span>
+                      </div>
+                      <div
+                        v-if="(rule.daily_quota_bytes || 0) > 0"
+                        class="mono"
+                        style="font-size: 11px; color: var(--text-muted); margin-top: 2px;"
+                      >
+                        今日: {{ formatBytes(rule.daily_used_bytes || 0) }} / {{ formatBytes(rule.daily_quota_bytes || 0) }}
+                      </div>
+                    </td>
+                    <td>
+                      <span
+                        class="badge"
+                        :class="ruleStatusBadge(rule)"
+                        :title="rule.last_error || ''"
+                      >
+                        <span class="dot"></span> {{ ruleStatusLabel(rule) }}
                       </span>
                     </td>
                     <td style="text-align: right; white-space: nowrap;">
@@ -4174,40 +4798,81 @@ onUnmounted(() => {
 
           <!-- 隧道管理 (仅管理员) -->
           <div v-if="activeTab === 'lines' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
-            <div style="display: flex; justify-content: flex-end;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+              <span style="font-size: 12.5px; color: var(--text-secondary);">
+                支持单跳直连、3+ 跳链式转发、多出口带宽聚合池、连接复用池 (Mux)、单流多通道条带化聚合 (Bonding) 与 PROXY Protocol v1/v2。
+              </span>
               <button @click="openCreateLineModal" class="btn btn-primary">+ 新增隧道</button>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>名称</th>
+                    <th>名称 / 增强特性</th>
                     <th>类型</th>
                     <th>转发方式</th>
-                    <th>入口节点</th>
-                    <th>出口节点</th>
-                    <th>计费</th>
+                    <th>链路拓扑 (入口 → 跳点 → 出口池)</th>
+                    <th>计费 / 闲时</th>
                     <th>规则数</th>
                     <th style="text-align: right;">操作</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="line in lines" :key="line.id">
-                    <td style="font-weight: 500;">{{ line.name }}</td>
+                    <td>
+                      <div style="font-weight: 500;">{{ line.name }}</div>
+                      <div style="display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px;">
+                        <span v-if="line.enable_mux" class="badge badge-info" style="font-size: 10.5px;">Mux复用池</span>
+                        <span v-if="line.enable_bonding" class="badge badge-success" style="font-size: 10.5px;">
+                          Bond×{{ line.bond_links || 4 }}聚合
+                        </span>
+                        <span v-if="line.proxy_protocol" class="badge badge-neutral" style="font-size: 10.5px;">
+                          PROXY v{{ line.proxy_protocol }}
+                        </span>
+                        <span
+                          v-if="line.type === 'encrypt' && parseLineEgressCount(line) > 1"
+                          class="badge badge-primary"
+                          style="font-size: 10.5px;"
+                        >
+                          {{ loadBalanceLabel(line.load_balance) }}
+                        </span>
+                      </div>
+                    </td>
                     <td>
                       <span class="badge" :class="line.type === 'encrypt' ? 'badge-purple' : 'badge-primary'">
                         {{ line.type === 'encrypt' ? '隧道转发' : '端口转发' }}
                       </span>
                     </td>
                     <td><span class="badge badge-neutral">{{ line.engine }}</span></td>
-                    <td>{{ nodeNameById(line.ingress_node_id) }}</td>
                     <td>
-                      <span v-if="line.type === 'encrypt'">
-                        {{ nodeNameById(line.egress_node_id) }} ({{ line.transport.toUpperCase() }})
-                      </span>
-                      <span v-else style="color: var(--text-muted);">-</span>
+                      <div v-if="line.type === 'direct'" style="font-size: 12.5px;">
+                        {{ nodeNameById(line.ingress_node_id) }} <span style="color: var(--text-muted);">(单节点直转)</span>
+                      </div>
+                      <div v-else style="display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 12.5px;">
+                        <span class="badge badge-primary">{{ nodeNameById(line.ingress_node_id) }}</span>
+                        <template v-for="hid in parseAllowedIds(line.hop_node_ids)" :key="'h-' + hid">
+                          <span style="color: var(--text-muted);">→</span>
+                          <span class="badge badge-info">跳:{{ nodeNameById(hid) }}</span>
+                        </template>
+                        <span style="color: var(--text-muted);">→</span>
+                        <span v-if="parseLineEgressCount(line) <= 1" class="badge badge-purple">
+                          {{ nodeNameById(line.egress_node_id) }} ({{ line.transport.toUpperCase() }})
+                        </span>
+                        <span
+                          v-else
+                          class="badge badge-purple"
+                          :title="line.egress_node_ids"
+                        >
+                          多出口池×{{ parseLineEgressCount(line) }} ({{ line.transport.toUpperCase() }})
+                        </span>
+                      </div>
                     </td>
-                    <td>{{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x</td>
+                    <td>
+                      <div>{{ line.billing_mode === 'one_way' ? '单向' : '双向' }} · {{ line.rate_multiplier }}x</div>
+                      <div v-if="(line.offpeak_multiplier || 0) > 0" style="font-size: 11px; color: var(--success-text);">
+                        专属闲时 ×{{ line.offpeak_multiplier }}
+                      </div>
+                    </td>
                     <td>
                       {{ lineRuleCountMap.get(line.id) || 0 }} / {{ line.max_port_count || 50 }}
                       <div v-if="line.port_range" style="font-size: 12px; color: var(--text-muted);">端口 {{ line.port_range }}</div>
@@ -4227,10 +4892,10 @@ onUnmounted(() => {
                     </td>
                   </tr>
                   <tr v-if="lines.length === 0">
-                    <td colspan="8" style="padding: 0;">
+                    <td colspan="7" style="padding: 0;">
                       <div class="empty-state">
                         <div class="empty-state-title">暂无隧道线路</div>
-                        <div class="empty-state-desc">点击右上角「+ 新增隧道」配置端口转发或加密对接隧道</div>
+                        <div class="empty-state-desc">点击右上角「+ 新增隧道」配置端口转发、多跳链式或带宽聚合隧道</div>
                       </div>
                     </td>
                   </tr>
@@ -4239,9 +4904,10 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- 节点管理 (仅管理员) -->
-          <div v-if="activeTab === 'nodes' && isAdmin" style="display: flex; flex-direction: column; gap: 14px;">
-            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+          <!-- 节点管理与多入口 DNS 容灾 (仅管理员) -->
+          <div v-if="activeTab === 'nodes' && isAdmin" style="display: flex; flex-direction: column; gap: 16px;">
+            <div style="display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap;">
+              <button @click="openCreateFailoverModal" class="btn btn-outline">+ 新增 DNS 自动容灾组</button>
               <button @click="batchUpgradeOnlineNodes" class="btn btn-soft">一键升级在线节点</button>
               <button @click="openCreateNodeModal" class="btn btn-primary">+ 新增节点</button>
             </div>
@@ -4251,7 +4917,7 @@ onUnmounted(() => {
                   <tr>
                     <th>名称 / 版本</th>
                     <th>连接地址</th>
-                    <th>节点 IP</th>
+                    <th>节点 IP / 出站源 IP</th>
                     <th>端口范围</th>
                     <th>倍率</th>
                     <th>流量</th>
@@ -4272,7 +4938,15 @@ onUnmounted(() => {
                         {{ node.connect_ip || node.public_host }}
                       </button>
                     </td>
-                    <td class="mono" style="color: var(--text-secondary);">{{ node.server_ip }}</td>
+                    <td>
+                      <div class="mono" style="color: var(--text-secondary);">{{ node.server_ip }}</div>
+                      <div v-if="node.outbound_ip" style="font-size: 11px; color: var(--text-muted); margin-top: 2px;">
+                        默认出站: <span class="mono">{{ node.outbound_ip }}</span>
+                      </div>
+                      <div v-if="node.allowed_outbound_ips" style="font-size: 11px; color: var(--primary-text); margin-top: 1px;">
+                        授权池: <span class="mono">{{ node.allowed_outbound_ips }}</span>
+                      </div>
+                    </td>
                     <td class="mono" style="color: var(--text-secondary);">{{ node.port_range }}</td>
                     <td>{{ node.traffic_rate || 1 }}x</td>
                     <td>
@@ -4285,8 +4959,12 @@ onUnmounted(() => {
                       </div>
                     </td>
                     <td>
-                      <span class="badge" :class="node.status === 'online' ? 'badge-success' : 'badge-danger'">
-                        <span class="dot"></span> {{ node.status === 'online' ? '在线' : '离线' }}
+                      <span
+                        class="badge"
+                        :class="node.status === 'online' ? 'badge-success' : node.status === 'maintenance' ? 'badge-warning' : 'badge-danger'"
+                      >
+                        <span class="dot"></span>
+                        {{ node.status === 'online' ? '在线' : node.status === 'maintenance' ? '维护中' : '离线' }}
                       </span>
                     </td>
                     <td style="text-align: right; white-space: nowrap;">
@@ -4318,6 +4996,112 @@ onUnmounted(() => {
                   </tr>
                 </tbody>
               </table>
+            </div>
+
+            <!-- 多入口高可用与 DNS 自动容灾切换 -->
+            <div class="card" style="display: flex; flex-direction: column; gap: 12px;">
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <div>
+                  <div style="font-weight: 600; font-size: 14px;">多入口高可用与 DNS 自动容灾切换 (DNS Failover)</div>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    实时巡检主入口与备用入口队列，节点掉线或进入维护模式超阈值后自动切换 Cloudflare / DNSPod / Webhook A/AAAA 解析并支持防抖回切
+                  </div>
+                </div>
+                <button @click="openCreateFailoverModal" class="btn btn-primary btn-sm">+ 新增 DNS 容灾组</button>
+              </div>
+
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>容灾组 / 域名</th>
+                      <th>服务商</th>
+                      <th>主入口 → 备用入口队列</th>
+                      <th>当前解析节点 / IP</th>
+                      <th>阈值 / 冷却</th>
+                      <th>状态</th>
+                      <th style="text-align: right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="fg in dnsFailoverList" :key="fg.id">
+                      <td>
+                        <div style="font-weight: 600;">{{ fg.name }}</div>
+                        <div class="mono" style="font-size: 12px; color: var(--text-secondary);">
+                          {{ fg.domain }} ({{ fg.record_type }} · TTL {{ fg.ttl }}s)
+                        </div>
+                      </td>
+                      <td>
+                        <span class="badge badge-info">{{ fg.provider.toUpperCase() }}</span>
+                      </td>
+                      <td style="font-size: 12px;">
+                        <span class="badge badge-primary">主: {{ nodeNameById(fg.primary_node_id) }}</span>
+                        <span
+                          v-for="bid in parseAllowedIds(fg.backup_node_ids)"
+                          :key="'fb-' + bid"
+                          class="badge badge-neutral"
+                          style="margin-left: 4px;"
+                        >
+                          备: {{ nodeNameById(bid) }}
+                        </span>
+                      </td>
+                      <td>
+                        <div v-if="fg.active_node_id" style="font-size: 12.5px; font-weight: 600;">
+                          {{ nodeNameById(fg.active_node_id) }}
+                          <span
+                            v-if="fg.active_node_id !== fg.primary_node_id"
+                            class="badge badge-warning"
+                            style="margin-left: 4px;"
+                          >
+                            容灾接管中
+                          </span>
+                        </div>
+                        <div class="mono" style="font-size: 11.5px; color: var(--text-muted);">
+                          {{ fg.active_ip || '等待首次巡检同步' }} · 切换 {{ fg.switch_count || 0 }} 次
+                        </div>
+                        <div v-if="fg.last_error" style="font-size: 11px; color: var(--danger-text); margin-top: 2px;">
+                          {{ fg.last_error }}
+                        </div>
+                      </td>
+                      <td class="mono" style="font-size: 12px; color: var(--text-secondary);">
+                        <div>离线 {{ fg.offline_threshold_sec }}s 切换</div>
+                        <div style="font-size: 11px; color: var(--text-muted);">
+                          冷却 {{ fg.cooldown_sec }}s · {{ fg.auto_failback ? '自动回切' : '保持接管' }}
+                        </div>
+                      </td>
+                      <td>
+                        <span class="badge" :class="fg.enabled ? 'badge-success' : 'badge-neutral'">
+                          {{ fg.enabled ? '巡检中' : '已停用' }}
+                        </span>
+                      </td>
+                      <td style="text-align: right; white-space: nowrap;">
+                        <button
+                          @click="reconcileFailoverGroup(fg)"
+                          class="btn btn-soft btn-sm"
+                          style="margin-right: 4px;"
+                          :disabled="reconcilingFailoverId === fg.id"
+                        >
+                          {{ reconcilingFailoverId === fg.id ? '同步中...' : '立即巡检切换' }}
+                        </button>
+                        <button @click="openEditFailoverModal(fg)" class="btn btn-outline btn-sm" style="margin-right: 4px;">
+                          编辑
+                        </button>
+                        <button @click="deleteFailoverGroup(fg)" class="btn btn-danger btn-sm">删除</button>
+                      </td>
+                    </tr>
+                    <tr v-if="dnsFailoverList.length === 0">
+                      <td colspan="7" style="padding: 0;">
+                        <div class="empty-state" style="padding: 24px 16px;">
+                          <div class="empty-state-title">暂无多入口 DNS 自动容灾组</div>
+                          <div class="empty-state-desc">
+                            点击右上角「+ 新增 DNS 容灾组」绑定主备入口节点，实现故障秒级 DNS 自动切换与恢复回切
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
 
@@ -5434,6 +6218,48 @@ onUnmounted(() => {
 
             <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
               <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                  <span style="font-weight: 600; font-size: 14px;">分时段闲时流量倍率 (Off-Peak Dynamic Billing)</span>
+                  <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">
+                    支持跨午夜时段（如 23:00 ~ 07:00）；闲时窗口内上报流量自动乘以闲时倍率，隧道也可单独设置专属闲时倍率覆盖全局
+                  </div>
+                </div>
+                <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; white-space: nowrap;">
+                  <input type="checkbox" v-model="settingsForm.offpeak_enabled" />
+                  <span>启用闲时倍率</span>
+                </label>
+              </div>
+
+              <div class="grid-4">
+                <div>
+                  <label class="form-label">闲时开始 (HH:MM)</label>
+                  <input v-model="settingsForm.offpeak_start" class="input mono" placeholder="00:00" />
+                </div>
+                <div>
+                  <label class="form-label">闲时结束 (HH:MM)</label>
+                  <input v-model="settingsForm.offpeak_end" class="input mono" placeholder="08:00" />
+                </div>
+                <div>
+                  <label class="form-label">全局闲时倍率 (0=免流)</label>
+                  <input
+                    v-model.number="settingsForm.offpeak_multiplier"
+                    type="number"
+                    min="0"
+                    max="10"
+                    step="0.1"
+                    class="input"
+                    placeholder="0.5"
+                  />
+                </div>
+                <div>
+                  <label class="form-label">计费时区 (IANA)</label>
+                  <input v-model="settingsForm.offpeak_timezone" class="input mono" placeholder="Asia/Shanghai" />
+                </div>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; gap: 14px;">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
                 <span style="font-weight: 600; font-size: 14px;">推广返利与邀请分销设置 (Affiliate)</span>
                 <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;">
                   <input type="checkbox" v-model="settingsForm.affiliate_enabled" />
@@ -5696,25 +6522,26 @@ onUnmounted(() => {
 
     <!-- 新增 / 编辑转发弹窗 (仅展示当前用户有权使用的隧道) -->
     <div v-if="showRuleModal" class="modal-backdrop" @click.self="showRuleModal = false">
-      <div class="modal-box">
+      <div class="modal-box" style="max-width: 580px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-          <span style="font-weight: 600;">{{ editingRuleId ? '编辑转发' : '新增转发' }}</span>
+          <span style="font-weight: 600;">{{ editingRuleId ? '编辑转发规则' : '新增转发规则' }}</span>
           <button @click="showRuleModal = false" class="btn btn-outline btn-sm">✕</button>
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 12px;">
-          <div>
-            <label class="form-label">隧道</label>
-            <select v-model="ruleForm.tunnel_line_id" class="select">
-              <option v-for="l in authorizedLines" :key="l.id" :value="l.id">
-                {{ l.name }} ({{ l.engine }})
-              </option>
-            </select>
-          </div>
-
-          <div>
-            <label class="form-label">名称</label>
-            <input v-model="ruleForm.name" class="input" placeholder="规则名称" />
+          <div class="grid-2">
+            <div>
+              <label class="form-label">隧道线路</label>
+              <select v-model="ruleForm.tunnel_line_id" class="select">
+                <option v-for="l in authorizedLines" :key="l.id" :value="l.id">
+                  {{ l.name }} ({{ l.engine }})
+                </option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">规则名称</label>
+              <input v-model="ruleForm.name" class="input" placeholder="例如：香港业务主站" />
+            </div>
           </div>
 
           <div class="grid-3">
@@ -5731,32 +6558,105 @@ onUnmounted(() => {
               <input v-model.number="ruleForm.listen_port" type="number" class="input" :placeholder="ruleFormPortHint" />
             </div>
             <div>
-              <label class="form-label">负载均衡</label>
+              <label class="form-label">多目标调度策略</label>
               <select v-model="ruleForm.load_balance" class="select">
-                <option value="round_robin">轮询</option>
-                <option value="failover">主备</option>
+                <option value="round_robin">轮询 (Round Robin)</option>
+                <option value="weighted">加权轮询 (Weighted)</option>
+                <option value="least_rtt">最低延迟 (Least RTT)</option>
+                <option value="failover">主备容灾 (Failover)</option>
+                <option value="random">随机调度 (Random)</option>
               </select>
             </div>
           </div>
 
+          <div v-if="ruleForm.protocol === 'tcp'">
+            <label class="form-label">SNI / HTTP Host 共享端口路由域名（选填，不解密 TLS）</label>
+            <input
+              v-model="ruleForm.match_domains"
+              class="input mono"
+              placeholder="例如 app.example.com, *.api.example.com（配置后多条规则可复用同一入口端口）"
+            />
+          </div>
+
           <div>
-            <label class="form-label">目标地址（多目标自动启用主动健康检查与故障剔除）</label>
-            <textarea v-model="ruleForm.targetsText" rows="3" class="textarea" placeholder="每行一个 IP:端口"></textarea>
+            <label class="form-label">
+              目标地址（每行一个 IP:端口，可选附带 <code>#weight=200</code> 或 <code>#backup</code>）
+            </label>
+            <textarea
+              v-model="ruleForm.targetsText"
+              rows="3"
+              class="textarea mono"
+              placeholder="1.1.1.1:443&#10;1.0.0.1:443#weight=50,backup"
+            ></textarea>
           </div>
 
           <div class="grid-2">
             <div>
-              <label class="form-label">单规则限速 (Mbps，0=继承套餐限速)</label>
-              <input v-model.number="ruleForm.speed_mbps" type="number" min="0" class="input" placeholder="0 为继承套餐限速" />
-            </div>
-            <div>
-              <label class="form-label">来源 IP 访问控制 (ACL)</label>
-              <select v-model="ruleForm.access_mode" class="select">
-                <option value="off">关闭（允许所有来源 IP）</option>
-                <option value="allow">白名单（仅允许指定 IP / CIDR）</option>
-                <option value="deny">黑名单（拦截指定 IP / CIDR）</option>
+              <label class="form-label">PROXY Protocol 源 IP 透传</label>
+              <select
+                v-model.number="ruleForm.proxy_protocol"
+                class="select"
+                :disabled="ruleForm.protocol === 'udp'"
+              >
+                <option :value="0">跟随隧道默认配置</option>
+                <option :value="1">开启 PROXY Protocol v1 (文本头)</option>
+                <option :value="2">开启 PROXY Protocol v2 (二进制头)</option>
+                <option :value="-1">强制关闭</option>
               </select>
             </div>
+            <div>
+              <label class="form-label">指定出站源 IP（多 IP 机器选填）</label>
+              <input
+                v-model="ruleForm.outbound_ip"
+                class="input mono"
+                :placeholder="
+                  ruleFormAllowedOutboundIPs.length > 0
+                    ? '可选授权 IP，留空使用节点默认'
+                    : isAdmin
+                      ? '留空使用默认出口网卡 IP'
+                      : '该线路暂未开放可选出站 IP'
+                "
+              />
+              <div
+                v-if="ruleFormAllowedOutboundIPs.length > 0"
+                style="display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px;"
+              >
+                <button
+                  v-for="oip in ruleFormAllowedOutboundIPs"
+                  :key="oip"
+                  type="button"
+                  class="btn btn-soft btn-sm mono"
+                  style="padding: 1px 6px; font-size: 11px;"
+                  @click="ruleForm.outbound_ip = oip"
+                >
+                  {{ oip }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div>
+              <label class="form-label">单规则限速 (Mbps，0=继承)</label>
+              <input v-model.number="ruleForm.speed_mbps" type="number" min="0" class="input" placeholder="0=继承套餐" />
+            </div>
+            <div>
+              <label class="form-label">单规则总流量上限 (GB，0=不限)</label>
+              <input v-model.number="ruleForm.rule_quota_gb" type="number" min="0" step="1" class="input" placeholder="0=不限" />
+            </div>
+            <div>
+              <label class="form-label">每日流量上限 (GB，0=不限)</label>
+              <input v-model.number="ruleForm.daily_quota_gb" type="number" min="0" step="1" class="input" placeholder="0=不限，次日自动恢复" />
+            </div>
+          </div>
+
+          <div>
+            <label class="form-label">来源 IP 访问控制 (ACL)</label>
+            <select v-model="ruleForm.access_mode" class="select">
+              <option value="off">关闭（允许所有来源 IP）</option>
+              <option value="allow">白名单（仅允许指定 IP / CIDR）</option>
+              <option value="deny">黑名单（拦截指定 IP / CIDR）</option>
+            </select>
           </div>
 
           <div v-if="ruleForm.access_mode !== 'off'">
@@ -5772,7 +6672,7 @@ onUnmounted(() => {
 
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showRuleModal = false" class="btn btn-outline">取消</button>
-            <button @click="submitRule" class="btn btn-primary">保存</button>
+            <button @click="submitRule" class="btn btn-primary">保存规则</button>
           </div>
         </div>
       </div>
@@ -5780,34 +6680,34 @@ onUnmounted(() => {
 
     <!-- 新增 / 编辑隧道弹窗 -->
     <div v-if="showLineModal && isAdmin" class="modal-backdrop" @click.self="showLineModal = false">
-      <div class="modal-box">
+      <div class="modal-box" style="max-width: 640px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-          <span style="font-weight: 600;">{{ editingLineId ? '编辑隧道' : '新增隧道' }}</span>
+          <span style="font-weight: 600;">{{ editingLineId ? '编辑隧道（支持多跳链式与带宽聚合）' : '新增隧道（支持多跳链式与带宽聚合）' }}</span>
           <button @click="showLineModal = false" class="btn btn-outline btn-sm">✕</button>
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 12px;">
           <div class="grid-2">
             <div class="mode-card" :class="{ selected: lineForm.type === 'direct' }" @click="lineForm.type = 'direct'">
-              端口转发
+              端口直转
             </div>
             <div class="mode-card" :class="{ selected: lineForm.type === 'encrypt' }" @click="lineForm.type = 'encrypt'">
-              隧道转发
+              加密隧道 / 链式与聚合
             </div>
           </div>
 
           <div class="grid-2">
             <div>
-              <label class="form-label">名称</label>
-              <input v-model="lineForm.name" class="input" placeholder="隧道名称" />
+              <label class="form-label">隧道名称</label>
+              <input v-model="lineForm.name" class="input" placeholder="例如：沪深港三跳专线聚合" />
             </div>
             <div>
-              <label class="form-label">转发方式</label>
+              <label class="form-label">基础转发引擎</label>
               <select v-model="lineForm.engine" class="select">
+                <option value="native">native（支持全量多跳/Mux/聚合/SNI/PROXY特性）</option>
                 <option value="realm">realm</option>
                 <option value="gost">gost</option>
                 <option value="nftables">nftables</option>
-                <option value="native">native</option>
               </select>
             </div>
           </div>
@@ -5819,28 +6719,175 @@ onUnmounted(() => {
             </select>
           </div>
 
-          <div v-else class="grid-3">
+          <template v-else>
+            <div class="grid-3">
+              <div>
+                <label class="form-label">入口节点 (Ingress)</label>
+                <select v-model="lineForm.ingress_node_id" class="select">
+                  <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+                </select>
+              </div>
+              <div>
+                <label class="form-label">主出口节点 (Primary Egress)</label>
+                <select v-model="lineForm.egress_node_id" class="select">
+                  <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+                </select>
+              </div>
+              <div>
+                <label class="form-label">传输协议</label>
+                <select v-model="lineForm.transport" class="select">
+                  <option value="tls">TLS</option>
+                  <option value="wss">WSS</option>
+                  <option value="ws">WS</option>
+                  <option value="quic">QUIC</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- 链式转发：有序中间跳点构建器 -->
+            <div
+              style="padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color); background: var(--bg-soft); display: flex; flex-direction: column; gap: 8px;"
+            >
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <span style="font-weight: 600; font-size: 12.5px;">多跳链式转发中间节点（选填，最多 8 跳，自动防环路校验）</span>
+                <div style="display: flex; gap: 6px; align-items: center;">
+                  <select v-model.number="hopPickerNodeId" class="select" style="width: 150px; height: 30px; font-size: 12px;">
+                    <option v-for="n in nodes" :key="n.id" :value="n.id">#{{ n.id }} {{ n.name }}</option>
+                  </select>
+                  <button type="button" @click="addHopToLineForm" class="btn btn-soft btn-sm">+ 插入跳点</button>
+                </div>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px;">
+                <span class="badge badge-primary">入口: {{ nodeNameById(lineForm.ingress_node_id) }}</span>
+                <template v-for="(hid, hIdx) in lineHopIds" :key="'edit-hop-' + hid">
+                  <span style="color: var(--text-muted);">→</span>
+                  <span
+                    class="badge badge-info"
+                    style="display: inline-flex; align-items: center; gap: 4px; padding-right: 4px;"
+                  >
+                    <span>跳{{ hIdx + 1 }}: {{ nodeNameById(hid) }}</span>
+                    <button
+                      v-if="hIdx > 0"
+                      type="button"
+                      style="border: none; background: transparent; cursor: pointer; font-size: 11px; color: inherit;"
+                      title="前移"
+                      @click="moveHopInLineForm(hIdx, -1)"
+                    >
+                      ◀
+                    </button>
+                    <button
+                      v-if="hIdx < lineHopIds.length - 1"
+                      type="button"
+                      style="border: none; background: transparent; cursor: pointer; font-size: 11px; color: inherit;"
+                      title="后移"
+                      @click="moveHopInLineForm(hIdx, 1)"
+                    >
+                      ▶
+                    </button>
+                    <button
+                      type="button"
+                      style="border: none; background: transparent; cursor: pointer; font-size: 11px; color: inherit;"
+                      title="移除该跳"
+                      @click="removeHopFromLineForm(hIdx)"
+                    >
+                      ✕
+                    </button>
+                  </span>
+                </template>
+                <span style="color: var(--text-muted);">→</span>
+                <span class="badge badge-purple">
+                  {{ lineForm.egress_node_ids.trim() ? '多出口聚合池' : '出口: ' + nodeNameById(lineForm.egress_node_id) }}
+                </span>
+              </div>
+            </div>
+
+            <!-- 带宽聚合：多出口节点池与吞吐加速 -->
+            <div
+              style="padding: 10px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color); background: var(--bg-soft); display: flex; flex-direction: column; gap: 8px;"
+            >
+              <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <span style="font-weight: 600; font-size: 12.5px;">多出口带宽聚合池（选填，留空则使用上方单主出口）</span>
+                <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
+                  <select v-model.number="egressPoolPickerNodeId" class="select" style="width: 135px; height: 30px; font-size: 12px;">
+                    <option v-for="n in nodes" :key="n.id" :value="n.id">#{{ n.id }} {{ n.name }}</option>
+                  </select>
+                  <input
+                    v-model.number="egressPoolPickerWeight"
+                    type="number"
+                    min="1"
+                    max="10000"
+                    class="input"
+                    style="width: 74px; height: 30px; font-size: 12px;"
+                    title="节点权重"
+                    placeholder="权重"
+                  />
+                  <label style="display: inline-flex; align-items: center; gap: 4px; font-size: 12px; cursor: pointer;">
+                    <input type="checkbox" v-model="egressPoolPickerBackup" />
+                    <span>备用</span>
+                  </label>
+                  <button type="button" @click="addMemberToEgressPool" class="btn btn-soft btn-sm">+ 加入出口池</button>
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">出口池配置串（节点ID:权重[:backup]）</label>
+                  <input
+                    v-model="lineForm.egress_node_ids"
+                    class="input mono"
+                    placeholder="例如 2:200,3:100,4:100:backup"
+                  />
+                </div>
+                <div>
+                  <label class="form-label">多出口池调度策略</label>
+                  <select v-model="lineForm.load_balance" class="select">
+                    <option value="round_robin">轮询分流 (Round Robin)</option>
+                    <option value="weighted">按带宽权重聚合 (Weighted)</option>
+                    <option value="least_rtt">最低 RTT 优先 (Least RTT)</option>
+                    <option value="failover">主备自动容灾 (Failover)</option>
+                    <option value="random">随机分流 (Random)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div>
+                  <label class="form-label">隧道吞吐加速 / 单流带宽聚合模式</label>
+                  <select v-model="lineForm.accel_mode" class="select">
+                    <option value="none">标准独立连接</option>
+                    <option value="mux">Mux 长连接多路复用池（零握手延迟 + 流控背压）</option>
+                    <option value="bonding">Bonding 单流多通道条带化聚合（突破单 TCP 窗口瓶颈）</option>
+                  </select>
+                </div>
+                <div v-if="lineForm.accel_mode === 'bonding'">
+                  <label class="form-label">单流并行聚合通道数 (2 - 8 条)</label>
+                  <input v-model.number="lineForm.bond_links" type="number" min="2" max="8" class="input" />
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <div class="grid-2">
             <div>
-              <label class="form-label">入口节点</label>
-              <select v-model="lineForm.ingress_node_id" class="select">
-                <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
+              <label class="form-label">默认 PROXY Protocol 源 IP 透传</label>
+              <select v-model.number="lineForm.proxy_protocol" class="select">
+                <option :value="0">默认关闭（规则可单独开启）</option>
+                <option :value="1">默认开启 PROXY Protocol v1</option>
+                <option :value="2">默认开启 PROXY Protocol v2</option>
               </select>
             </div>
             <div>
-              <label class="form-label">出口节点</label>
-              <select v-model="lineForm.egress_node_id" class="select">
-                <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.name }}</option>
-              </select>
-            </div>
-            <div>
-              <label class="form-label">传输协议</label>
-              <select v-model="lineForm.transport" class="select">
-                <option value="tls">TLS</option>
-                <option value="wss">WSS</option>
-                <option value="ws">WS</option>
-                <option value="quic">QUIC</option>
-                <option value="custom">Custom</option>
-              </select>
+              <label class="form-label">隧道专属闲时倍率（0 = 继承全局闲时设置）</label>
+              <input
+                v-model.number="lineForm.offpeak_multiplier"
+                type="number"
+                min="0"
+                step="0.1"
+                class="input"
+                placeholder="0 为继承全局闲时倍率"
+              />
             </div>
           </div>
 
@@ -5870,13 +6917,13 @@ onUnmounted(() => {
               :placeholder="'留空使用入口节点端口范围 ' + (nodes.find((n) => n.id === lineForm.ingress_node_id)?.port_range || '')"
             />
             <div style="font-size: 12px; color: var(--text-muted); margin-top: 4px;">
-              该隧道的转发规则只在此范围内分配监听端口，格式如 20000-20999，需在入口节点端口范围之内；修改后对新分配的端口生效。
+              该隧道的转发规则只在此范围内分配监听端口，格式如 20000-20999，需在入口节点端口范围之内。
             </div>
           </div>
 
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showLineModal = false" class="btn btn-outline">取消</button>
-            <button @click="submitLine" class="btn btn-primary">保存</button>
+            <button @click="submitLine" class="btn btn-primary">保存隧道</button>
           </div>
         </div>
       </div>
@@ -5884,7 +6931,7 @@ onUnmounted(() => {
 
     <!-- 新增 / 编辑节点弹窗 -->
     <div v-if="showNodeModal && isAdmin" class="modal-backdrop" @click.self="showNodeModal = false">
-      <div class="modal-box">
+      <div class="modal-box" style="max-width: 540px;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
           <span style="font-weight: 600;">{{ editingNodeId ? '编辑节点' : '新增节点' }}</span>
           <button @click="showNodeModal = false" class="btn btn-outline btn-sm">✕</button>
@@ -5896,12 +6943,22 @@ onUnmounted(() => {
           </div>
           <div class="grid-2">
             <div>
-              <label class="form-label">连接地址</label>
+              <label class="form-label">连接地址 (客户端接入域名 / IP)</label>
               <input v-model="nodeForm.connect_ip" class="input" placeholder="IP 或域名" />
             </div>
             <div>
-              <label class="form-label">节点 IP</label>
+              <label class="form-label">节点服务器 IP (内部对接 IP)</label>
               <input v-model="nodeForm.server_ip" class="input" placeholder="留空默认同连接地址" />
+            </div>
+          </div>
+          <div class="grid-2">
+            <div>
+              <label class="form-label">默认出站源 IP（多网卡选填）</label>
+              <input v-model="nodeForm.outbound_ip" class="input mono" placeholder="留空由内核路由自动选源" />
+            </div>
+            <div>
+              <label class="form-label">授权租户选用的出站 IP 列表（逗号分隔）</label>
+              <input v-model="nodeForm.allowed_outbound_ips" class="input mono" placeholder="例如 203.0.113.10,203.0.113.11" />
             </div>
           </div>
           <div class="grid-2">
@@ -5928,9 +6985,204 @@ onUnmounted(() => {
               <input v-model.number="nodeForm.reset_day" type="number" min="0" max="28" class="input" placeholder="0 为不自动重置" />
             </div>
           </div>
+          <label
+            v-if="editingNodeId"
+            style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;"
+          >
+            <input type="checkbox" v-model="nodeForm.maintenance" />
+            <span>设为维护模式（自动触发关联的多入口 DNS 容灾组平滑切走解析流量）</span>
+          </label>
           <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
             <button @click="showNodeModal = false" class="btn btn-outline">取消</button>
             <button @click="submitNode" class="btn btn-primary">保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新增 / 编辑多入口 DNS 自动容灾组弹窗 -->
+    <div v-if="showFailoverModal && isAdmin" class="modal-backdrop" @click.self="showFailoverModal = false">
+      <div class="modal-box" style="max-width: 580px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+          <span style="font-weight: 600;">
+            {{ editingFailoverId ? '编辑多入口 DNS 自动容灾组' : '新增多入口 DNS 自动容灾组' }}
+          </span>
+          <button @click="showFailoverModal = false" class="btn btn-outline btn-sm">✕</button>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 12px;">
+          <div class="grid-2">
+            <div>
+              <label class="form-label">容灾组名称</label>
+              <input v-model="failoverForm.name" class="input" placeholder="例如：华南电信双入口高可用" />
+            </div>
+            <div>
+              <label class="form-label">接入解析完整域名 (FQDN)</label>
+              <input v-model="failoverForm.domain" class="input mono" placeholder="entry.example.com" />
+            </div>
+          </div>
+
+          <div class="grid-3">
+            <div>
+              <label class="form-label">DNS 服务商</label>
+              <select v-model="failoverForm.provider" class="select">
+                <option value="cloudflare">Cloudflare API v4</option>
+                <option value="dnspod">腾讯云 DNSPod API</option>
+                <option value="webhook">自定义 HMAC Webhook</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">记录类型</label>
+              <select v-model="failoverForm.record_type" class="select">
+                <option value="A">A (IPv4)</option>
+                <option value="AAAA">AAAA (IPv6)</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">DNS TTL (秒)</label>
+              <input v-model.number="failoverForm.ttl" type="number" min="1" max="86400" class="input" />
+            </div>
+          </div>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">主入口节点 (Primary Ingress)</label>
+              <select v-model.number="failoverForm.primary_node_id" class="select">
+                <option v-for="n in nodes" :key="n.id" :value="n.id">
+                  #{{ n.id }} {{ n.name }} ({{ n.connect_ip || n.server_ip }})
+                </option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">添加备用入口节点 (按优先级顺序接管)</label>
+              <div style="display: flex; gap: 6px;">
+                <select v-model.number="failoverBackupPickerId" class="select" style="flex: 1;">
+                  <option v-for="n in nodes" :key="n.id" :value="n.id">#{{ n.id }} {{ n.name }}</option>
+                </select>
+                <button type="button" @click="addFailoverBackupNode" class="btn btn-soft btn-sm">+ 添加</button>
+              </div>
+            </div>
+          </div>
+
+          <div
+            style="padding: 8px 12px; border-radius: var(--radius-md); background: var(--bg-soft); border: 1px solid var(--border-color); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px;"
+          >
+            <span style="color: var(--text-muted);">接管顺序：</span>
+            <span class="badge badge-primary">主: {{ nodeNameById(failoverForm.primary_node_id) }}</span>
+            <template v-for="(bid, bIdx) in failoverBackupIds" :key="'fb-form-' + bid">
+              <span style="color: var(--text-muted);">→</span>
+              <span class="badge badge-neutral" style="display: inline-flex; align-items: center; gap: 4px;">
+                <span>备{{ bIdx + 1 }}: {{ nodeNameById(bid) }}</span>
+                <button
+                  type="button"
+                  style="border: none; background: transparent; cursor: pointer; font-size: 11px; color: inherit;"
+                  @click="removeFailoverBackupNode(bIdx)"
+                >
+                  ✕
+                </button>
+              </span>
+            </template>
+          </div>
+
+          <template v-if="failoverForm.provider === 'cloudflare'">
+            <div class="grid-2">
+              <div>
+                <label class="form-label">Cloudflare Zone ID</label>
+                <input v-model="failoverForm.zone_id" class="input mono" placeholder="32 位 Zone ID" />
+              </div>
+              <div>
+                <label class="form-label">Record ID（留空自动查询匹配）</label>
+                <input v-model="failoverForm.record_id" class="input mono" placeholder="留空自动发现并缓存" />
+              </div>
+            </div>
+            <div>
+              <label class="form-label">
+                Cloudflare API Token (需 Zone.DNS 编辑权限){{ failoverForm.has_api_token ? ' — 留空保持原密钥不变' : '' }}
+              </label>
+              <input
+                v-model="failoverForm.api_token"
+                type="password"
+                class="input mono"
+                :placeholder="failoverForm.has_api_token ? '已保存密钥，留空不修改' : '输入 Bearer API Token'"
+              />
+            </div>
+            <label style="display: flex; align-items: center; gap: 8px; font-size: 12.5px; cursor: pointer;">
+              <input type="checkbox" v-model="failoverForm.proxied" />
+              <span>开启 Cloudflare 橙云代理（非标准端口 TCP/UDP 转发建议保持关闭）</span>
+            </label>
+          </template>
+
+          <template v-else-if="failoverForm.provider === 'dnspod'">
+            <div class="grid-3">
+              <div>
+                <label class="form-label">主域名（如 example.com）</label>
+                <input v-model="failoverForm.zone_id" class="input mono" placeholder="留空自动从 FQDN 推导" />
+              </div>
+              <div>
+                <label class="form-label">主机记录（如 entry）</label>
+                <input v-model="failoverForm.sub_domain" class="input mono" placeholder="留空自动推导" />
+              </div>
+              <div>
+                <label class="form-label">Record ID（选填）</label>
+                <input v-model="failoverForm.record_id" class="input mono" placeholder="留空自动查询" />
+              </div>
+            </div>
+            <div>
+              <label class="form-label">
+                DNSPod Token（格式: ID,Token）{{ failoverForm.has_api_token ? ' — 留空保持原密钥不变' : '' }}
+              </label>
+              <input
+                v-model="failoverForm.api_token"
+                type="password"
+                class="input mono"
+                :placeholder="failoverForm.has_api_token ? '已保存密钥，留空不修改' : '例如 123456,abcdef0123456789...'"
+              />
+            </div>
+          </template>
+
+          <template v-else>
+            <div>
+              <label class="form-label">自定义 DNS 切换 Webhook URL (POST JSON)</label>
+              <input v-model="failoverForm.webhook_url" class="input mono" placeholder="https://dns-hook.example.com/switch" />
+            </div>
+            <div>
+              <label class="form-label">
+                HMAC-SHA256 签名密钥（请求头 X-Zachary-Signature，选填）{{ failoverForm.has_api_token ? ' — 留空保持原密钥不变' : '' }}
+              </label>
+              <input
+                v-model="failoverForm.api_token"
+                type="password"
+                class="input mono"
+                :placeholder="failoverForm.has_api_token ? '已保存签名密钥，留空不修改' : '用于验签防伪造'"
+              />
+            </div>
+          </template>
+
+          <div class="grid-2">
+            <div>
+              <label class="form-label">节点离线判定阈值 (秒)</label>
+              <input v-model.number="failoverForm.offline_threshold_sec" type="number" min="0" max="3600" class="input" />
+            </div>
+            <div>
+              <label class="form-label">切换防抖冷却时间 (秒)</label>
+              <input v-model.number="failoverForm.cooldown_sec" type="number" min="0" max="86400" class="input" />
+            </div>
+          </div>
+
+          <div style="display: flex; gap: 18px; flex-wrap: wrap;">
+            <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+              <input type="checkbox" v-model="failoverForm.auto_failback" />
+              <span>主入口恢复在线后自动回切 (Auto-Failback)</span>
+            </label>
+            <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer;">
+              <input type="checkbox" v-model="failoverForm.enabled" />
+              <span>启用自动巡检容灾</span>
+            </label>
+          </div>
+
+          <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px;">
+            <button @click="showFailoverModal = false" class="btn btn-outline">取消</button>
+            <button @click="submitFailoverForm" class="btn btn-primary">保存容灾组</button>
           </div>
         </div>
       </div>

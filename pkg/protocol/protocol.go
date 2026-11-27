@@ -21,6 +21,74 @@ const (
 	RoleEgress  RuleRole = "egress"  // 隧道/专线出口解包
 )
 
+// RoleHop returns the deterministic RuleRole for the idx-th intermediate relay hop (0-indexed) in a multi-hop chain.
+func RoleHop(idx int) RuleRole {
+	return RuleRole("hop_" + itoaSmall(idx))
+}
+
+func itoaSmall(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+// ParseHopRole parses "hop_<idx>" (0 <= idx <= 7) and reports whether r is a valid intermediate hop role.
+func ParseHopRole(r RuleRole) (int, bool) {
+	s := string(r)
+	if len(s) < 5 || len(s) > 6 || s[:4] != "hop_" {
+		return -1, false
+	}
+	n := 0
+	for i := 4; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return -1, false
+		}
+		n = n*10 + int(s[i]-'0')
+	}
+	if n < 0 || n > 7 {
+		return -1, false
+	}
+	return n, true
+}
+
+// IsHopRole reports whether r is a valid intermediate multi-hop relay role ("hop_0".."hop_7").
+func IsHopRole(r RuleRole) bool {
+	_, ok := ParseHopRole(r)
+	return ok
+}
+
+// IsTunnelRole reports whether r participates in an encrypted tunnel leg (Ingress, Hop, or Egress).
+func IsTunnelRole(r RuleRole) bool {
+	return r == RoleIngress || r == RoleEgress || IsHopRole(r)
+}
+
+// IsTunnelServerRole reports whether r accepts incoming encrypted tunnel connections (Hop or Egress).
+func IsTunnelServerRole(r RuleRole) bool {
+	return r == RoleEgress || IsHopRole(r)
+}
+
+// IsTunnelClientRole reports whether r dials upstream encrypted tunnel connections (Ingress or Hop).
+func IsTunnelClientRole(r RuleRole) bool {
+	return r == RoleIngress || IsHopRole(r)
+}
+
 // MessageType represents the WebSocket message type between Master and Agent.
 type MessageType string
 
@@ -85,41 +153,48 @@ type AgentHeartbeatPayload struct {
 	UptimeSeconds    int64        `json:"uptime_seconds"`
 }
 
-// TargetEndpoint represents an upstream destination and its weight/priority.
+// TargetEndpoint represents an upstream destination and its weight/priority/certificate.
 type TargetEndpoint struct {
-	Address string `json:"address"`          // IP:Port or Domain:Port
-	Weight  int    `json:"weight,omitempty"` // 权重
-	Backup  bool   `json:"backup,omitempty"` // 是否为主备模式下的备用节点
+	Address string `json:"address"`            // IP:Port or Domain:Port
+	Weight  int    `json:"weight,omitempty"`   // 权重 (默认 100，用于加权带宽聚合)
+	Backup  bool   `json:"backup,omitempty"`   // 是否为主备模式下的备用节点
+	CertPEM string `json:"cert_pem,omitempty"` // 多出口聚合时该下一跳/出口节点的独立固定 TLS 证书
+	NodeID  uint64 `json:"node_id,omitempty"`  // 对应节点 ID（可选元数据）
 }
 
-// TunnelConfig holds parameters for encrypted/dedicated tunnel transport between Ingress and Egress.
+// TunnelConfig holds parameters for encrypted/dedicated tunnel transport between Ingress, Hop, and Egress.
 type TunnelConfig struct {
-	Transport  string `json:"transport"`             // "raw" | "tls" | "ws" | "wss" | "quic" | "custom" (底层统一走经校验的 TLS 加密)
-	SecretKey  string `json:"secret_key,omitempty"`  // 隧道握手机密令牌或预共享密钥
-	SNI        string `json:"sni,omitempty"`         // TLS 伪装域名
-	WSPath     string `json:"ws_path,omitempty"`     // WebSocket 路径
-	EnableMux  bool   `json:"enable_mux,omitempty"`  // 多路复用减少握手延迟
-	ProxyProto int    `json:"proxy_proto,omitempty"` // 0: 关闭, 1: v1, 2: v2
-	CertPEM    string `json:"cert_pem,omitempty"`    // 出口节点隧道证书 (入口节点据此做证书固定校验)
+	Transport     string `json:"transport"`               // "raw" | "tls" | "ws" | "wss" | "quic" | "custom" (底层统一走经校验的 TLS 加密)
+	SecretKey     string `json:"secret_key,omitempty"`    // 隧道握手机密令牌或预共享密钥
+	SNI           string `json:"sni,omitempty"`           // TLS 伪装域名
+	WSPath        string `json:"ws_path,omitempty"`       // WebSocket 路径
+	EnableMux     bool   `json:"enable_mux,omitempty"`    // 常驻连接池多路复用，消除新建连接握手延迟
+	EnableBonding bool   `json:"enable_bonding,omitempty"` // 单连接多通道条带化带宽聚合
+	BondLinks     int    `json:"bond_links,omitempty"`    // 条带化并发通道数 (2..8，默认 4)
+	ProxyProto    int    `json:"proxy_proto,omitempty"`   // 0: 关闭, 1: v1, 2: v2
+	CertPEM       string `json:"cert_pem,omitempty"`      // 默认下一跳/出口节点隧道证书
 }
 
-// RuleSpec describes a single runtime rule dispatched to an Agent (either Relay, Ingress, or Egress).
+// RuleSpec describes a single runtime rule dispatched to an Agent (Relay, Ingress, Hop, or Egress).
 type RuleSpec struct {
 	RuleID         uint64           `json:"rule_id"`
 	UserID         uint64           `json:"user_id"`
 	Name           string           `json:"name"`
-	Role           RuleRole         `json:"role"`             // relay | ingress | egress
-	Engine         EngineType       `json:"engine"`           // native | gost | realm | nftables
-	Protocol       string           `json:"protocol"`         // tcp | udp | both
-	ListenHost     string           `json:"listen_host"`      // 默认 0.0.0.0 或内网绑定 IP
-	ListenPort     int              `json:"listen_port"`      // 本地监听端口
-	LoadBalance    string           `json:"load_balance"`     // round_robin | random | failover
-	Targets        []TargetEndpoint `json:"targets"`          // 转发目标列表 (Ingress 角色下为出口节点的隧道地址)
-	Tunnel         *TunnelConfig    `json:"tunnel,omitempty"`       // 隧道参数
-	SpeedLimitMbps int              `json:"speed_limit_mbps"`       // 单规则/用户带宽上限 (Mbps, 0 表示不限速)
-	AccessMode     string           `json:"access_mode,omitempty"`  // "off" | "allow" | "deny"
-	AccessCIDRs    string           `json:"access_cidrs,omitempty"` // 逗号分隔的 IP 或 CIDR 列表
-	MaxConns       int              `json:"max_conns"`              // 最大并发连接数限制
+	Role           RuleRole         `json:"role"`                    // relay | ingress | hop_0..hop_7 | egress
+	Engine         EngineType       `json:"engine"`                  // native | gost | realm | nftables
+	Protocol       string           `json:"protocol"`                // tcp | udp | both
+	ListenHost     string           `json:"listen_host"`             // 默认 0.0.0.0 或内网绑定 IP
+	ListenPort     int              `json:"listen_port"`             // 本地监听端口
+	LoadBalance    string           `json:"load_balance"`            // round_robin | weighted | least_rtt | random | failover
+	Targets        []TargetEndpoint `json:"targets"`                 // 转发目标列表 (Ingress/Hop 角色下为下一跳或出口节点的隧道地址池)
+	Tunnel         *TunnelConfig    `json:"tunnel,omitempty"`        // 隧道参数
+	SpeedLimitMbps int              `json:"speed_limit_mbps"`        // 单规则/用户带宽上限 (Mbps, 0 表示不限速)
+	AccessMode     string           `json:"access_mode,omitempty"`   // "off" | "allow" | "deny"
+	AccessCIDRs    string           `json:"access_cidrs,omitempty"`  // 逗号分隔的 IP 或 CIDR 列表
+	OutboundIP     string           `json:"outbound_ip,omitempty"`   // 指定出站绑定的本机源 IP
+	ProxyProto     int              `json:"proxy_proto,omitempty"`   // 0: 关闭, 1: PROXY v1, 2: PROXY v2
+	MatchDomains   string           `json:"match_domains,omitempty"` // SNI / HTTP Host 共享端口路由域名列表 (逗号分隔，支持 *.example.com)
+	MaxConns       int              `json:"max_conns"`               // 最大并发连接数限制
 	UpdatedAt      time.Time        `json:"updated_at"`
 }
 

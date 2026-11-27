@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,7 +21,7 @@ import (
 type gostRuleProcess struct {
 	spec       protocol.RuleSpec
 	configPath string
-	caPath     string
+	caPaths    []string
 	cmd        *exec.Cmd
 	cancel     context.CancelFunc
 }
@@ -62,6 +65,14 @@ func (g *GostEngine) Available() bool {
 	return false
 }
 
+func cleanupGostFiles(paths []string) {
+	for _, p := range paths {
+		if p != "" {
+			_ = os.Remove(p)
+		}
+	}
+}
+
 func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) error {
 	if !g.Available() {
 		return fmt.Errorf("gost binary not found in PATH")
@@ -72,27 +83,46 @@ func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) erro
 	key := RuleKey(spec.RuleID, spec.Role)
 	_ = g.RemoveRule(key, spec.RuleID, spec.Role)
 
-	caPath := ""
-	if spec.Role == protocol.RoleIngress && spec.Tunnel != nil {
-		if err := security.ValidateTunnelCertPEM(spec.Tunnel.CertPEM); err != nil {
-			return fmt.Errorf("rule %s: egress tunnel certificate unavailable: %w", key, err)
+	var caPaths []string
+	if protocol.IsTunnelClientRole(spec.Role) && spec.Tunnel != nil {
+		if len(spec.Targets) == 0 {
+			return fmt.Errorf("rule %s: no tunnel targets configured", key)
 		}
-		caPath = filepath.Join(g.workDir, fmt.Sprintf("gost-rule-%d-%s-ca.pem", spec.RuleID, spec.Role))
-		if err := security.WriteFileAtomic(caPath, []byte(spec.Tunnel.CertPEM), 0600); err != nil {
-			return err
+		caPaths = make([]string, len(spec.Targets))
+		for idx, t := range spec.Targets {
+			rawPEM := strings.TrimSpace(t.CertPEM)
+			if rawPEM == "" {
+				rawPEM = strings.TrimSpace(spec.Tunnel.CertPEM)
+			}
+			if rawPEM == "" {
+				cleanupGostFiles(caPaths)
+				return fmt.Errorf("rule %s: next-hop tunnel certificate unavailable for target %d", key, idx)
+			}
+			if err := security.ValidateTunnelCertPEM(rawPEM); err != nil {
+				cleanupGostFiles(caPaths)
+				return fmt.Errorf("rule %s: target %d tunnel certificate invalid: %w", key, idx, err)
+			}
+			if !strings.HasSuffix(rawPEM, "\n") {
+				rawPEM += "\n"
+			}
+			p := filepath.Join(g.workDir, fmt.Sprintf("gost-rule-%d-%s-ca-%d.pem", spec.RuleID, spec.Role, idx))
+			if err := security.WriteFileAtomic(p, []byte(rawPEM), 0600); err != nil {
+				cleanupGostFiles(caPaths)
+				return err
+			}
+			caPaths[idx] = p
 		}
 	}
 
-	cfgData, err := g.buildGostConfig(spec, caPath)
+	cfgData, err := g.buildGostConfig(spec, caPaths)
 	if err != nil {
-		if caPath != "" {
-			_ = os.Remove(caPath)
-		}
+		cleanupGostFiles(caPaths)
 		return err
 	}
 
 	cfgFile := filepath.Join(g.workDir, fmt.Sprintf("gost-rule-%d-%s.json", spec.RuleID, spec.Role))
 	if err := security.WriteFileAtomic(cfgFile, cfgData, 0600); err != nil {
+		cleanupGostFiles(caPaths)
 		return err
 	}
 
@@ -100,13 +130,15 @@ func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) erro
 	cmd := exec.CommandContext(procCtx, g.binPath, "-C", cfgFile)
 	if err := cmd.Start(); err != nil {
 		cancel()
+		_ = os.Remove(cfgFile)
+		cleanupGostFiles(caPaths)
 		return fmt.Errorf("failed to start gost for rule %s: %w", key, err)
 	}
 
 	proc := &gostRuleProcess{
 		spec:       spec,
 		configPath: cfgFile,
-		caPath:     caPath,
+		caPaths:    caPaths,
 		cmd:        cmd,
 		cancel:     cancel,
 	}
@@ -115,7 +147,7 @@ func (g *GostEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) erro
 	g.mu.Unlock()
 
 	acctProto := "tcp"
-	if spec.Role == protocol.RoleEgress && spec.Tunnel != nil && gostTunnelTransport(spec.Tunnel.Transport) == "quic" {
+	if protocol.IsTunnelServerRole(spec.Role) && spec.Tunnel != nil && gostTunnelTransport(spec.Tunnel.Transport) == "quic" {
 		acctProto = "udp"
 	}
 	sharedPortCounter.TrackPort(key, spec.ListenPort, acctProto)
@@ -169,26 +201,40 @@ func gostTunnelTransport(t string) string {
 	}
 }
 
-// buildGostConfig generates a GOST v3 JSON configuration for Relay, Ingress (chain -> relay+tls/wss/quic), or Egress.
-func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec, caPath string) ([]byte, error) {
-	listenAddr := fmt.Sprintf("%s:%d", spec.ListenHost, spec.ListenPort)
-	if spec.ListenHost == "" {
-		listenAddr = fmt.Sprintf(":%d", spec.ListenPort)
+// buildGostConfig generates a GOST v3 JSON configuration for Relay, Ingress, intermediate Hop, or Egress.
+func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec, caPaths []string) ([]byte, error) {
+	listenAddr := fmt.Sprintf(":%d", spec.ListenPort)
+	if cleanHost := strings.Trim(strings.TrimSpace(spec.ListenHost), "[]"); cleanHost != "" {
+		listenAddr = net.JoinHostPort(cleanHost, strconv.Itoa(spec.ListenPort))
+	}
+
+	pp := spec.ProxyProto
+	if pp == 0 && spec.Tunnel != nil {
+		pp = spec.Tunnel.ProxyProto
 	}
 
 	var nodes []map[string]any
 	for i, t := range spec.Targets {
-		nodes = append(nodes, map[string]any{
+		n := map[string]any{
 			"name": fmt.Sprintf("target-%d", i),
 			"addr": t.Address,
-		})
+		}
+		if (spec.Role == protocol.RoleRelay || spec.Role == protocol.RoleEgress) && (pp == 1 || pp == 2) {
+			n["metadata"] = map[string]any{
+				"proxyProtocol": fmt.Sprintf("%d", pp),
+			}
+		}
+		nodes = append(nodes, n)
 	}
+
+	isServer := protocol.IsTunnelServerRole(spec.Role) && spec.Tunnel != nil
+	isClient := protocol.IsTunnelClientRole(spec.Role) && spec.Tunnel != nil
 
 	handlerType := "tcp"
 	listenerMap := map[string]any{"type": "tcp"}
-	if spec.Role == protocol.RoleEgress && spec.Tunnel != nil {
+	if isServer {
 		if g.cert == nil {
-			return nil, fmt.Errorf("local tunnel certificate unavailable, refusing to start egress")
+			return nil, fmt.Errorf("local tunnel certificate unavailable, refusing to start %s", spec.Role)
 		}
 		handlerType = "relay"
 		listenerMap = map[string]any{
@@ -201,11 +247,14 @@ func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec, caPath string) ([]b
 	}
 
 	handlerMap := map[string]any{"type": handlerType}
-	if spec.Role == protocol.RoleEgress && spec.Tunnel != nil && spec.Tunnel.SecretKey != "" {
+	if isServer && spec.Tunnel.SecretKey != "" {
 		handlerMap["auth"] = map[string]any{
 			"username": fmt.Sprintf("rule-%d", spec.RuleID),
 			"password": spec.Tunnel.SecretKey,
 		}
+	}
+	if outIP := strings.Trim(strings.TrimSpace(spec.OutboundIP), "[]"); outIP != "" && !isClient {
+		handlerMap["metadata"] = map[string]any{"interface": outIP}
 	}
 
 	service := map[string]any{
@@ -216,18 +265,19 @@ func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec, caPath string) ([]b
 	}
 
 	var chains []map[string]any
-	if spec.Role == protocol.RoleIngress && spec.Tunnel != nil {
-		if caPath == "" {
-			return nil, fmt.Errorf("egress tunnel certificate unavailable")
+	if isClient {
+		if len(caPaths) != len(spec.Targets) {
+			return nil, fmt.Errorf("next-hop tunnel certificate unavailable")
 		}
 		dialerType := gostTunnelTransport(spec.Tunnel.Transport)
-		chainName := fmt.Sprintf("chain-%d", spec.RuleID)
-		service["handler"] = map[string]any{
-			"type":  "tcp",
-			"chain": chainName,
-		}
-		service["forwarder"] = map[string]any{
-			"nodes": nodes,
+		chainName := fmt.Sprintf("chain-%d-%s", spec.RuleID, spec.Role)
+		handlerMap["chain"] = chainName
+		service["handler"] = handlerMap
+		if !isServer {
+			// Ingress forwards user's target via the relay chain; Hop relays whatever target Egress resolves
+			service["forwarder"] = map[string]any{
+				"nodes": nodes,
+			}
 		}
 		connectorMap := map[string]any{"type": "relay"}
 		if spec.Tunnel.SecretKey != "" {
@@ -236,28 +286,52 @@ func (g *GostEngine) buildGostConfig(spec protocol.RuleSpec, caPath string) ([]b
 				"password": spec.Tunnel.SecretKey,
 			}
 		}
+
+		var hopNodes []map[string]any
+		for idx, t := range spec.Targets {
+			if caPaths[idx] == "" {
+				return nil, fmt.Errorf("next-hop tunnel certificate unavailable for target %d", idx)
+			}
+			dialerMap := map[string]any{
+				"type": dialerType,
+				"tls": map[string]any{
+					"secure":     true,
+					"serverName": protocol.TunnelServerName,
+					"caFile":     caPaths[idx],
+				},
+			}
+			if outIP := strings.Trim(strings.TrimSpace(spec.OutboundIP), "[]"); outIP != "" {
+				dialerMap["metadata"] = map[string]any{"interface": outIP}
+			}
+			hopNodes = append(hopNodes, map[string]any{
+				"name":      fmt.Sprintf("peer-%d", idx),
+				"addr":      t.Address,
+				"connector": connectorMap,
+				"dialer":    dialerMap,
+			})
+		}
+
+		hopMap := map[string]any{
+			"name":  "hop-0",
+			"nodes": hopNodes,
+		}
+		if len(hopNodes) > 1 {
+			strat := "round"
+			if spec.LoadBalance == "failover" {
+				strat = "fifo"
+			} else if spec.LoadBalance == "random" {
+				strat = "rand"
+			}
+			hopMap["selector"] = map[string]any{
+				"strategy":    strat,
+				"maxFails":    2,
+				"failTimeout": "15s",
+			}
+		}
+
 		chains = append(chains, map[string]any{
 			"name": chainName,
-			"hops": []map[string]any{
-				{
-					"name": "hop-0",
-					"nodes": []map[string]any{
-						{
-							"name":      "egress-node",
-							"addr":      spec.Targets[0].Address,
-							"connector": connectorMap,
-							"dialer": map[string]any{
-								"type": dialerType,
-								"tls": map[string]any{
-									"secure":     true,
-									"serverName": protocol.TunnelServerName,
-									"caFile":     caPath,
-								},
-							},
-						},
-					},
-				},
-			},
+			"hops": []map[string]any{hopMap},
 		})
 	} else {
 		service["forwarder"] = map[string]any{
@@ -291,9 +365,7 @@ func (g *GostEngine) RemoveRule(ruleKey string, ruleID uint64, role protocol.Rul
 		_ = proc.cmd.Process.Kill()
 	}
 	_ = os.Remove(proc.configPath)
-	if proc.caPath != "" {
-		_ = os.Remove(proc.caPath)
-	}
+	cleanupGostFiles(proc.caPaths)
 	return nil
 }
 

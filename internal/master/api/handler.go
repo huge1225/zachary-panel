@@ -320,6 +320,12 @@ func (s *Server) SetupRouter() *gin.Engine {
 				admin.PUT("/lines/:id", s.handleAdminUpdateLine)
 				admin.DELETE("/lines/:id", s.handleAdminDeleteLine)
 
+				admin.GET("/dns-failover", s.handleAdminListDNSFailover)
+				admin.POST("/dns-failover", s.handleAdminCreateDNSFailover)
+				admin.PUT("/dns-failover/:id", s.handleAdminUpdateDNSFailover)
+				admin.DELETE("/dns-failover/:id", s.handleAdminDeleteDNSFailover)
+				admin.POST("/dns-failover/:id/reconcile", s.handleAdminReconcileDNSFailover)
+
 				admin.POST("/plans", s.handleAdminCreatePlan)
 				admin.PUT("/plans/:id", s.handleAdminUpdatePlan)
 				admin.DELETE("/plans/:id", s.handleAdminDeletePlan)
@@ -597,18 +603,23 @@ func (s *Server) handleGetSiteConfig(c *gin.Context) {
 		strings.TrimSpace(cfg.EpayKey) != ""
 	usdtEnabled := cfg.PaymentEnabled && strings.TrimSpace(cfg.USDTAddress) != ""
 	c.JSON(http.StatusOK, gin.H{
-		"site_name":                   cfg.SiteName,
-		"site_logo":                   cfg.SiteLogo,
-		"announcement":                cfg.Announcement,
-		"allow_register":              cfg.AllowRegister,
-		"payment_enabled":             cfg.PaymentEnabled,
-		"epay_enabled":                epayEnabled,
-		"usdt_enabled":                usdtEnabled,
-		"usdt_address":                cfg.USDTAddress,
-		"recharge_notice":             cfg.RechargeNotice,
-		"affiliate_enabled":           cfg.AffiliateEnabled,
-		"affiliate_commission_rate":   sanitizeAffiliateRate(cfg.AffiliateCommissionRate),
+		"site_name":                    cfg.SiteName,
+		"site_logo":                    cfg.SiteLogo,
+		"announcement":                 cfg.Announcement,
+		"allow_register":               cfg.AllowRegister,
+		"payment_enabled":              cfg.PaymentEnabled,
+		"epay_enabled":                 epayEnabled,
+		"usdt_enabled":                 usdtEnabled,
+		"usdt_address":                 cfg.USDTAddress,
+		"recharge_notice":              cfg.RechargeNotice,
+		"affiliate_enabled":            cfg.AffiliateEnabled,
+		"affiliate_commission_rate":    sanitizeAffiliateRate(cfg.AffiliateCommissionRate),
 		"affiliate_min_withdraw_cents": cfg.AffiliateMinWithdrawCents,
+		"offpeak_enabled":              cfg.OffPeakEnabled,
+		"offpeak_start":                cfg.OffPeakStart,
+		"offpeak_end":                  cfg.OffPeakEnd,
+		"offpeak_multiplier":           cfg.OffPeakMultiplier,
+		"offpeak_timezone":             cfg.OffPeakTimezone,
 	})
 }
 
@@ -646,6 +657,11 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 		AffiliateEnabled          *bool    `json:"affiliate_enabled"`
 		AffiliateCommissionRate   *float64 `json:"affiliate_commission_rate"`
 		AffiliateMinWithdrawCents *int64   `json:"affiliate_min_withdraw_cents"`
+		OffPeakEnabled            *bool    `json:"offpeak_enabled"`
+		OffPeakStart              *string  `json:"offpeak_start"`
+		OffPeakEnd                *string  `json:"offpeak_end"`
+		OffPeakMultiplier         *float64 `json:"offpeak_multiplier"`
+		OffPeakTimezone           *string  `json:"offpeak_timezone"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -759,8 +775,51 @@ func (s *Server) handleAdminUpdateSettings(c *gin.Context) {
 		}
 		cfg.AffiliateMinWithdrawCents = *req.AffiliateMinWithdrawCents
 	}
+	if req.OffPeakEnabled != nil {
+		cfg.OffPeakEnabled = *req.OffPeakEnabled
+	}
+	if req.OffPeakStart != nil {
+		v := strings.TrimSpace(*req.OffPeakStart)
+		if v != "" {
+			if _, err := service.ParseClockHHMM(v); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "闲时开始" + err.Error()})
+				return
+			}
+			cfg.OffPeakStart = v
+		}
+	}
+	if req.OffPeakEnd != nil {
+		v := strings.TrimSpace(*req.OffPeakEnd)
+		if v != "" {
+			if _, err := service.ParseClockHHMM(v); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "闲时结束" + err.Error()})
+				return
+			}
+			cfg.OffPeakEnd = v
+		}
+	}
+	if req.OffPeakMultiplier != nil {
+		if math.IsNaN(*req.OffPeakMultiplier) || math.IsInf(*req.OffPeakMultiplier, 0) || *req.OffPeakMultiplier < 0.01 || *req.OffPeakMultiplier > 100 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "闲时流量倍率需在 0.01 - 100 之间"})
+			return
+		}
+		cfg.OffPeakMultiplier = *req.OffPeakMultiplier
+	}
+	if req.OffPeakTimezone != nil {
+		tz := strings.TrimSpace(*req.OffPeakTimezone)
+		if tz == "" {
+			tz = "Asia/Shanghai"
+		}
+		if tz != "Asia/Shanghai" && tz != "UTC" && tz != "CST" {
+			if _, err := time.LoadLocation(tz); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("无效的时区标识 %q（示例: Asia/Shanghai 或 UTC）", tz)})
+				return
+			}
+		}
+		cfg.OffPeakTimezone = truncateUTF8(tz, 64)
+	}
 	s.db.Save(&cfg)
-	s.recordAudit(c, "admin.update_settings", cfg.SiteName, "更新系统设置、推广返利、支付网关或告警配置")
+	s.recordAudit(c, "admin.update_settings", cfg.SiteName, "更新系统设置、闲时倍率、推广返利、支付网关或告警配置")
 	c.JSON(http.StatusOK, maskSystemConfig(cfg))
 }
 
@@ -851,15 +910,19 @@ func (s *Server) handleTelemetry(c *gin.Context) {
 	}
 
 	type ruleDelta struct {
-		ID          uint64 `json:"id"`
-		UploadBytes int64  `json:"upload_bytes"`
-		DownBytes   int64  `json:"down_bytes"`
-		BilledBytes int64  `json:"billed_bytes"`
-		Enabled     bool   `json:"enabled"`
-		Status      string `json:"status"`
+		ID              uint64 `json:"id"`
+		UploadBytes     int64  `json:"upload_bytes"`
+		DownBytes       int64  `json:"down_bytes"`
+		BilledBytes     int64  `json:"billed_bytes"`
+		DailyUsedBytes  int64  `json:"daily_used_bytes"`
+		DailyResetDate  string `json:"daily_reset_date"`
+		RuleQuotaBytes  int64  `json:"rule_quota_bytes"`
+		DailyQuotaBytes int64  `json:"daily_quota_bytes"`
+		Enabled         bool   `json:"enabled"`
+		Status          string `json:"status"`
 	}
 	var rules []ruleDelta
-	q := s.db.Model(&model.ForwardRule{}).Select("id, upload_bytes, down_bytes, billed_bytes, enabled, status")
+	q := s.db.Model(&model.ForwardRule{}).Select("id, upload_bytes, down_bytes, billed_bytes, daily_used_bytes, daily_reset_date, rule_quota_bytes, daily_quota_bytes, enabled, status")
 	if !s.isAdmin(c) {
 		q = q.Where("user_id = ?", uid)
 	}
@@ -873,9 +936,87 @@ func (s *Server) handleTelemetry(c *gin.Context) {
 	})
 }
 
+func collectNodeAllowedIPList(n model.Node) []string {
+	var ips []string
+	seen := make(map[string]struct{})
+	for _, raw := range append([]string{n.OutboundIP}, strings.Split(n.AllowedOutboundIPs, ",")...) {
+		v := strings.TrimSpace(raw)
+		if v != "" {
+			if _, dup := seen[v]; !dup {
+				seen[v] = struct{}{}
+				ips = append(ips, v)
+			}
+		}
+	}
+	return ips
+}
+
+func (s *Server) populateLineAllowedOutboundIPs(lines []model.TunnelLine) {
+	if len(lines) == 0 {
+		return
+	}
+	var nodes []model.Node
+	s.db.Select("id, outbound_ip, allowed_outbound_ips").Find(&nodes)
+	nodeMap := make(map[uint64]model.Node, len(nodes))
+	for _, n := range nodes {
+		nodeMap[n.ID] = n
+	}
+	for i := range lines {
+		if lines[i].Type == "encrypt" {
+			ems := lines[i].EgressMembers()
+			if len(ems) > 0 {
+				var common []string
+				for idx, em := range ems {
+					n, ok := nodeMap[em.NodeID]
+					if !ok {
+						common = nil
+						break
+					}
+					if idx == 0 {
+						common = collectNodeAllowedIPList(n)
+					} else {
+						filtered := common[:0]
+						for _, ip := range common {
+							if n.AllowsOutboundIP(ip, false) {
+								filtered = append(filtered, ip)
+							}
+						}
+						common = filtered
+					}
+				}
+				lines[i].AllowedOutboundIPs = strings.Join(common, ",")
+				continue
+			}
+		}
+		if n, ok := nodeMap[lines[i].IngressNodeID]; ok {
+			lines[i].AllowedOutboundIPs = strings.Join(collectNodeAllowedIPList(n), ",")
+		}
+	}
+}
+
+func sanitizeRuleForClient(r *model.ForwardRule, isAdmin bool) {
+	if r == nil || isAdmin {
+		return
+	}
+	r.HopPortsJSON = ""
+	r.EgressPortsJSON = ""
+	r.RelayPort = 0
+	r.RelayNodeID = 0
+}
+
+func sanitizeRulesForClient(rules []model.ForwardRule, isAdmin bool) {
+	if isAdmin {
+		return
+	}
+	for i := range rules {
+		sanitizeRuleForClient(&rules[i], false)
+	}
+}
+
 func (s *Server) handleListLines(c *gin.Context) {
 	var lines []model.TunnelLine
 	s.db.Order("id asc").Find(&lines)
+	s.populateLineAllowedOutboundIPs(lines)
 	if s.isAdmin(c) {
 		c.JSON(http.StatusOK, lines)
 		return
@@ -889,6 +1030,10 @@ func (s *Server) handleListLines(c *gin.Context) {
 	authorized := make([]model.TunnelLine, 0)
 	for _, l := range lines {
 		if l.Enabled && user.HasTunnelPermission(l.ID) {
+			// Mask internal hop/egress topology node IDs from non-admin tenants
+			l.HopNodeIDs = ""
+			l.EgressNodeIDs = ""
+			l.EgressNodeID = 0
 			authorized = append(authorized, l)
 		}
 	}
@@ -939,9 +1084,10 @@ func respondListPayload(c *gin.Context, items any, total int64, page, pageSize i
 
 func (s *Server) handleListRules(c *gin.Context) {
 	uid := s.currentUserID(c)
+	isAdmin := s.isAdmin(c)
 	var rules []model.ForwardRule
 	query := s.db.Model(&model.ForwardRule{})
-	if !s.isAdmin(c) || c.Query("all") != "1" {
+	if !isAdmin || c.Query("all") != "1" {
 		query = query.Where("user_id = ?", uid)
 	} else if uidParam := strings.TrimSpace(c.Query("user_id")); uidParam != "" {
 		if filterUID, err := strconv.ParseUint(uidParam, 10, 64); err == nil && filterUID > 0 {
@@ -962,9 +1108,9 @@ func (s *Server) handleListRules(c *gin.Context) {
 	if q := strings.TrimSpace(c.Query("q")); q != "" {
 		like := buildSafeLike(q)
 		if portNum, err := strconv.Atoi(q); err == nil && portNum > 0 {
-			query = query.Where(`(name LIKE ? ESCAPE '!' OR targets_json LIKE ? ESCAPE '!' OR listen_port = ?)`, like, like, portNum)
+			query = query.Where(`(name LIKE ? ESCAPE '!' OR targets_json LIKE ? ESCAPE '!' OR match_domains LIKE ? ESCAPE '!' OR listen_port = ?)`, like, like, like, portNum)
 		} else {
-			query = query.Where(`(name LIKE ? ESCAPE '!' OR targets_json LIKE ? ESCAPE '!')`, like, like)
+			query = query.Where(`(name LIKE ? ESCAPE '!' OR targets_json LIKE ? ESCAPE '!' OR match_domains LIKE ? ESCAPE '!')`, like, like, like)
 		}
 	}
 	var total int64
@@ -973,19 +1119,24 @@ func (s *Server) handleListRules(c *gin.Context) {
 	page, pageSize, pagedEnvelope := parseListPagination(c, 500, 1000)
 	query.Order("id desc").Offset((page - 1) * pageSize).Limit(pageSize).Find(&rules)
 	s.fillEffectiveEngines(rules)
+	sanitizeRulesForClient(rules, isAdmin)
 	respondListPayload(c, rules, total, page, pageSize, pagedEnvelope)
 }
 
 // fillEffectiveEngines sets the read-only EffectiveEngine field so the UI shows the engine actually running.
-// Batch-fetches rule owners in a single WHERE id IN (?) query to eliminate N+1 round-trips.
+// Batch-fetches rule owners and tunnel lines in O(1) queries to eliminate N+1 round-trips.
 func (s *Server) fillEffectiveEngines(rules []model.ForwardRule) {
 	if len(rules) == 0 {
 		return
 	}
 	uidSet := make(map[uint64]struct{}, len(rules))
+	lineSet := make(map[uint64]struct{}, len(rules))
 	for i := range rules {
 		if rules[i].UserID > 0 {
 			uidSet[rules[i].UserID] = struct{}{}
+		}
+		if rules[i].TunnelLineID > 0 {
+			lineSet[rules[i].TunnelLineID] = struct{}{}
 		}
 	}
 	users := make(map[uint64]*model.User, len(uidSet))
@@ -1000,25 +1151,42 @@ func (s *Server) fillEffectiveEngines(rules []model.ForwardRule) {
 			users[fetched[i].ID] = &fetched[i]
 		}
 	}
+	lines := make(map[uint64]*model.TunnelLine, len(lineSet))
+	if len(lineSet) > 0 {
+		lids := make([]uint64, 0, len(lineSet))
+		for id := range lineSet {
+			lids = append(lids, id)
+		}
+		var fetchedLines []model.TunnelLine
+		s.db.Where("id IN ?", lids).Find(&fetchedLines)
+		for i := range fetchedLines {
+			lines[fetchedLines[i].ID] = &fetchedLines[i]
+		}
+	}
 	for i := range rules {
-		rules[i].EffectiveEngine = service.EffectiveEngine(&rules[i], users[rules[i].UserID])
+		rules[i].EffectiveEngine = service.EffectiveEngineForLine(&rules[i], users[rules[i].UserID], lines[rules[i].TunnelLineID])
 	}
 }
 
 type ruleCreateUpdateReq struct {
-	Name          string                    `json:"name" binding:"required"`
-	Mode          string                    `json:"mode"`            // "direct" | "tunnel"
-	IngressNodeID uint64                    `json:"ingress_node_id"` // Mode=="direct" 时必选
-	TunnelLineID  uint64                    `json:"tunnel_line_id"`  // Mode=="tunnel" 时必选
-	Engine        protocol.EngineType       `json:"engine"`          // "native" | "gost" | "realm" | "nftables"
-	Protocol      string                    `json:"protocol"`        // "tcp" | "udp" | "both"
-	ListenPort    int                       `json:"listen_port"`     // 0 表示自动从节点端口池分配
-	PortRange     string                    `json:"port_range"`      // 批量导入时支持端口段如 "20201-20205"
-	LoadBalance   string                    `json:"load_balance"`    // "round_robin" | "failover"
-	Targets       []protocol.TargetEndpoint `json:"targets" binding:"required"`
-	SpeedMbps     int                       `json:"speed_mbps"`
-	AccessMode    string                    `json:"access_mode"`  // "off" | "allow" | "deny"
-	AccessCIDRs   string                    `json:"access_cidrs"` // 逗号分隔的 IP 或 CIDR
+	Name            string                    `json:"name" binding:"required"`
+	Mode            string                    `json:"mode"`            // "direct" | "tunnel"
+	IngressNodeID   uint64                    `json:"ingress_node_id"` // Mode=="direct" 时必选
+	TunnelLineID    uint64                    `json:"tunnel_line_id"`  // Mode=="tunnel" 时必选
+	Engine          protocol.EngineType       `json:"engine"`          // "native" | "gost" | "realm" | "nftables"
+	Protocol        string                    `json:"protocol"`        // "tcp" | "udp" | "both"
+	ListenPort      int                       `json:"listen_port"`     // 0 表示自动从节点端口池分配
+	PortRange       string                    `json:"port_range"`      // 批量导入时支持端口段如 "20201-20205"
+	LoadBalance     string                    `json:"load_balance"`    // "round_robin" | "weighted" | "least_rtt" | "failover" | "random"
+	Targets         []protocol.TargetEndpoint `json:"targets" binding:"required"`
+	SpeedMbps       int                       `json:"speed_mbps"`
+	AccessMode      string                    `json:"access_mode"`       // "off" | "allow" | "deny"
+	AccessCIDRs     string                    `json:"access_cidrs"`      // 逗号分隔的 IP 或 CIDR
+	ProxyProtocol   *int                      `json:"proxy_protocol"`    // 0=继承隧道/关闭, 1=v1, 2=v2, -1=强制关闭
+	MatchDomains    *string                   `json:"match_domains"`     // SNI / HTTP Host 共享端口域名
+	OutboundIP      *string                   `json:"outbound_ip"`       // 指定出站源 IP
+	RuleQuotaBytes  *int64                    `json:"rule_quota_bytes"`  // 单规则累计流量上限 (0=不限)
+	DailyQuotaBytes *int64                    `json:"daily_quota_bytes"` // 单规则每日流量上限 (0=不限)
 }
 
 func validateRuleAccessACL(mode, cidrs string) (string, string, error) {
@@ -1067,6 +1235,9 @@ func expandBatchRuleItems(items []ruleCreateUpdateReq) ([]ruleCreateUpdateReq, e
 		if pr == "" {
 			expanded = append(expanded, item)
 			continue
+		}
+		if item.MatchDomains != nil && strings.TrimSpace(*item.MatchDomains) != "" {
+			return nil, fmt.Errorf("规则「%s」配置了共享端口域名路由，不支持同时展开端口段", item.Name)
 		}
 		startP, endP, err := utils.ParsePortRange(pr)
 		if err != nil || startP <= 0 || endP < startP {
@@ -1128,7 +1299,7 @@ func validateRuleInput(name, proto, lb string, targets []protocol.TargetEndpoint
 		return fmt.Errorf("不支持的协议类型 %q", proto)
 	}
 	switch lb {
-	case "", "round_robin", "failover", "random":
+	case "", "round_robin", "weighted", "least_rtt", "failover", "random":
 	default:
 		return fmt.Errorf("不支持的负载均衡策略 %q", lb)
 	}
@@ -1139,8 +1310,8 @@ func validateRuleInput(name, proto, lb string, targets []protocol.TargetEndpoint
 		if len(t.Address) > 255 {
 			return fmt.Errorf("目标地址过长")
 		}
-		if t.Weight < 0 || t.Weight > 1000 {
-			return fmt.Errorf("目标权重需在 0-1000 之间")
+		if t.Weight < 0 || t.Weight > 10000 {
+			return fmt.Errorf("目标权重需在 0-10000 之间")
 		}
 		// 内网目标默认拦截；仅当面板显式设置 NEXUS_ALLOW_PRIVATE_TARGETS=true（且节点也开启 -allow-private-targets）时放行
 		if err := security.ValidateTargetAddress(t.Address, os.Getenv("NEXUS_ALLOW_PRIVATE_TARGETS") == "true"); err != nil {
@@ -1148,6 +1319,62 @@ func validateRuleInput(name, proto, lb string, targets []protocol.TargetEndpoint
 		}
 	}
 	return nil
+}
+
+const maxRuleQuotaCeiling int64 = 1 << 50 // 1 PiB ceiling
+
+// validateRuleNextGenOptions validates ProxyProtocol, MatchDomains, OutboundIP RBAC, and Rule/Daily Quotas.
+func (s *Server) validateRuleNextGenOptions(proto string, proxyProto int, rawDomains, rawOutIP string, ruleQuota, dailyQuota int64, ingressNodeID uint64, line *model.TunnelLine, isAdmin bool) (cleanDomains string, cleanOutIP string, status int, err error) {
+	if proxyProto < -1 || proxyProto > 2 {
+		return "", "", http.StatusBadRequest, fmt.Errorf("无效的 PROXY Protocol 版本（仅支持 -1=强制关闭, 0=默认, 1=v1, 2=v2）")
+	}
+	effPP := proxyProto
+	if effPP == 0 && line != nil {
+		effPP = line.ProxyProtocol
+	}
+	if effPP > 0 && proto == "udp" {
+		return "", "", http.StatusBadRequest, fmt.Errorf("纯 UDP 规则不支持开启 PROXY Protocol，请改用 TCP 或关闭 PROXY Protocol")
+	}
+
+	if strings.TrimSpace(rawDomains) != "" {
+		if proto != "tcp" {
+			return "", "", http.StatusBadRequest, fmt.Errorf("SNI / HTTP Host 共享端口域名路由仅支持 TCP 协议")
+		}
+		parsed, dErr := security.ParseAndValidateMatchDomains(rawDomains)
+		if dErr != nil {
+			return "", "", http.StatusBadRequest, fmt.Errorf("路由域名配置无效: %v", dErr)
+		}
+		cleanDomains = strings.Join(parsed, ",")
+	}
+
+	if strings.TrimSpace(rawOutIP) != "" {
+		parsedIP, oErr := security.ValidateOutboundIP(rawOutIP, os.Getenv("NEXUS_ALLOW_PRIVATE_TARGETS") == "true")
+		if oErr != nil || parsedIP == nil {
+			return "", "", http.StatusBadRequest, fmt.Errorf("出站源 IP 无效: %v", oErr)
+		}
+		cleanOutIP = parsedIP.String()
+		if line != nil && line.Type == "encrypt" && len(line.EgressMembers()) > 0 {
+			for _, em := range line.EgressMembers() {
+				var egNode model.Node
+				if s.db.First(&egNode, em.NodeID).Error != nil || !egNode.AllowsOutboundIP(cleanOutIP, isAdmin) {
+					return "", "", http.StatusForbidden, fmt.Errorf("无权在出口节点选用出站源 IP %s，仅可选择节点已授权的出站 IP", cleanOutIP)
+				}
+			}
+		} else if ingressNodeID > 0 {
+			var inNode model.Node
+			if s.db.First(&inNode, ingressNodeID).Error != nil || !inNode.AllowsOutboundIP(cleanOutIP, isAdmin) {
+				return "", "", http.StatusForbidden, fmt.Errorf("无权在入口节点选用出站源 IP %s，仅可选择节点已授权的出站 IP", cleanOutIP)
+			}
+		}
+	}
+
+	if ruleQuota < 0 || ruleQuota > maxRuleQuotaCeiling {
+		return "", "", http.StatusBadRequest, fmt.Errorf("单规则累计流量上限数值超出有效范围")
+	}
+	if dailyQuota < 0 || dailyQuota > maxRuleQuotaCeiling {
+		return "", "", http.StatusBadRequest, fmt.Errorf("单规则每日流量上限数值超出有效范围")
+	}
+	return cleanDomains, cleanOutIP, 0, nil
 }
 
 // checkNodeAddressTargets rejects targets that point back at one of the panel's own nodes (e.g. a cloud public IP
@@ -1232,8 +1459,9 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 		return
 	}
 
+	isAdmin := s.isAdmin(c)
 	// 普通用户严禁绕过隧道直接指定节点，且必须具备所选隧道的使用权限
-	if !s.isAdmin(c) {
+	if !isAdmin {
 		if req.TunnelLineID == 0 {
 			c.JSON(http.StatusForbidden, gin.H{"error": "必须选择已授权的隧道创建转发"})
 			return
@@ -1269,18 +1497,19 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 	ruleMode := req.Mode
 	ruleEngine := req.Engine
 	var line model.TunnelLine
+	var linePtr *model.TunnelLine
 	if req.TunnelLineID > 0 {
-		if err := s.db.First(&line, req.TunnelLineID).Error; err != nil || (!line.Enabled && !s.isAdmin(c)) {
+		if err := s.db.First(&line, req.TunnelLineID).Error; err != nil || (!line.Enabled && !isAdmin) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "所选隧道不存在或已禁用"})
 			return
 		}
+		linePtr = &line
 		ingressNodeID = line.IngressNodeID
-		if line.Type == "encrypt" && line.EgressNodeID > 0 {
+		if line.Type == "encrypt" && len(line.EgressMembers()) > 0 {
 			ruleMode = "tunnel"
 		} else {
 			ruleMode = "direct"
 		}
-		// 转发方式在隧道创建时已固化，直接继承所属隧道的转发方式
 		if line.Engine != "" {
 			ruleEngine = line.Engine
 		}
@@ -1289,32 +1518,78 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 		return
 	}
 
-	targetsBytes, _ := json.Marshal(req.Targets)
+	proxyProto := 0
+	if req.ProxyProtocol != nil {
+		proxyProto = *req.ProxyProtocol
+	}
+	rawDomains := ""
+	if req.MatchDomains != nil {
+		rawDomains = *req.MatchDomains
+	}
+	rawOutIP := ""
+	if req.OutboundIP != nil {
+		rawOutIP = *req.OutboundIP
+	}
+	ruleQuota := int64(0)
+	if req.RuleQuotaBytes != nil {
+		ruleQuota = *req.RuleQuotaBytes
+	}
+	dailyQuota := int64(0)
+	if req.DailyQuotaBytes != nil {
+		dailyQuota = *req.DailyQuotaBytes
+	}
+
+	cleanDomains, cleanOutIP, optStatus, optErr := s.validateRuleNextGenOptions(
+		req.Protocol, proxyProto, rawDomains, rawOutIP, ruleQuota, dailyQuota, ingressNodeID, linePtr, isAdmin,
+	)
+	if optErr != nil {
+		c.JSON(optStatus, gin.H{"error": optErr.Error()})
+		return
+	}
+
+	// Sanitize client-supplied TargetEndpoint fields so users cannot inject CertPEM/NodeID on backend targets
+	sanitizedTargets := make([]protocol.TargetEndpoint, 0, len(req.Targets))
+	for _, t := range req.Targets {
+		sanitizedTargets = append(sanitizedTargets, protocol.TargetEndpoint{
+			Address: strings.TrimSpace(t.Address),
+			Weight:  t.Weight,
+			Backup:  t.Backup,
+		})
+	}
+	targetsBytes, _ := json.Marshal(sanitizedTargets)
 	aclMode, aclCIDRs, aclErr := validateRuleAccessACL(req.AccessMode, req.AccessCIDRs)
 	if aclErr != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": aclErr.Error()})
 		return
 	}
-	speedLimit := clampRuleSpeedMbps(req.SpeedMbps, user.SpeedMbps, s.isAdmin(c))
+	speedLimit := clampRuleSpeedMbps(req.SpeedMbps, user.SpeedMbps, isAdmin)
 	rule := model.ForwardRule{
-		UserID:        uid,
-		Name:          req.Name,
-		Mode:          ruleMode,
-		IngressNodeID: ingressNodeID,
-		TunnelLineID:  req.TunnelLineID,
-		Engine:        ruleEngine,
-		Protocol:      req.Protocol,
-		LoadBalance:   req.LoadBalance,
-		TargetsJSON:   string(targetsBytes),
-		SpeedMbps:     speedLimit,
-		AccessMode:    aclMode,
-		AccessCIDRs:   aclCIDRs,
-		Enabled:       true,
-		Status:        "running",
+		UserID:          uid,
+		Name:            req.Name,
+		Mode:            ruleMode,
+		IngressNodeID:   ingressNodeID,
+		TunnelLineID:    req.TunnelLineID,
+		Engine:          ruleEngine,
+		Protocol:        req.Protocol,
+		LoadBalance:     req.LoadBalance,
+		TargetsJSON:     string(targetsBytes),
+		SpeedMbps:       speedLimit,
+		AccessMode:      aclMode,
+		AccessCIDRs:     aclCIDRs,
+		ProxyProtocol:   proxyProto,
+		MatchDomains:    cleanDomains,
+		OutboundIP:      cleanOutIP,
+		RuleQuotaBytes:  ruleQuota,
+		DailyQuotaBytes: dailyQuota,
+		Enabled:         true,
+		Status:          "running",
 	}
 
-	// Quota checks, port allocation and insert are serialized to prevent concurrent requests from exceeding
-	// quotas or allocating the same port twice.
+	if !s.orch.RuleNodesWithinQuota(&rule) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "所选隧道或节点月流量配额已耗尽，暂时无法创建转发规则"})
+		return
+	}
+
 	status, err := 0, error(nil)
 	_ = s.orch.WithAllocLock(func() error {
 		var currentCount int64
@@ -1331,12 +1606,13 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 				return err
 			}
 		}
-		allocPort, aerr := s.orch.AllocatePortForNode(ingressNodeID, req.ListenPort, line.PortRange)
+		allocPort, normDomains, aerr := s.orch.AllocateIngressPortForRule(ingressNodeID, req.ListenPort, cleanDomains, 0, line.PortRange)
 		if aerr != nil {
 			status, err = http.StatusBadRequest, aerr
 			return err
 		}
 		rule.ListenPort = allocPort
+		rule.MatchDomains = normDomains
 		if cerr := s.db.Create(&rule).Error; cerr != nil {
 			log.Printf("[API] create rule failed: %v", cerr)
 			status, err = http.StatusInternalServerError, fmt.Errorf("创建规则失败，请稍后再试")
@@ -1350,7 +1626,8 @@ func (s *Server) handleCreateRule(c *gin.Context) {
 	}
 
 	s.orch.DispatchRule(&rule)
-	rule.EffectiveEngine = service.EffectiveEngine(&rule, &user)
+	rule.EffectiveEngine = service.EffectiveEngineForLine(&rule, &user, linePtr)
+	sanitizeRuleForClient(&rule, isAdmin)
 	c.JSON(http.StatusCreated, rule)
 }
 
@@ -1427,19 +1704,30 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 		return
 	}
 
-	if !s.isAdmin(c) && !user.HasTunnelPermission(req.TunnelLineID) {
+	isAdmin := s.isAdmin(c)
+	if !isAdmin && !user.HasTunnelPermission(req.TunnelLineID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "无权使用该隧道，请联系管理员分配权限"})
 		return
 	}
 
 	var line model.TunnelLine
-	if err := s.db.First(&line, req.TunnelLineID).Error; err != nil || (!line.Enabled && !s.isAdmin(c)) {
+	if err := s.db.First(&line, req.TunnelLineID).Error; err != nil || (!line.Enabled && !isAdmin) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "所选隧道不存在或已禁用"})
 		return
 	}
 
+	proto := req.Protocol
+	if proto == "" {
+		proto = "tcp"
+	}
+
 	for i := range req.Items {
 		req.Items[i].Name = strings.TrimSpace(req.Items[i].Name)
+		itemProto := req.Items[i].Protocol
+		if itemProto == "" {
+			itemProto = proto
+		}
+		req.Items[i].Protocol = itemProto
 		item := req.Items[i]
 		if err := validateRuleInput(item.Name, item.Protocol, item.LoadBalance, item.Targets); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("规则「%s」: %v", item.Name, err)})
@@ -1456,15 +1744,49 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 		}
 		req.Items[i].AccessMode = aclMode
 		req.Items[i].AccessCIDRs = aclCIDRs
+
+		pp := 0
+		if item.ProxyProtocol != nil {
+			pp = *item.ProxyProtocol
+		}
+		md := ""
+		if item.MatchDomains != nil {
+			md = *item.MatchDomains
+		}
+		oip := ""
+		if item.OutboundIP != nil {
+			oip = *item.OutboundIP
+		}
+		rq := int64(0)
+		if item.RuleQuotaBytes != nil {
+			rq = *item.RuleQuotaBytes
+		}
+		dq := int64(0)
+		if item.DailyQuotaBytes != nil {
+			dq = *item.DailyQuotaBytes
+		}
+		cleanMD, cleanOIP, optSt, optErr := s.validateRuleNextGenOptions(itemProto, pp, md, oip, rq, dq, line.IngressNodeID, &line, isAdmin)
+		if optErr != nil {
+			c.JSON(optSt, gin.H{"error": fmt.Sprintf("规则「%s」: %v", item.Name, optErr)})
+			return
+		}
+		req.Items[i].MatchDomains = &cleanMD
+		req.Items[i].OutboundIP = &cleanOIP
 	}
 
 	ruleMode := "direct"
-	if line.Type == "encrypt" && line.EgressNodeID > 0 {
+	if line.Type == "encrypt" && len(line.EgressMembers()) > 0 {
 		ruleMode = "tunnel"
 	}
-	proto := req.Protocol
-	if proto == "" {
-		proto = "tcp"
+
+	probeRule := model.ForwardRule{
+		Mode:          ruleMode,
+		IngressNodeID: line.IngressNodeID,
+		TunnelLineID:  line.ID,
+	}
+	if !s.orch.RuleNodesWithinQuota(&probeRule) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "所选隧道或节点月流量配额已耗尽，暂时无法批量创建规则"})
+		return
 	}
 
 	var created []model.ForwardRule
@@ -1485,37 +1807,66 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 			}
 		}
 		for _, item := range req.Items {
-			allocPort, aerr := s.orch.AllocatePortForNode(line.IngressNodeID, item.ListenPort, line.PortRange)
+			md := ""
+			if item.MatchDomains != nil {
+				md = *item.MatchDomains
+			}
+			allocPort, normMD, aerr := s.orch.AllocateIngressPortForRule(line.IngressNodeID, item.ListenPort, md, 0, line.PortRange)
 			if aerr != nil {
 				status, err = http.StatusBadRequest, fmt.Errorf("规则「%s」端口分配失败: %v", item.Name, aerr)
 				return err
-			}
-			itemProto := item.Protocol
-			if itemProto == "" {
-				itemProto = proto
 			}
 			lb := item.LoadBalance
 			if lb == "" {
 				lb = "round_robin"
 			}
-			speedLimit := clampRuleSpeedMbps(item.SpeedMbps, user.SpeedMbps, s.isAdmin(c))
-			targetsBytes, _ := json.Marshal(item.Targets)
+			pp := 0
+			if item.ProxyProtocol != nil {
+				pp = *item.ProxyProtocol
+			}
+			oip := ""
+			if item.OutboundIP != nil {
+				oip = *item.OutboundIP
+			}
+			rq := int64(0)
+			if item.RuleQuotaBytes != nil {
+				rq = *item.RuleQuotaBytes
+			}
+			dq := int64(0)
+			if item.DailyQuotaBytes != nil {
+				dq = *item.DailyQuotaBytes
+			}
+			speedLimit := clampRuleSpeedMbps(item.SpeedMbps, user.SpeedMbps, isAdmin)
+			sanitizedTargets := make([]protocol.TargetEndpoint, 0, len(item.Targets))
+			for _, t := range item.Targets {
+				sanitizedTargets = append(sanitizedTargets, protocol.TargetEndpoint{
+					Address: strings.TrimSpace(t.Address),
+					Weight:  t.Weight,
+					Backup:  t.Backup,
+				})
+			}
+			targetsBytes, _ := json.Marshal(sanitizedTargets)
 			rule := model.ForwardRule{
-				UserID:        uid,
-				Name:          item.Name,
-				Mode:          ruleMode,
-				IngressNodeID: line.IngressNodeID,
-				TunnelLineID:  line.ID,
-				Engine:        line.Engine,
-				Protocol:      itemProto,
-				ListenPort:    allocPort,
-				LoadBalance:   lb,
-				TargetsJSON:   string(targetsBytes),
-				SpeedMbps:     speedLimit,
-				AccessMode:    item.AccessMode,
-				AccessCIDRs:   item.AccessCIDRs,
-				Enabled:       true,
-				Status:        "running",
+				UserID:          uid,
+				Name:            item.Name,
+				Mode:            ruleMode,
+				IngressNodeID:   line.IngressNodeID,
+				TunnelLineID:    line.ID,
+				Engine:          line.Engine,
+				Protocol:        item.Protocol,
+				ListenPort:      allocPort,
+				LoadBalance:     lb,
+				TargetsJSON:     string(targetsBytes),
+				SpeedMbps:       speedLimit,
+				AccessMode:      item.AccessMode,
+				AccessCIDRs:     item.AccessCIDRs,
+				ProxyProtocol:   pp,
+				MatchDomains:    normMD,
+				OutboundIP:      oip,
+				RuleQuotaBytes:  rq,
+				DailyQuotaBytes: dq,
+				Enabled:         true,
+				Status:          "running",
 			}
 			if cerr := s.db.Create(&rule).Error; cerr != nil {
 				log.Printf("[API] batch create rule failed: %v", cerr)
@@ -1529,6 +1880,7 @@ func (s *Server) handleBatchCreateRules(c *gin.Context) {
 		s.orch.DispatchRule(&created[i])
 	}
 	s.fillEffectiveEngines(created)
+	sanitizeRulesForClient(created, isAdmin)
 	if err != nil {
 		msg := err.Error()
 		if len(created) > 0 {
@@ -1547,7 +1899,8 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "规则不存在"})
 		return
 	}
-	if rule.UserID != s.currentUserID(c) && !s.isAdmin(c) {
+	isAdmin := s.isAdmin(c)
+	if rule.UserID != s.currentUserID(c) && !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "无权修改此规则"})
 		return
 	}
@@ -1583,33 +1936,50 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 	if req.TunnelLineID > 0 {
 		targetTunnelID = req.TunnelLineID
 	}
-	if !s.isAdmin(c) && !owner.HasTunnelPermission(targetTunnelID) {
+	if !isAdmin && !owner.HasTunnelPermission(targetTunnelID) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "无权使用该隧道，请联系管理员分配权限"})
 		return
 	}
 
 	oldRule := rule
-	targetsBytes, _ := json.Marshal(req.Targets)
+	sanitizedTargets := make([]protocol.TargetEndpoint, 0, len(req.Targets))
+	for _, t := range req.Targets {
+		sanitizedTargets = append(sanitizedTargets, protocol.TargetEndpoint{
+			Address: strings.TrimSpace(t.Address),
+			Weight:  t.Weight,
+			Backup:  t.Backup,
+		})
+	}
+	targetsBytes, _ := json.Marshal(sanitizedTargets)
 	rule.Name = req.Name
 
 	needRemoveOld := false
 	var newLine model.TunnelLine
+	var activeLinePtr *model.TunnelLine
 	switchLine := req.TunnelLineID > 0 && req.TunnelLineID != rule.TunnelLineID
 	if switchLine {
-		if err := s.db.First(&newLine, req.TunnelLineID).Error; err != nil || (!newLine.Enabled && !s.isAdmin(c)) {
+		if err := s.db.First(&newLine, req.TunnelLineID).Error; err != nil || (!newLine.Enabled && !isAdmin) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "所选隧道不存在或已禁用"})
 			return
 		}
+		activeLinePtr = &newLine
 		needRemoveOld = true
 		rule.TunnelLineID = newLine.ID
 		rule.IngressNodeID = newLine.IngressNodeID
 		rule.Engine = newLine.Engine
 		rule.RelayPort = 0
 		rule.RelayNodeID = 0
-		if newLine.Type == "encrypt" && newLine.EgressNodeID > 0 {
+		rule.HopPortsJSON = ""
+		rule.EgressPortsJSON = ""
+		if newLine.Type == "encrypt" && len(newLine.EgressMembers()) > 0 {
 			rule.Mode = "tunnel"
 		} else {
 			rule.Mode = "direct"
+		}
+	} else if rule.TunnelLineID > 0 {
+		var existingLine model.TunnelLine
+		if s.db.First(&existingLine, rule.TunnelLineID).Error == nil {
+			activeLinePtr = &existingLine
 		}
 	}
 
@@ -1619,8 +1989,35 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 	if req.LoadBalance != "" {
 		rule.LoadBalance = req.LoadBalance
 	}
+	if req.ProxyProtocol != nil {
+		rule.ProxyProtocol = *req.ProxyProtocol
+	}
+	if req.MatchDomains != nil {
+		rule.MatchDomains = *req.MatchDomains
+	}
+	if req.OutboundIP != nil {
+		rule.OutboundIP = *req.OutboundIP
+	}
+	if req.RuleQuotaBytes != nil {
+		rule.RuleQuotaBytes = *req.RuleQuotaBytes
+	}
+	if req.DailyQuotaBytes != nil {
+		rule.DailyQuotaBytes = *req.DailyQuotaBytes
+	}
+
+	cleanDomains, cleanOutIP, optSt, optErr := s.validateRuleNextGenOptions(
+		rule.Protocol, rule.ProxyProtocol, rule.MatchDomains, rule.OutboundIP, rule.RuleQuotaBytes, rule.DailyQuotaBytes,
+		rule.IngressNodeID, activeLinePtr, isAdmin,
+	)
+	if optErr != nil {
+		c.JSON(optSt, gin.H{"error": optErr.Error()})
+		return
+	}
+	rule.MatchDomains = cleanDomains
+	rule.OutboundIP = cleanOutIP
+
 	rule.TargetsJSON = string(targetsBytes)
-	if s.isAdmin(c) {
+	if isAdmin {
 		if req.SpeedMbps >= 0 {
 			rule.SpeedMbps = clampRuleSpeedMbps(req.SpeedMbps, owner.SpeedMbps, true)
 		}
@@ -1630,9 +2027,6 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 
 	status, err := 0, error(nil)
 	_ = s.orch.WithAllocLock(func() error {
-		// Re-read under the lock: fields owned by other code paths (enabled/status set by pause or quota cut-off,
-		// ports moved by a port range change, topology set by a tunnel edit) must not be overwritten by the snapshot
-		// taken before the lock.
 		var cur model.ForwardRule
 		if e := s.db.First(&cur, ruleID).Error; e != nil {
 			status, err = http.StatusNotFound, fmt.Errorf("规则不存在")
@@ -1640,7 +2034,7 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		}
 		reqPort := req.ListenPort
 		if reqPort == oldRule.ListenPort {
-			reqPort = cur.ListenPort // the client did not change the port; keep whatever it is now
+			reqPort = cur.ListenPort
 		}
 		oldRule = cur
 		rule.Enabled, rule.Status, rule.LastError = cur.Enabled, cur.Status, cur.LastError
@@ -1649,7 +2043,52 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		if !switchLine {
 			rule.TunnelLineID, rule.IngressNodeID, rule.Mode, rule.Engine = cur.TunnelLineID, cur.IngressNodeID, cur.Mode, cur.Engine
 			rule.RelayPort, rule.RelayNodeID = cur.RelayPort, cur.RelayNodeID
+			rule.HopPortsJSON, rule.EgressPortsJSON = cur.HopPortsJSON, cur.EgressPortsJSON
 		}
+		if req.ProxyProtocol == nil {
+			rule.ProxyProtocol = cur.ProxyProtocol
+		}
+		if req.MatchDomains == nil {
+			rule.MatchDomains = cur.MatchDomains
+		}
+		if req.OutboundIP == nil {
+			rule.OutboundIP = cur.OutboundIP
+		}
+		if req.RuleQuotaBytes == nil {
+			rule.RuleQuotaBytes = cur.RuleQuotaBytes
+		}
+		if req.DailyQuotaBytes == nil {
+			rule.DailyQuotaBytes = cur.DailyQuotaBytes
+		}
+		if req.Protocol == "" {
+			rule.Protocol = cur.Protocol
+		}
+
+		var lockLinePtr *model.TunnelLine
+		lineRange := ""
+		if switchLine {
+			lockLinePtr = &newLine
+			lineRange = newLine.PortRange
+		} else if rule.TunnelLineID > 0 {
+			var curLine model.TunnelLine
+			if s.db.First(&curLine, rule.TunnelLineID).Error == nil {
+				lockLinePtr = &curLine
+				lineRange = curLine.PortRange
+			}
+		}
+
+		// Re-validate merged options inside WithAllocLock to prevent concurrent TOCTOU smuggling across lines/protocols
+		lockedDomains, lockedOutIP, lSt, lErr := s.validateRuleNextGenOptions(
+			rule.Protocol, rule.ProxyProtocol, rule.MatchDomains, rule.OutboundIP, rule.RuleQuotaBytes, rule.DailyQuotaBytes,
+			rule.IngressNodeID, lockLinePtr, isAdmin,
+		)
+		if lErr != nil {
+			status, err = lSt, lErr
+			return err
+		}
+		rule.MatchDomains = lockedDomains
+		rule.OutboundIP = lockedOutIP
+
 		if switchLine && newLine.MaxPortCount > 0 {
 			var lineRuleCount int64
 			s.db.Model(&model.ForwardRule{}).Where("tunnel_line_id = ?", newLine.ID).Count(&lineRuleCount)
@@ -1658,29 +2097,20 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 				return err
 			}
 		}
-		// 规则所属隧道的端口范围（切换隧道时取新隧道）
-		lineRange := ""
-		if switchLine {
-			lineRange = newLine.PortRange
-		} else if rule.TunnelLineID > 0 {
-			var curLine model.TunnelLine
-			if s.db.Select("id", "port_range").First(&curLine, rule.TunnelLineID).Error == nil {
-				lineRange = curLine.PortRange
-			}
-		}
+
 		movedOutOfRange := rule.IngressNodeID == oldRule.IngressNodeID &&
 			(rule.ListenPort <= 0 || !s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange))
+		domainsChanged := rule.MatchDomains != oldRule.MatchDomains
+
 		if rule.IngressNodeID != oldRule.IngressNodeID || movedOutOfRange {
-			// 切换到了不同入口节点的隧道（或当前端口不在新隧道的端口范围内），需重新校验或分配端口
 			desiredPort := reqPort
 			if desiredPort == oldRule.ListenPort {
 				desiredPort = 0
 			}
 			if movedOutOfRange {
-				// 同一节点上旧端口仍被本规则占用，先释放再分配
 				s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("listen_port", 0)
 			}
-			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, desiredPort, lineRange)
+			allocPort, normDomains, aerr := s.orch.AllocateIngressPortForRule(rule.IngressNodeID, desiredPort, rule.MatchDomains, rule.ID, lineRange)
 			if aerr != nil {
 				if movedOutOfRange {
 					s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Update("listen_port", oldRule.ListenPort)
@@ -1689,19 +2119,53 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 				return err
 			}
 			rule.ListenPort = allocPort
-		} else if reqPort > 0 && reqPort != rule.ListenPort {
-			allocPort, aerr := s.orch.AllocatePortForNode(rule.IngressNodeID, reqPort, lineRange)
+			rule.MatchDomains = normDomains
+		} else if (reqPort > 0 && reqPort != rule.ListenPort) || domainsChanged {
+			targetPort := reqPort
+			if targetPort <= 0 {
+				targetPort = rule.ListenPort
+			}
+			allocPort, normDomains, aerr := s.orch.AllocateIngressPortForRule(rule.IngressNodeID, targetPort, rule.MatchDomains, rule.ID, lineRange)
 			if aerr != nil {
 				status, err = http.StatusBadRequest, aerr
 				return err
 			}
 			rule.ListenPort = allocPort
+			rule.MatchDomains = normDomains
 		}
+
+		// Auto-resume if rule was paused due to rule_quota_exceeded or daily_quota_exceeded and user just raised the limit
+		now := time.Now()
+		todayStr := s.orch.BillingDateString(now)
+		curCopy := cur
+		curCopy.RuleQuotaBytes = rule.RuleQuotaBytes
+		curCopy.DailyQuotaBytes = rule.DailyQuotaBytes
+		nodesOK := s.orch.RuleNodesWithinQuota(&rule)
+		if (rule.Status == "rule_quota_exceeded" || rule.Status == "daily_quota_exceeded") &&
+			curCopy.WithinRuleQuotas(todayStr) &&
+			owner.CanForward(now) &&
+			(isAdmin || owner.HasTunnelPermission(rule.TunnelLineID)) &&
+			s.tunnelLineEnabled(rule.TunnelLineID) &&
+			s.ruleHasValidPort(&rule) &&
+			nodesOK {
+			rule.Enabled = true
+			rule.Status = "running"
+		} else if rule.Enabled && !curCopy.WithinRuleQuotas(todayStr) {
+			rule.Enabled = false
+			if rule.RuleQuotaBytes > 0 && cur.BilledBytes >= rule.RuleQuotaBytes {
+				rule.Status = "rule_quota_exceeded"
+			} else {
+				rule.Status = "daily_quota_exceeded"
+			}
+		} else if rule.Enabled && !nodesOK {
+			rule.Enabled = false
+			rule.Status = "node_quota_exceeded"
+		}
+
 		if serr := s.db.Omit(ruleCounterCols...).Save(&rule).Error; serr != nil {
 			log.Printf("[API] update rule failed: %v", serr)
-			// Undo the temporary port release so the port the agent still serves stays reserved in the DB.
 			s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).Updates(map[string]any{
-				"listen_port": oldRule.ListenPort, "ingress_node_id": oldRule.IngressNodeID,
+				"listen_port": oldRule.ListenPort, "ingress_node_id": oldRule.IngressNodeID, "match_domains": oldRule.MatchDomains,
 			})
 			status, err = http.StatusInternalServerError, fmt.Errorf("保存规则失败，请稍后再试")
 			return err
@@ -1713,10 +2177,12 @@ func (s *Server) handleUpdateRule(c *gin.Context) {
 		return
 	}
 
-	if needRemoveOld {
+	if needRemoveOld || oldRule.MatchDomains != rule.MatchDomains || oldRule.ListenPort != rule.ListenPort {
 		s.orch.RemoveRuleFromAgents(&oldRule)
 	}
 	s.orch.DispatchRule(&rule)
+	rule.EffectiveEngine = service.EffectiveEngineForLine(&rule, &owner, activeLinePtr)
+	sanitizeRuleForClient(&rule, isAdmin)
 	c.JSON(http.StatusOK, rule)
 }
 
@@ -1727,7 +2193,8 @@ func (s *Server) handleToggleRule(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "规则不存在"})
 		return
 	}
-	if rule.UserID != s.currentUserID(c) && !s.isAdmin(c) {
+	isAdmin := s.isAdmin(c)
+	if rule.UserID != s.currentUserID(c) && !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "无权操作此规则"})
 		return
 	}
@@ -1740,13 +2207,22 @@ func (s *Server) handleToggleRule(c *gin.Context) {
 				return
 			}
 		}
+		now := time.Now()
+		if !rule.WithinRuleQuotas(s.orch.BillingDateString(now)) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "该规则已达单规则总流量或今日流量上限，请调高规则配额或等待次日自动恢复"})
+			return
+		}
+		if !s.orch.RuleNodesWithinQuota(&rule) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "所属节点月流量配额已耗尽，无法启用转发规则"})
+			return
+		}
 		var user model.User
 		if err := s.db.First(&user, rule.UserID).Error; err == nil {
-			if !s.isAdmin(c) && !user.HasTunnelPermission(rule.TunnelLineID) {
+			if !isAdmin && !user.HasTunnelPermission(rule.TunnelLineID) {
 				c.JSON(http.StatusForbidden, gin.H{"error": "该隧道权限未授权或已收回，无法启用转发"})
 				return
 			}
-			if !user.CanForward(time.Now()) {
+			if !user.CanForward(now) {
 				c.JSON(http.StatusForbidden, gin.H{"error": "账户状态异常、流量已用尽或套餐已到期，无法启用规则"})
 				return
 			}
@@ -1759,21 +2235,26 @@ func (s *Server) handleToggleRule(c *gin.Context) {
 		status = "running"
 	}
 	errBadPort := fmt.Errorf("规则端口不在当前允许的端口范围内，请编辑规则重新分配端口后再启用")
-	// The port check and the state change run under the allocation lock so a concurrent port range change cannot slip
-	// in between; only enabled/status are written so a port moved by such a change is never overwritten.
+	errNodeQuota := fmt.Errorf("所属节点月流量配额已耗尽，无法启用转发规则")
 	terr := s.orch.WithAllocLock(func() error {
 		if err := s.db.First(&rule, rule.ID).Error; err != nil {
 			return err
 		}
-		// 端口范围调整后未能迁移的规则（无端口或端口在范围外）需先编辑重新分配端口
 		if enable && !s.ruleHasValidPort(&rule) {
 			return errBadPort
+		}
+		if enable && !s.orch.RuleNodesWithinQuota(&rule) {
+			return errNodeQuota
 		}
 		return s.db.Model(&model.ForwardRule{}).Where("id = ?", rule.ID).
 			Updates(map[string]any{"enabled": enable, "status": status}).Error
 	})
 	if terr == errBadPort {
 		c.JSON(http.StatusBadRequest, gin.H{"error": terr.Error()})
+		return
+	}
+	if terr == errNodeQuota {
+		c.JSON(http.StatusForbidden, gin.H{"error": terr.Error()})
 		return
 	}
 	if terr != nil {
@@ -1784,6 +2265,7 @@ func (s *Server) handleToggleRule(c *gin.Context) {
 	rule.Enabled = enable
 	rule.Status = status
 	s.orch.DispatchRule(&rule)
+	sanitizeRuleForClient(&rule, isAdmin)
 	c.JSON(http.StatusOK, rule)
 }
 
@@ -1794,7 +2276,8 @@ func (s *Server) handleProbeRule(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "规则不存在"})
 		return
 	}
-	if rule.UserID != s.currentUserID(c) && !s.isAdmin(c) {
+	isAdmin := s.isAdmin(c)
+	if rule.UserID != s.currentUserID(c) && !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "无权探测他人规则"})
 		return
 	}
@@ -1806,24 +2289,134 @@ func (s *Server) handleProbeRule(c *gin.Context) {
 		addrs = append(addrs, t.Address)
 	}
 
-	// 双端加密对接隧道：支持端到端分段测速（入口->出口隧道延迟 tunnel_ms + 出口->目标落地延迟 latencies）
+	type probeLeg struct {
+		Leg        string `json:"leg"`
+		FromNodeID uint64 `json:"from_node_id,omitempty"`
+		FromName   string `json:"from_name"`
+		ToNodeID   uint64 `json:"to_node_id,omitempty"`
+		ToName     string `json:"to_name"`
+		LatencyMs  int    `json:"latency_ms"`
+		Backup     bool   `json:"backup,omitempty"`
+	}
+	var legs []probeLeg
+
+	// 链式/多出口加密对接隧道：支持逐跳分段测速（入口 -> 跳点1 -> ... -> 出口池 -> 落地目标）
 	tunnelMs := 0
 	probeNodeID := rule.IngressNodeID
 	if rule.Mode == "tunnel" && rule.TunnelLineID > 0 {
 		var line model.TunnelLine
-		if err := s.db.First(&line, rule.TunnelLineID).Error; err == nil && line.EgressNodeID > 0 {
-			probeNodeID = line.EgressNodeID
-			var egressNode model.Node
-			if err := s.db.First(&egressNode, line.EgressNodeID).Error; err == nil && rule.RelayPort > 0 {
-				egressHost := egressNode.ServerIP
-				if egressHost == "" {
-					egressHost = egressNode.ConnectIP
+		if err := s.db.First(&line, rule.TunnelLineID).Error; err == nil && len(line.EgressMembers()) > 0 {
+			// Ensure HopPorts & EgressPorts exist
+			if rule.RelayPort <= 0 {
+				_, _ = s.orch.CompileRuleGraph(&rule)
+			}
+			hopIDs := line.HopIDs()
+			egMembers := line.EgressMembers()
+			probeNodeID = egMembers[0].NodeID
+
+			nodeIDs := []uint64{rule.IngressNodeID}
+			nodeIDs = append(nodeIDs, hopIDs...)
+			for _, em := range egMembers {
+				nodeIDs = append(nodeIDs, em.NodeID)
+			}
+			var nodes []model.Node
+			s.db.Where("id IN ?", nodeIDs).Find(&nodes)
+			nMap := make(map[uint64]model.Node, len(nodes))
+			for _, n := range nodes {
+				nMap[n.ID] = n
+			}
+			hopPortMap := make(map[uint64]int)
+			for _, a := range rule.HopPortAllocs() {
+				hopPortMap[a.NodeID] = a.Port
+			}
+			egPortMap := make(map[uint64]int)
+			for _, a := range rule.EgressPortAllocs() {
+				egPortMap[a.NodeID] = a.Port
+			}
+
+			displayNodeName := func(nid uint64, fallback string) string {
+				if !isAdmin {
+					return fallback
 				}
-				hopAddr := fmt.Sprintf("%s:%d", egressHost, rule.RelayPort)
-				if hopMap, hErr := s.hub.RequestProbe(rule.IngressNodeID, rule.ID, []string{hopAddr}); hErr == nil {
-					if ms, ok := hopMap[hopAddr]; ok && ms > 0 {
-						tunnelMs = ms
+				if n, ok := nMap[nid]; ok && n.Name != "" {
+					return n.Name
+				}
+				return fallback
+			}
+
+			curFromID := rule.IngressNodeID
+			curFromLabel := displayNodeName(curFromID, "入口节点")
+			for idx, hid := range hopIDs {
+				hp := hopPortMap[hid]
+				hNode, ok := nMap[hid]
+				toLabel := displayNodeName(hid, fmt.Sprintf("中继跳点 #%d", idx+1))
+				ms := -1
+				if ok && hp > 0 {
+					hHost := strings.Trim(strings.TrimSpace(hNode.PreferredTunnelHost()), "[]")
+					addr := net.JoinHostPort(hHost, strconv.Itoa(hp))
+					if resMap, pErr := s.hub.RequestProbe(curFromID, rule.ID, []string{addr}); pErr == nil {
+						if v, vOk := resMap[addr]; vOk {
+							ms = v
+						}
 					}
+				}
+				if ms > 0 {
+					tunnelMs += ms
+				}
+				legs = append(legs, probeLeg{
+					Leg:       fmt.Sprintf("hop_%d", idx+1),
+					FromName:  curFromLabel,
+					ToName:    toLabel,
+					LatencyMs: ms,
+				})
+				if isAdmin {
+					legs[len(legs)-1].FromNodeID = curFromID
+					legs[len(legs)-1].ToNodeID = hid
+				}
+				curFromID = hid
+				curFromLabel = toLabel
+			}
+
+			// Probe final tunnel leg from last hop (or ingress) to each egress member
+			egAddrs := make([]string, 0, len(egMembers))
+			addrByEgID := make(map[uint64]string, len(egMembers))
+			for _, em := range egMembers {
+				ep := egPortMap[em.NodeID]
+				if ep <= 0 && em.NodeID == line.EgressNodeID {
+					ep = rule.RelayPort
+				}
+				if eNode, ok := nMap[em.NodeID]; ok && ep > 0 {
+					eHost := strings.Trim(strings.TrimSpace(eNode.PreferredTunnelHost()), "[]")
+					addr := net.JoinHostPort(eHost, strconv.Itoa(ep))
+					egAddrs = append(egAddrs, addr)
+					addrByEgID[em.NodeID] = addr
+				}
+			}
+			var egLatMap map[string]int
+			if len(egAddrs) > 0 {
+				egLatMap, _ = s.hub.RequestProbe(curFromID, rule.ID, egAddrs)
+			}
+			for i, em := range egMembers {
+				ms := -1
+				if addr := addrByEgID[em.NodeID]; addr != "" && egLatMap != nil {
+					if v, vOk := egLatMap[addr]; vOk {
+						ms = v
+					}
+				}
+				if i == 0 && ms > 0 {
+					tunnelMs += ms
+				}
+				toLabel := displayNodeName(em.NodeID, fmt.Sprintf("出口节点 #%d", i+1))
+				legs = append(legs, probeLeg{
+					Leg:       fmt.Sprintf("egress_%d", i+1),
+					FromName:  curFromLabel,
+					ToName:    toLabel,
+					LatencyMs: ms,
+					Backup:    em.Backup,
+				})
+				if isAdmin {
+					legs[len(legs)-1].FromNodeID = curFromID
+					legs[len(legs)-1].ToNodeID = em.NodeID
 				}
 			}
 		}
@@ -1837,6 +2430,7 @@ func (s *Server) handleProbeRule(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"tunnel_ms": tunnelMs,
 		"latencies": latencies,
+		"legs":      legs,
 	})
 }
 
@@ -2283,35 +2877,50 @@ func (s *Server) handleGetSubscription(c *gin.Context) {
 	}
 
 	type subRuleItem struct {
-		ID       uint64 `json:"id"`
-		Name     string `json:"name"`
-		Protocol string `json:"protocol"`
-		Host     string `json:"host"`
-		Port     int    `json:"port"`
-		Entry    string `json:"entry"`
-		Mode     string `json:"mode"`
-		Status   string `json:"status"`
+		ID           uint64 `json:"id"`
+		Name         string `json:"name"`
+		Protocol     string `json:"protocol"`
+		Host         string `json:"host"`
+		Port         int    `json:"port"`
+		Entry        string `json:"entry"`
+		Mode         string `json:"mode"`
+		Status       string `json:"status"`
+		MatchDomains string `json:"match_domains,omitempty"`
 	}
+	todayStr := s.orch.BillingDateString(time.Now())
 	items := make([]subRuleItem, 0, len(rules))
 	var lines []string
 	for _, r := range rules {
 		if !u.HasTunnelPermission(r.TunnelLineID) && r.TunnelLineID > 0 {
 			continue
 		}
+		if !r.WithinRuleQuotas(todayStr) {
+			continue
+		}
 		host := nodeHost[r.IngressNodeID]
 		if host == "" {
 			host = "127.0.0.1"
 		}
+		if strings.TrimSpace(r.MatchDomains) != "" {
+			for _, part := range strings.Split(r.MatchDomains, ",") {
+				d := strings.TrimSpace(part)
+				if d != "" && !strings.HasPrefix(d, "*.") {
+					host = d
+					break
+				}
+			}
+		}
 		entry := net.JoinHostPort(strings.Trim(host, "[]"), strconv.Itoa(r.ListenPort))
 		items = append(items, subRuleItem{
-			ID:       r.ID,
-			Name:     r.Name,
-			Protocol: r.Protocol,
-			Host:     host,
-			Port:     r.ListenPort,
-			Entry:    entry,
-			Mode:     r.Mode,
-			Status:   r.Status,
+			ID:           r.ID,
+			Name:         r.Name,
+			Protocol:     r.Protocol,
+			Host:         host,
+			Port:         r.ListenPort,
+			Entry:        entry,
+			Mode:         r.Mode,
+			Status:       r.Status,
+			MatchDomains: r.MatchDomains,
 		})
 		lines = append(lines, fmt.Sprintf("%s://%s#%s", r.Protocol, entry, url.PathEscape(r.Name)))
 	}
@@ -3108,6 +3717,41 @@ func (s *Server) handleAdminConfirmOrder(c *gin.Context) {
 
 // --- Admin Handlers ---
 
+func normalizeNodeOutboundIPs(defaultIP, allowedRaw string) (string, string, error) {
+	allowPriv := os.Getenv("NEXUS_ALLOW_PRIVATE_TARGETS") == "true"
+	cleanDefault := strings.TrimSpace(defaultIP)
+	if cleanDefault != "" {
+		parsed, err := security.ValidateOutboundIP(cleanDefault, allowPriv)
+		if err != nil || parsed == nil {
+			return "", "", fmt.Errorf("默认出站源 IP 无效: %v", err)
+		}
+		cleanDefault = parsed.String()
+	}
+	var allowed []string
+	seen := make(map[string]struct{})
+	for _, token := range strings.FieldsFunc(allowedRaw, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	}) {
+		v := strings.TrimSpace(token)
+		if v == "" {
+			continue
+		}
+		parsed, err := security.ValidateOutboundIP(v, allowPriv)
+		if err != nil || parsed == nil {
+			return "", "", fmt.Errorf("授权出站 IP %q 无效: %v", v, err)
+		}
+		canon := parsed.String()
+		if _, dup := seen[canon]; !dup {
+			seen[canon] = struct{}{}
+			allowed = append(allowed, canon)
+		}
+	}
+	if len(allowed) > 32 {
+		return "", "", fmt.Errorf("单节点最多配置 32 个授权出站源 IP")
+	}
+	return cleanDefault, strings.Join(allowed, ","), nil
+}
+
 func (s *Server) handleAdminCreateNode(c *gin.Context) {
 	var node model.Node
 	if err := c.ShouldBindJSON(&node); err != nil {
@@ -3129,9 +3773,14 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 		node.ServerIP = node.ConnectIP
 	}
 	node.PublicHost = node.ConnectIP
+	outIP, allowedIPs, oErr := normalizeNodeOutboundIPs(node.OutboundIP, node.AllowedOutboundIPs)
+	if oErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": oErr.Error()})
+		return
+	}
+	node.OutboundIP = outIP
+	node.AllowedOutboundIPs = allowedIPs
 	if len(node.SecretToken) < 32 {
-		// Node tokens are HMAC keys for the control channel: always use a strong random value unless the admin
-		// supplied a sufficiently long one.
 		node.SecretToken = utils.GenerateRandomToken(32)
 	}
 	if node.PortRange == "" {
@@ -3178,7 +3827,7 @@ func (s *Server) handleAdminCreateNode(c *gin.Context) {
 
 // ruleCounterCols are incremented concurrently by agent traffic reports (gorm.Expr); full-row saves of a rule must
 // never write back a stale snapshot of them.
-var ruleCounterCols = []string{"upload_bytes", "down_bytes", "billed_bytes"}
+var ruleCounterCols = []string{"upload_bytes", "down_bytes", "billed_bytes", "daily_used_bytes", "daily_reset_date"}
 
 func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
@@ -3188,25 +3837,32 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Name          string              `json:"name"`
-		Role          string              `json:"role"`
-		ConnectIP     string              `json:"connect_ip"`
-		ServerIP      string              `json:"server_ip"`
-		PublicHost    string              `json:"public_host"`
-		InternalHost  string              `json:"internal_host"`
-		PortRange     string              `json:"port_range"`
-		TrafficRate   float64             `json:"traffic_rate"`
-		QuotaBytes    *int64              `json:"quota_bytes"`
-		UsedBytes     *int64              `json:"used_bytes"`
-		ResetDay      *int                `json:"reset_day"`
-		DefaultEngine protocol.EngineType `json:"default_engine"`
+		Name               string              `json:"name"`
+		Role               string              `json:"role"`
+		ConnectIP          string              `json:"connect_ip"`
+		ServerIP           string              `json:"server_ip"`
+		PublicHost         string              `json:"public_host"`
+		InternalHost       *string             `json:"internal_host"`
+		OutboundIP         *string             `json:"outbound_ip"`
+		AllowedOutboundIPs *string             `json:"allowed_outbound_ips"`
+		Status             *string             `json:"status"`
+		PortRange          string              `json:"port_range"`
+		TrafficRate        float64             `json:"traffic_rate"`
+		QuotaBytes         *int64              `json:"quota_bytes"`
+		UsedBytes          *int64              `json:"used_bytes"`
+		ResetDay           *int                `json:"reset_day"`
+		DefaultEngine      protocol.EngineType `json:"default_engine"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	oldServerIP := node.ServerIP
+	oldTunnelHost := node.PreferredTunnelHost()
+	oldOutboundIP := node.OutboundIP
+	oldAllowedOutboundIPs := node.AllowedOutboundIPs
 	oldPortRange := node.PortRange
+	oldStatus := node.Status
+	wasOverQuota := node.QuotaBytes > 0 && node.UsedBytes >= node.QuotaBytes
 	portRangeChanged := false
 	if strings.TrimSpace(req.Name) != "" {
 		if utf8.RuneCountInString(strings.TrimSpace(req.Name)) > 64 {
@@ -3230,9 +3886,46 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 	} else if node.ServerIP == "" {
 		node.ServerIP = node.ConnectIP
 	}
-	if req.InternalHost != "" {
-		node.InternalHost = strings.TrimSpace(req.InternalHost)
+	if req.InternalHost != nil {
+		node.InternalHost = strings.TrimSpace(*req.InternalHost)
 	}
+	newOutIP := node.OutboundIP
+	if req.OutboundIP != nil {
+		newOutIP = *req.OutboundIP
+	}
+	newAllowedIPs := node.AllowedOutboundIPs
+	if req.AllowedOutboundIPs != nil {
+		newAllowedIPs = *req.AllowedOutboundIPs
+	}
+	cleanOutIP, cleanAllowedIPs, oErr := normalizeNodeOutboundIPs(newOutIP, newAllowedIPs)
+	if oErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": oErr.Error()})
+		return
+	}
+	node.OutboundIP = cleanOutIP
+	node.AllowedOutboundIPs = cleanAllowedIPs
+
+	statusExplicit := false
+	if req.Status != nil {
+		st := strings.ToLower(strings.TrimSpace(*req.Status))
+		switch st {
+		case "maintenance":
+			node.Status = "maintenance"
+			statusExplicit = true
+		case "online", "offline":
+			node.Status = "offline"
+			if s.hub != nil {
+				for _, oid := range s.hub.OnlineNodeIDs() {
+					if oid == node.ID {
+						node.Status = "online"
+						break
+					}
+				}
+			}
+			statusExplicit = true
+		}
+	}
+
 	if req.PortRange != "" && req.PortRange != node.PortRange {
 		nmin, nmax, perr := utils.ParsePortRange(req.PortRange)
 		if perr != nil || nmin < security.DefaultPolicy.MinListenPort {
@@ -3273,14 +3966,19 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 		}
 		node.DefaultEngine = req.DefaultEngine
 	}
-	// Never write back fields owned by the agent / traffic accounting from a stale snapshot.
-	if err := s.db.Omit("used_bytes", "tunnel_cert_pem", "status", "supported_engines", "last_seen_at").Save(&node).Error; err != nil {
+	omitCols := []string{"used_bytes", "tunnel_cert_pem", "supported_engines", "last_seen_at"}
+	if !statusExplicit {
+		omitCols = append(omitCols, "status")
+	}
+	if err := s.db.Omit(omitCols...).Save(&node).Error; err != nil {
 		log.Printf("[API] update node %d failed: %v", node.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存节点失败，请稍后再试"})
 		return
 	}
+	if statusExplicit && node.Status != oldStatus {
+		s.orch.EvaluateDNSFailoverGroupsAsync(time.Now())
+	}
 	if portRangeChanged {
-		// 节点端口范围收窄后，把落在范围外的规则迁移到新范围内的空闲端口
 		s.reallocNodeRulesOutOfRange(node.ID)
 	}
 	if req.UsedBytes != nil && *req.UsedBytes >= 0 {
@@ -3296,38 +3994,27 @@ func (s *Server) handleAdminUpdateNode(c *gin.Context) {
 	if node.QuotaBytes > 0 && node.UsedBytes >= node.QuotaBytes {
 		s.orch.EnforceNodeQuotaCutoff(node.ID)
 	} else {
-		var pausedRules []model.ForwardRule
-		s.db.Where("ingress_node_id = ? AND status = ?", node.ID, "node_quota_exceeded").Find(&pausedRules)
-		now := time.Now()
-		for i := range pausedRules {
-			var owner model.User
-			if s.db.First(&owner, pausedRules[i].UserID).Error != nil || !owner.CanForward(now) ||
-				!owner.HasTunnelPermission(pausedRules[i].TunnelLineID) || !s.tunnelLineEnabled(pausedRules[i].TunnelLineID) ||
-				s.resumeBlockedByPort(&pausedRules[i]) {
-				continue
-			}
-			pausedRules[i].Enabled = true
-			pausedRules[i].Status = "running"
-			// Conditional on the status it was found in, so a concurrent pause / stop is never undone.
-			if res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND status = ?", pausedRules[i].ID, "node_quota_exceeded").
-				Updates(map[string]any{"enabled": true, "status": "running"}); res.Error != nil || res.RowsAffected == 0 {
-				continue
-			}
-			s.db.First(&pausedRules[i], pausedRules[i].ID) // dispatch the current row, not a pre-lock snapshot
-			s.orch.DispatchRule(&pausedRules[i])
-		}
+		s.orch.ResumeNodeQuotaRules(node.ID, time.Now(), wasOverQuota)
 	}
 
-	// 若该节点作为加密隧道出口且 ServerIP 变更，通知关联入口节点更新隧道连接目标地址
-	if node.ServerIP != oldServerIP {
-		var egressLines []model.TunnelLine
-		s.db.Where("egress_node_id = ?", node.ID).Find(&egressLines)
-		for _, l := range egressLines {
-			var rules []model.ForwardRule
-			s.db.Where("tunnel_line_id = ? AND enabled = ?", l.ID, true).Find(&rules)
-			for i := range rules {
-				s.orch.DispatchRule(&rules[i])
+	// Re-dispatch rules if tunnel host, default outbound IP, or allowed outbound IP whitelist changed
+	if node.PreferredTunnelHost() != oldTunnelHost || node.OutboundIP != oldOutboundIP || node.AllowedOutboundIPs != oldAllowedOutboundIPs {
+		var allLines []model.TunnelLine
+		s.db.Find(&allLines)
+		var affectedLineIDs []uint64
+		for i := range allLines {
+			if allLines[i].IngressNodeID == node.ID || allLines[i].UsesNodeInTunnelLeg(node.ID) {
+				affectedLineIDs = append(affectedLineIDs, allLines[i].ID)
 			}
+		}
+		var rules []model.ForwardRule
+		if len(affectedLineIDs) > 0 {
+			s.db.Where("(ingress_node_id = ? OR tunnel_line_id IN ?) AND enabled = ?", node.ID, affectedLineIDs, true).Find(&rules)
+		} else {
+			s.db.Where("ingress_node_id = ? AND enabled = ?", node.ID, true).Find(&rules)
+		}
+		for i := range rules {
+			s.orch.DispatchRule(&rules[i])
 		}
 	}
 	s.recordAudit(c, "admin.update_node", node.Name, fmt.Sprintf("更新节点 #%d 配置", node.ID))
@@ -3351,22 +4038,34 @@ func (s *Server) handleAdminResetNodeTraffic(c *gin.Context) {
 
 func (s *Server) handleAdminDeleteNode(c *gin.Context) {
 	id, _ := strconv.ParseUint(c.Param("id"), 10, 64)
-	var lineCount int64
-	s.db.Model(&model.TunnelLine{}).Where("ingress_node_id = ? OR egress_node_id = ?", id, id).Count(&lineCount)
-	if lineCount > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该节点仍被隧道引用，请先删除或修改关联隧道"})
-		return
+	var allLines []model.TunnelLine
+	s.db.Find(&allLines)
+	for i := range allLines {
+		if allLines[i].IngressNodeID == id || allLines[i].EgressNodeID == id || allLines[i].UsesNodeInTunnelLeg(id) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("该节点仍被隧道「%s」引用，请先删除或修改关联隧道", allLines[i].Name)})
+			return
+		}
+	}
+	var foGroups []model.IngressFailoverGroup
+	s.db.Find(&foGroups)
+	for i := range foGroups {
+		if foGroups[i].PrimaryNodeID == id {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("该节点仍被 DNS 容灾组「%s」设为主入口，请先调整容灾组", foGroups[i].Name)})
+			return
+		}
+		bIDs, _ := foGroups[i].ParseBackupNodeIDs()
+		for _, bid := range bIDs {
+			if bid == id {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("该节点仍被 DNS 容灾组「%s」设为备用入口，请先调整容灾组", foGroups[i].Name)})
+				return
+			}
+		}
 	}
 	s.db.Delete(&model.Node{}, id)
 	s.recordAudit(c, "admin.delete_node", strconv.FormatUint(id, 10), fmt.Sprintf("删除节点 #%d", id))
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
 }
 
-// reallocIfOutOfRange moves a rule whose listen port lies outside the effective port range of its ingress node
-// (narrowed by lineRange) to a free in-range port. Callers must hold WithAllocLock. It returns true when the port
-// changed. Rules without a port (listen_port == 0, e.g. after a failed migration) are left for the user to re-edit.
-// The old port is outside the new window, so it can never collide with the newly allocated one; the move is a single
-// conditional write, so a failure leaves the DB unchanged.
 func (s *Server) reallocIfOutOfRange(rule *model.ForwardRule, lineRange string) (bool, error) {
 	if rule.ListenPort <= 0 || s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange) {
 		return false, nil
@@ -3386,8 +4085,6 @@ func (s *Server) reallocIfOutOfRange(rule *model.ForwardRule, lineRange string) 
 	return true, nil
 }
 
-// ruleHasValidPort reports whether the rule's listen port lies inside the current node / tunnel port range. Auto-resume
-// paths use it so a rule stranded outside a narrowed range is never brought back up outside the allowed window.
 func (s *Server) ruleHasValidPort(rule *model.ForwardRule) bool {
 	lineRange := ""
 	if rule.TunnelLineID > 0 {
@@ -3399,8 +4096,6 @@ func (s *Server) ruleHasValidPort(rule *model.ForwardRule) bool {
 	return rule.ListenPort > 0 && s.orch.PortInRange(rule.IngressNodeID, rule.ListenPort, lineRange)
 }
 
-// resumeBlockedByPort handles a paused rule that would be auto-resumed but has no valid port: it is moved to the error
-// state (so it is not retried silently) and the caller must skip it.
 func (s *Server) resumeBlockedByPort(rule *model.ForwardRule) bool {
 	if s.ruleHasValidPort(rule) {
 		return false
@@ -3411,8 +4106,6 @@ func (s *Server) resumeBlockedByPort(rule *model.ForwardRule) bool {
 	return true
 }
 
-// markRuleNoPort records that a rule could not get an in-range port. Enabled rules are stopped with an error status;
-// rules that are already off (paused / quota-cut) keep their status so their resume semantics are preserved.
 func (s *Server) markRuleNoPort(ruleID uint64, wasEnabled bool, msg string) {
 	updates := map[string]any{"last_error": msg}
 	if wasEnabled {
@@ -3422,12 +4115,6 @@ func (s *Server) markRuleNoPort(ruleID uint64, wasEnabled bool, msg string) {
 	s.db.Model(&model.ForwardRule{}).Where("id = ?", ruleID).Updates(updates)
 }
 
-// reallocNodeRulesOutOfRange re-homes every rule on nodeID whose listen port (node as ingress) or relay port (node as
-// egress) no longer fits the node / tunnel port range after a range change, and pushes the new config to agents.
-// The whole scan runs under the allocation lock so concurrent rule creates/edits are either fully before it or see
-// the new range. Ranges and the occupied-port set are loaded once and new ports are handed out in memory, so the cost
-// is a handful of queries plus one conditional UPDATE per moved rule. Rules that cannot get a new port are stopped so
-// they never keep listening outside the allowed window.
 func (s *Server) reallocNodeRulesOutOfRange(nodeID uint64) {
 	var moved, failed []uint64
 	_ = s.orch.WithAllocLock(func() error {
@@ -3463,9 +4150,14 @@ func (s *Server) reallocNodeRulesOutOfRange(nodeID uint64) {
 			failed = append(failed, id)
 		}
 
-		// Listen ports (this node is the ingress).
+		// 1. Listen ports (keeping shared MatchDomains groups together when on the same line)
+		type sharedPortKey struct {
+			lineID  uint64
+			oldPort int
+		}
+		sharedMoved := make(map[sharedPortKey]int)
 		var rules []model.ForwardRule
-		s.db.Select("id", "enabled", "tunnel_line_id", "listen_port").
+		s.db.Select("id", "enabled", "tunnel_line_id", "listen_port", "match_domains").
 			Where("ingress_node_id = ? AND listen_port > 0", nodeID).Find(&rules)
 		for _, r := range rules {
 			w := windowFor(r.TunnelLineID)
@@ -3476,7 +4168,20 @@ func (s *Server) reallocNodeRulesOutOfRange(nodeID uint64) {
 				fail(r.ID, r.Enabled, "端口范围调整后无可用端口，请重新编辑该规则", fmt.Errorf("invalid port range"))
 				continue
 			}
-			p, err := service.PickFreePort(w.min, w.max, occupied)
+			var p int
+			var err error
+			sk := sharedPortKey{lineID: r.TunnelLineID, oldPort: r.ListenPort}
+			if strings.TrimSpace(r.MatchDomains) != "" {
+				if mapped, ok := sharedMoved[sk]; ok {
+					p = mapped
+				}
+			}
+			if p == 0 {
+				p, err = service.PickFreePort(w.min, w.max, occupied)
+				if err == nil && strings.TrimSpace(r.MatchDomains) != "" {
+					sharedMoved[sk] = p
+				}
+			}
 			if err == nil {
 				res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND listen_port = ?", r.ID, r.ListenPort).Update("listen_port", p)
 				if err = res.Error; err == nil && res.RowsAffected == 0 {
@@ -3491,40 +4196,108 @@ func (s *Server) reallocNodeRulesOutOfRange(nodeID uint64) {
 			moved = append(moved, r.ID)
 		}
 
-		// Relay ports (this node is the egress of tunnel rules); they only follow the node range.
+		// 2. Primary Relay ports & Hop/Egress JSON port allocations on nodeID
 		nw := windowFor(0)
-		var relays []model.ForwardRule
-		s.db.Select("id", "enabled", "relay_port").Where("relay_node_id = ? AND relay_port > 0", nodeID).Find(&relays)
-		for _, r := range relays {
-			if nw.ok && r.RelayPort >= nw.min && r.RelayPort <= nw.max {
-				continue
+		var tunnelRules []model.ForwardRule
+		s.db.Select("id", "enabled", "relay_port", "relay_node_id", "hop_ports_json", "egress_ports_json").
+			Where("(relay_node_id = ? AND relay_port > 0) OR hop_ports_json <> '' OR egress_ports_json <> ''", nodeID).
+			Find(&tunnelRules)
+		for _, r := range tunnelRules {
+			updates := make(map[string]any)
+			changed := false
+			allocErr := error(nil)
+
+			hops := r.HopPortAllocs()
+			hopsMod := false
+			for i := range hops {
+				if hops[i].NodeID != nodeID || hops[i].Port <= 0 {
+					continue
+				}
+				if nw.ok && hops[i].Port >= nw.min && hops[i].Port <= nw.max {
+					continue
+				}
+				if !nw.ok {
+					allocErr = fmt.Errorf("invalid port range")
+					break
+				}
+				np, pErr := service.PickFreePort(nw.min, nw.max, occupied)
+				if pErr != nil {
+					allocErr = pErr
+					break
+				}
+				hops[i].Port = np
+				hopsMod = true
 			}
-			var p int
-			err := fmt.Errorf("invalid port range")
-			if nw.ok {
-				if p, err = service.PickFreePort(nw.min, nw.max, occupied); err == nil {
-					res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND relay_port = ?", r.ID, r.RelayPort).Update("relay_port", p)
-					if err = res.Error; err == nil && res.RowsAffected == 0 {
-						err = fmt.Errorf("rule changed concurrently")
-					}
+			if allocErr == nil && hopsMod {
+				hb, _ := json.Marshal(hops)
+				updates["hop_ports_json"] = string(hb)
+				changed = true
+			}
+
+			egs := r.EgressPortAllocs()
+			egsMod := false
+			newRelayPort := r.RelayPort
+			for i := range egs {
+				if allocErr != nil {
+					break
+				}
+				if egs[i].NodeID != nodeID || egs[i].Port <= 0 {
+					continue
+				}
+				if nw.ok && egs[i].Port >= nw.min && egs[i].Port <= nw.max {
+					continue
+				}
+				if !nw.ok {
+					allocErr = fmt.Errorf("invalid port range")
+					break
+				}
+				np, pErr := service.PickFreePort(nw.min, nw.max, occupied)
+				if pErr != nil {
+					allocErr = pErr
+					break
+				}
+				egs[i].Port = np
+				if i == 0 && r.RelayNodeID == nodeID {
+					newRelayPort = np
+				}
+				egsMod = true
+			}
+			if allocErr == nil && egsMod {
+				eb, _ := json.Marshal(egs)
+				updates["egress_ports_json"] = string(eb)
+				if r.RelayNodeID == nodeID && newRelayPort != r.RelayPort {
+					updates["relay_port"] = newRelayPort
+				}
+				changed = true
+			} else if allocErr == nil && r.RelayNodeID == nodeID && r.RelayPort > 0 && !(nw.ok && r.RelayPort >= nw.min && r.RelayPort <= nw.max) {
+				if !nw.ok {
+					allocErr = fmt.Errorf("invalid port range")
+				} else if np, pErr := service.PickFreePort(nw.min, nw.max, occupied); pErr != nil {
+					allocErr = pErr
+				} else {
+					updates["relay_port"] = np
+					changed = true
 				}
 			}
-			if err != nil {
-				// Release the out-of-range relay port; it is re-allocated inside the range when the rule is next deployed.
-				res := s.db.Model(&model.ForwardRule{}).Where("id = ? AND relay_port = ?", r.ID, r.RelayPort).
-					Updates(map[string]any{"relay_port": 0, "relay_node_id": 0})
-				if res.Error == nil && res.RowsAffected == 0 {
-					continue // the rule was changed concurrently (e.g. re-edited); leave it alone
+
+			if allocErr != nil {
+				clearMap := map[string]any{"hop_ports_json": "", "egress_ports_json": ""}
+				if r.RelayNodeID == nodeID {
+					clearMap["relay_port"] = 0
+					clearMap["relay_node_id"] = 0
 				}
-				fail(r.ID, r.Enabled, "出口节点端口范围调整后无可用中继端口，请调整范围后重新编辑该规则", err)
+				s.db.Model(&model.ForwardRule{}).Where("id = ?", r.ID).Updates(clearMap)
+				fail(r.ID, r.Enabled, "隧道节点端口范围调整后无可用中继端口，请调整范围后重新编辑该规则", allocErr)
 				continue
 			}
-			log.Printf("[API] node %d: rule %d relay port %d -> %d after port range change", nodeID, r.ID, r.RelayPort, p)
-			moved = append(moved, r.ID)
+			if changed {
+				if err := s.db.Model(&model.ForwardRule{}).Where("id = ?", r.ID).Updates(updates).Error; err == nil {
+					moved = append(moved, r.ID)
+				}
+			}
 		}
 		return nil
 	})
-	// Dispatch from the current DB state (never a stale snapshot), so paused / disabled / deleted rules are not revived.
 	seen := map[uint64]bool{}
 	for _, id := range append(moved, failed...) {
 		if seen[id] {
@@ -3538,7 +4311,6 @@ func (s *Server) reallocNodeRulesOutOfRange(nodeID uint64) {
 	}
 }
 
-// validateLine checks enum fields and node references of a tunnel line.
 // validateLinePortRange normalizes the tunnel's optional port range and checks it lies inside the ingress node's range.
 func (s *Server) validateLinePortRange(line *model.TunnelLine) error {
 	line.PortRange = strings.ReplaceAll(strings.TrimSpace(line.PortRange), " ", "")
@@ -3556,7 +4328,7 @@ func (s *Server) validateLinePortRange(line *model.TunnelLine) error {
 	}
 	nmin, nmax, nerr := utils.ParsePortRange(node.PortRange)
 	if nerr != nil {
-		nmin, nmax = 10000, 50000 // same fallback as the allocator
+		nmin, nmax = 10000, 50000
 	}
 	if minP < nmin || maxP > nmax {
 		return fmt.Errorf("隧道端口范围 %s 必须位于入口节点「%s」的端口范围 %d-%d 之内", line.PortRange, node.Name, nmin, nmax)
@@ -3564,7 +4336,9 @@ func (s *Server) validateLinePortRange(line *model.TunnelLine) error {
 	return nil
 }
 
-func validateLine(line *model.TunnelLine) error {
+// validateAndNormalizeLine validates enum fields, multi-hop chains, multipath egress pools, mux/bonding options,
+// and ensures all referenced nodes exist and form a strictly loop-free DAG.
+func (s *Server) validateAndNormalizeLine(line *model.TunnelLine) error {
 	line.Name = strings.TrimSpace(line.Name)
 	if line.Name == "" || utf8.RuneCountInString(line.Name) > 64 {
 		return fmt.Errorf("隧道名称不能为空且不超过 64 个字符")
@@ -3575,16 +4349,113 @@ func validateLine(line *model.TunnelLine) error {
 	if line.IngressNodeID == 0 {
 		return fmt.Errorf("请选择入口节点")
 	}
-	if line.Type == "encrypt" {
-		if line.EgressNodeID == 0 {
-			return fmt.Errorf("加密隧道必须选择出口节点")
+	var inNode model.Node
+	if err := s.db.Select("id").First(&inNode, line.IngressNodeID).Error; err != nil {
+		return fmt.Errorf("所选入口节点 #%d 不存在", line.IngressNodeID)
+	}
+
+	if line.LoadBalance == "" {
+		line.LoadBalance = "round_robin"
+	}
+	switch line.LoadBalance {
+	case "round_robin", "weighted", "least_rtt", "failover", "random":
+	default:
+		return fmt.Errorf("不支持的多出口调度策略 %q", line.LoadBalance)
+	}
+
+	if line.ProxyProtocol < 0 || line.ProxyProtocol > 2 {
+		return fmt.Errorf("默认 PROXY Protocol 版本仅支持 0 (关闭)、1 (v1)、2 (v2)")
+	}
+	if math.IsNaN(line.OffPeakMultiplier) || math.IsInf(line.OffPeakMultiplier, 0) || line.OffPeakMultiplier < 0 || line.OffPeakMultiplier > 1000 {
+		return fmt.Errorf("隧道专属闲时倍率需在 0 - 1000 之间")
+	}
+
+	if line.Type == "direct" {
+		line.HopNodeIDs = ""
+		line.EgressNodeID = 0
+		line.EgressNodeIDs = ""
+		line.EnableMux = false
+		line.EnableBonding = false
+		line.BondLinks = 4
+		line.Transport = "raw"
+	} else {
+		// Encrypt tunnel: parse & normalize HopNodeIDs and EgressNodeIDs
+		hops, hErr := model.ParseHopNodeIDs(line.HopNodeIDs)
+		if hErr != nil {
+			return hErr
 		}
+		hopStrs := make([]string, 0, len(hops))
+		for _, hid := range hops {
+			hopStrs = append(hopStrs, strconv.FormatUint(hid, 10))
+		}
+		line.HopNodeIDs = strings.Join(hopStrs, ",")
+
+		var egMembers []model.EgressMember
+		if strings.TrimSpace(line.EgressNodeIDs) != "" {
+			parsedEg, eErr := model.ParseEgressNodeIDs(line.EgressNodeIDs)
+			if eErr != nil {
+				return eErr
+			}
+			egMembers = parsedEg
+		} else if line.EgressNodeID > 0 {
+			egMembers = []model.EgressMember{{NodeID: line.EgressNodeID, Weight: 100}}
+		}
+		if len(egMembers) == 0 {
+			return fmt.Errorf("加密隧道必须至少选择一个出口节点")
+		}
+		line.EgressNodeID = egMembers[0].NodeID
+		if len(egMembers) > 1 || egMembers[0].Weight != 100 || egMembers[0].Backup {
+			line.EgressNodeIDs = model.FormatEgressMembers(egMembers)
+		} else {
+			line.EgressNodeIDs = ""
+		}
+
+		// Loop & duplicate guard across Ingress -> Hops -> EgressPool
+		usedNodes := map[uint64]string{line.IngressNodeID: "入口节点"}
+		checkNodeIDs := make([]uint64, 0, len(hops)+len(egMembers))
+		for idx, hid := range hops {
+			if roleName, dup := usedNodes[hid]; dup {
+				return fmt.Errorf("链式转发检测到环路或重复节点：节点 #%d 已作为%s，不能同时作为中间跳点 #%d", hid, roleName, idx+1)
+			}
+			usedNodes[hid] = fmt.Sprintf("中间跳点 #%d", idx+1)
+			checkNodeIDs = append(checkNodeIDs, hid)
+		}
+		for _, em := range egMembers {
+			if roleName, dup := usedNodes[em.NodeID]; dup {
+				return fmt.Errorf("拓扑冲突：节点 #%d 已作为%s，不能同时作为出口节点", em.NodeID, roleName)
+			}
+			usedNodes[em.NodeID] = "出口节点"
+			checkNodeIDs = append(checkNodeIDs, em.NodeID)
+		}
+		var existingNodes []model.Node
+		s.db.Select("id").Where("id IN ?", checkNodeIDs).Find(&existingNodes)
+		existSet := make(map[uint64]bool, len(existingNodes))
+		for _, n := range existingNodes {
+			existSet[n.ID] = true
+		}
+		for _, nid := range checkNodeIDs {
+			if !existSet[nid] {
+				return fmt.Errorf("隧道拓扑引用的节点 #%d 不存在", nid)
+			}
+		}
+
+		if line.EnableMux && line.EnableBonding {
+			return fmt.Errorf("多路复用连接池 (Mux) 与单流多通道条带化聚合 (Bonding) 请二选一开启")
+		}
+		if line.BondLinks <= 0 {
+			line.BondLinks = 4
+		}
+		if line.BondLinks < 2 || line.BondLinks > 8 {
+			return fmt.Errorf("单流带宽聚合通道数需在 2 - 8 之间")
+		}
+
 		switch line.Transport {
 		case "tls", "ws", "wss", "quic", "custom":
 		default:
 			return fmt.Errorf("加密隧道不支持传输方式 %q", line.Transport)
 		}
 	}
+
 	if !validEngine(line.Engine) {
 		return fmt.Errorf("不支持的转发引擎")
 	}
@@ -3653,7 +4524,6 @@ func sanitizeRequestHost(raw string) string {
 		}
 		return raw
 	}
-	// Bare host without port
 	if strings.Contains(raw, ":") && !(strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]")) {
 		return "127.0.0.1:8080"
 	}
@@ -3835,7 +4705,7 @@ func (s *Server) handleAdminCreateLine(c *gin.Context) {
 		return
 	}
 	if line.Type == "" {
-		if line.EgressNodeID > 0 {
+		if line.EgressNodeID > 0 || strings.TrimSpace(line.EgressNodeIDs) != "" {
 			line.Type = "encrypt"
 		} else {
 			line.Type = "direct"
@@ -3850,7 +4720,7 @@ func (s *Server) handleAdminCreateLine(c *gin.Context) {
 	if line.Transport == "" {
 		line.Transport = "tls"
 	}
-	if err := validateLine(&line); err != nil {
+	if err := s.validateAndNormalizeLine(&line); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -3865,7 +4735,9 @@ func (s *Server) handleAdminCreateLine(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建隧道失败，请检查参数"})
 		return
 	}
-	c.JSON(http.StatusCreated, line)
+	lines := []model.TunnelLine{line}
+	s.populateLineAllowedOutboundIPs(lines)
+	c.JSON(http.StatusCreated, lines[0])
 }
 
 func (s *Server) handleAdminUpdateLine(c *gin.Context) {
@@ -3876,25 +4748,36 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Name           string              `json:"name"`
-		Type           string              `json:"type"`
-		Description    *string             `json:"description"`
-		IngressNodeID  uint64              `json:"ingress_node_id"`
-		EgressNodeID   uint64              `json:"egress_node_id"`
-		Transport      string              `json:"transport"`
-		Engine         protocol.EngineType `json:"engine"`
-		BillingMode    string              `json:"billing_mode"`
-		RateMultiplier float64             `json:"rate_multiplier"`
-		MaxPortCount   int                 `json:"max_port_count"`
-		PortRange      string              `json:"port_range"`
-		Enabled        *bool               `json:"enabled"`
+		Name              string              `json:"name"`
+		Type              string              `json:"type"`
+		Description       *string             `json:"description"`
+		IngressNodeID     uint64              `json:"ingress_node_id"`
+		HopNodeIDs        *string             `json:"hop_node_ids"`
+		EgressNodeID      uint64              `json:"egress_node_id"`
+		EgressNodeIDs     *string             `json:"egress_node_ids"`
+		LoadBalance       *string             `json:"load_balance"`
+		EnableMux         *bool               `json:"enable_mux"`
+		EnableBonding     *bool               `json:"enable_bonding"`
+		BondLinks         *int                `json:"bond_links"`
+		ProxyProtocol     *int                `json:"proxy_protocol"`
+		OffPeakMultiplier *float64            `json:"offpeak_multiplier"`
+		Transport         string              `json:"transport"`
+		Engine            protocol.EngineType `json:"engine"`
+		BillingMode       string              `json:"billing_mode"`
+		RateMultiplier    float64             `json:"rate_multiplier"`
+		MaxPortCount      int                 `json:"max_port_count"`
+		PortRange         string              `json:"port_range"`
+		Enabled           *bool               `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	oldLine := line
 	oldIngressID := line.IngressNodeID
 	oldEgressID := line.EgressNodeID
+	oldHops := line.HopNodeIDs
+	oldEgressPool := line.EgressNodeIDs
 	oldType := line.Type
 	oldPortRange := line.PortRange
 	oldEnabled := line.Enabled
@@ -3908,11 +4791,39 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		line.Enabled = *req.Enabled
 	}
 	line.IngressNodeID = req.IngressNodeID
+	if req.LoadBalance != nil {
+		line.LoadBalance = *req.LoadBalance
+	}
+	if req.EnableMux != nil {
+		line.EnableMux = *req.EnableMux
+	}
+	if req.EnableBonding != nil {
+		line.EnableBonding = *req.EnableBonding
+	}
+	if req.BondLinks != nil {
+		line.BondLinks = *req.BondLinks
+	}
+	if req.ProxyProtocol != nil {
+		line.ProxyProtocol = *req.ProxyProtocol
+	}
+	if req.OffPeakMultiplier != nil {
+		line.OffPeakMultiplier = *req.OffPeakMultiplier
+	}
 	if line.Type == "encrypt" {
 		line.EgressNodeID = req.EgressNodeID
+		if req.HopNodeIDs != nil {
+			line.HopNodeIDs = *req.HopNodeIDs
+		}
+		if req.EgressNodeIDs != nil {
+			line.EgressNodeIDs = *req.EgressNodeIDs
+		} else if req.EgressNodeID > 0 && req.EgressNodeID != oldEgressID && oldEgressPool == "" {
+			line.EgressNodeIDs = ""
+		}
 		line.Transport = req.Transport
 	} else {
+		line.HopNodeIDs = ""
 		line.EgressNodeID = 0
+		line.EgressNodeIDs = ""
 		line.Transport = "raw"
 	}
 	line.Engine = req.Engine
@@ -3926,7 +4837,7 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 	if line.BillingMode == "" {
 		line.BillingMode = "two_way"
 	}
-	if err := validateLine(&line); err != nil {
+	if err := s.validateAndNormalizeLine(&line); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -3934,52 +4845,96 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+
+	hopsOrEgressChanged := oldEgressID != line.EgressNodeID || oldHops != line.HopNodeIDs || oldEgressPool != line.EgressNodeIDs
+	topologyChanged := oldIngressID != line.IngressNodeID || hopsOrEgressChanged || oldType != line.Type ||
+		oldLine.EnableMux != line.EnableMux || oldLine.EnableBonding != line.EnableBonding ||
+		oldLine.ProxyProtocol != line.ProxyProtocol || (oldEnabled && !line.Enabled)
+
+	// Tear down old rule instances on old topology BEFORE overwriting line in DB so RemoveRuleFromAgents sees oldLine's nodes!
+	var preRules []model.ForwardRule
+	if topologyChanged || !line.Enabled {
+		s.db.Where("tunnel_line_id = ?", line.ID).Find(&preRules)
+		for i := range preRules {
+			s.orch.RemoveRuleFromAgents(&preRules[i])
+		}
+	}
+
 	s.db.Save(&line)
 
-	topologyChanged := oldIngressID != line.IngressNodeID || oldEgressID != line.EgressNodeID || oldType != line.Type || (oldEnabled && !line.Enabled)
-
-	// 隧道固化转发方式或拓扑变更后，先清理旧节点上的残留实例，再同步更新该隧道下所有转发规则并重新下发
 	ruleGone := fmt.Errorf("rule deleted concurrently")
+	sharedMoved := make(map[int]int) // oldListenPort -> newly allocated shared port for MatchDomains groups
 	var rules []model.ForwardRule
 	s.db.Where("tunnel_line_id = ?", line.ID).Find(&rules)
 	for i := range rules {
 		oldRule := rules[i]
-		if topologyChanged || !line.Enabled {
-			s.orch.RemoveRuleFromAgents(&oldRule)
-		}
 		saveErr := s.orch.WithAllocLock(func() error {
-			// Re-read under the lock so a concurrent pause / edit / delete is not overwritten by a stale snapshot.
 			if err := s.db.First(&rules[i], oldRule.ID).Error; err != nil {
 				return ruleGone
 			}
 			rules[i].Engine = line.Engine
+			hasDomains := strings.TrimSpace(rules[i].MatchDomains) != ""
 			if oldIngressID != line.IngressNodeID {
 				rules[i].IngressNodeID = line.IngressNodeID
-				// Persist the node change first so the rule's old port on the old node is not counted twice.
 				rules[i].ListenPort = 0
 				s.db.Model(&model.ForwardRule{}).Where("id = ?", rules[i].ID).Updates(map[string]any{"ingress_node_id": line.IngressNodeID, "listen_port": 0})
-				if p, err := s.orch.AllocatePortForNode(line.IngressNodeID, oldRule.ListenPort, line.PortRange); err == nil {
+				preferredPort := oldRule.ListenPort
+				if hasDomains && oldRule.ListenPort > 0 {
+					if mapped, ok := sharedMoved[oldRule.ListenPort]; ok {
+						preferredPort = mapped
+					}
+				}
+				if p, normMD, err := s.orch.AllocateIngressPortForRule(line.IngressNodeID, preferredPort, rules[i].MatchDomains, rules[i].ID, line.PortRange); err == nil {
 					rules[i].ListenPort = p
-				} else if p2, err2 := s.orch.AllocatePortForNode(line.IngressNodeID, 0, line.PortRange); err2 == nil {
+					rules[i].MatchDomains = normMD
+					if hasDomains && oldRule.ListenPort > 0 {
+						if _, ok := sharedMoved[oldRule.ListenPort]; !ok {
+							sharedMoved[oldRule.ListenPort] = p
+						}
+					}
+				} else if p2, normMD2, err2 := s.orch.AllocateIngressPortForRule(line.IngressNodeID, 0, rules[i].MatchDomains, rules[i].ID, line.PortRange); err2 == nil {
 					rules[i].ListenPort = p2
+					rules[i].MatchDomains = normMD2
+					if hasDomains && oldRule.ListenPort > 0 {
+						sharedMoved[oldRule.ListenPort] = p2
+					}
 				} else {
 					rules[i].Enabled = false
 					rules[i].Status = "error"
 					rules[i].LastError = "新入口节点无可用端口"
 				}
-			} else if _, rerr := s.reallocIfOutOfRange(&rules[i], line.PortRange); rerr != nil {
-				// 隧道端口范围收窄后当前端口已不在范围内，且范围内无空闲端口；已暂停/超额的规则保留原状态
-				if rules[i].Enabled {
-					rules[i].Enabled = false
-					rules[i].Status = "error"
+			} else if rules[i].ListenPort > 0 && !s.orch.PortInRange(rules[i].IngressNodeID, rules[i].ListenPort, line.PortRange) {
+				prevPort := rules[i].ListenPort
+				desiredPort := 0
+				if hasDomains {
+					if mapped, ok := sharedMoved[prevPort]; ok {
+						desiredPort = mapped
+					}
 				}
-				rules[i].LastError = "隧道端口范围内无可用端口，请调整范围后重新编辑该规则"
+				s.db.Model(&model.ForwardRule{}).Where("id = ?", rules[i].ID).Update("listen_port", 0)
+				if p, normMD, rerr := s.orch.AllocateIngressPortForRule(rules[i].IngressNodeID, desiredPort, rules[i].MatchDomains, rules[i].ID, line.PortRange); rerr == nil {
+					rules[i].ListenPort = p
+					rules[i].MatchDomains = normMD
+					if hasDomains {
+						sharedMoved[prevPort] = p
+					}
+				} else {
+					s.db.Model(&model.ForwardRule{}).Where("id = ?", rules[i].ID).Update("listen_port", prevPort)
+					rules[i].ListenPort = prevPort
+					if rules[i].Enabled {
+						rules[i].Enabled = false
+						rules[i].Status = "error"
+					}
+					rules[i].LastError = "隧道端口范围内无可用端口，请调整范围后重新编辑该规则"
+				}
 			}
-			if oldEgressID != line.EgressNodeID {
+			if hopsOrEgressChanged || line.Type != "encrypt" {
 				rules[i].RelayPort = 0
 				rules[i].RelayNodeID = 0
+				rules[i].HopPortsJSON = ""
+				rules[i].EgressPortsJSON = ""
 			}
-			if line.Type == "encrypt" && line.EgressNodeID > 0 {
+			if line.Type == "encrypt" && len(line.EgressMembers()) > 0 {
 				rules[i].Mode = "tunnel"
 			} else {
 				rules[i].Mode = "direct"
@@ -4001,10 +4956,11 @@ func (s *Server) handleAdminUpdateLine(c *gin.Context) {
 		s.orch.DispatchRule(&rules[i])
 	}
 	if line.PortRange != oldPortRange {
-		// 兜底：在分配锁内整体复查入口节点，覆盖本次更新期间并发创建、仍沿用旧范围端口的规则
 		s.reallocNodeRulesOutOfRange(line.IngressNodeID)
 	}
-	c.JSON(http.StatusOK, line)
+	lines := []model.TunnelLine{line}
+	s.populateLineAllowedOutboundIPs(lines)
+	c.JSON(http.StatusOK, lines[0])
 }
 
 func (s *Server) handleAdminDeleteLine(c *gin.Context) {
@@ -4333,13 +5289,17 @@ func (s *Server) tunnelLineEnabled(lineID uint64) bool {
 // resumeUserQuotaExceededRules automatically resumes any `quota_exceeded` rules of the user when the user's account
 // is active, not expired, under quota, and permitted on an enabled tunnel and valid port range.
 func (s *Server) resumeUserQuotaExceededRules(u *model.User) {
-	if !u.CanForward(time.Now()) {
+	now := time.Now()
+	if !u.CanForward(now) {
 		return
 	}
+	todayStr := s.orch.BillingDateString(now)
 	var rules []model.ForwardRule
 	s.db.Where("user_id = ? AND status = ?", u.ID, "quota_exceeded").Find(&rules)
 	for i := range rules {
-		if !u.HasTunnelPermission(rules[i].TunnelLineID) || !s.tunnelLineEnabled(rules[i].TunnelLineID) || s.resumeBlockedByPort(&rules[i]) {
+		if !u.HasTunnelPermission(rules[i].TunnelLineID) || !s.tunnelLineEnabled(rules[i].TunnelLineID) ||
+			!rules[i].WithinRuleQuotas(todayStr) || !s.orch.RuleNodesWithinQuota(&rules[i]) ||
+			s.resumeBlockedByPort(&rules[i]) {
 			continue
 		}
 		rules[i].Enabled = true

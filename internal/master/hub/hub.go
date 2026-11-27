@@ -284,7 +284,7 @@ func (h *AgentHub) HandleAgentWS(c *gin.Context) {
 		h.mu.Lock()
 		if cur, ok := h.sessions[nodeID]; ok && cur == sess {
 			delete(h.sessions, nodeID)
-			h.db.Model(&model.Node{}).Where("id = ?", nodeID).Update("status", "offline")
+			h.db.Model(&model.Node{}).Where("id = ? AND status <> ?", nodeID, "maintenance").Update("status", "offline")
 			log.Printf("[AgentHub] Node #%d (%s) disconnected", node.ID, node.Name)
 			disconnected = true
 		}
@@ -352,7 +352,6 @@ func (h *AgentHub) handleRegister(sess *AgentSession, payloadBytes []byte) {
 	now := time.Now()
 	updates := map[string]any{
 		"supported_engines": strings.Join(engStrs, ","),
-		"status":            "online",
 		"last_seen_at":      &now,
 	}
 	if ver != "" {
@@ -371,6 +370,7 @@ func (h *AgentHub) handleRegister(sess *AgentSession, payloadBytes []byte) {
 		}
 	}
 	h.db.Model(&model.Node{}).Where("id = ?", sess.NodeID).Updates(updates)
+	h.db.Model(&model.Node{}).Where("id = ? AND status <> ?", sess.NodeID, "maintenance").Update("status", "online")
 	if h.onNodeOnline != nil {
 		go h.onNodeOnline(sess.NodeID)
 	}
@@ -448,13 +448,13 @@ func (h *AgentHub) processAgentMessage(sess *AgentSession, raw []byte) {
 
 			now := time.Now()
 			hbUpdates := map[string]any{
-				"status":       "online",
 				"last_seen_at": &now,
 			}
 			if ver != "" {
 				hbUpdates["agent_version"] = ver
 			}
 			h.db.Model(&model.Node{}).Where("id = ?", sess.NodeID).Updates(hbUpdates)
+			h.db.Model(&model.Node{}).Where("id = ? AND status <> ?", sess.NodeID, "maintenance").Update("status", "online")
 		}
 
 	case protocol.MsgTrafficReport:
@@ -512,7 +512,9 @@ func (h *AgentHub) EnrichNodeMetrics(n *model.Node) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	if sess, ok := h.sessions[n.ID]; ok {
-		n.Status = "online"
+		if n.Status != "maintenance" {
+			n.Status = "online"
+		}
 		if sess.AgentVersion != "" {
 			n.AgentVersion = sess.AgentVersion
 		}

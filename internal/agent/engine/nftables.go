@@ -143,6 +143,14 @@ func (n *NftablesEngine) ApplyRule(ctx context.Context, spec protocol.RuleSpec) 
 		return fmt.Errorf("nftables is only available on Linux with 'nft' binary installed")
 	}
 	key := RuleKey(spec.RuleID, spec.Role)
+	if rawOut := strings.TrimSpace(spec.OutboundIP); rawOut != "" {
+		if _, err := security.ValidateOutboundIP(rawOut, n.policy.AllowPrivateTargets); err != nil {
+			return fmt.Errorf("rule %s: %w", key, err)
+		}
+		if !security.IsLocalInterfaceIP(rawOut) {
+			return fmt.Errorf("rule %s: security violation: outbound_ip %s is not assigned to any local interface", key, rawOut)
+		}
+	}
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -316,11 +324,17 @@ func buildNftForwardScript(rules []nftResolvedRule, state nftCounterState) strin
 
 	s.WriteString("  chain postrouting {\n")
 	s.WriteString("    type nat hook postrouting priority srcnat; policy accept;\n")
-	// Only masquerade connections DNAT-ed by one of our rules; never rewrite unrelated host traffic.
+	// Only masquerade/SNAT connections DNAT-ed by one of our rules; never rewrite unrelated host traffic.
 	for _, r := range rules {
+		snatExpr := "masquerade"
+		if rawOut := strings.TrimSpace(r.spec.OutboundIP); rawOut != "" {
+			if outIP := net.ParseIP(rawOut); outIP != nil && outIP.To4() != nil {
+				snatExpr = fmt.Sprintf("snat ip to %s", outIP.To4().String())
+			}
+		}
 		for _, proto := range nftProtos(r.spec) {
-			fmt.Fprintf(&s, "    meta l4proto %s ct status dnat ct original proto-dst %d ip daddr %s %s dport %d masquerade\n",
-				proto, r.spec.ListenPort, r.dstIP, proto, r.dstPort)
+			fmt.Fprintf(&s, "    meta l4proto %s ct status dnat ct original proto-dst %d ip daddr %s %s dport %d %s\n",
+				proto, r.spec.ListenPort, r.dstIP, proto, r.dstPort, snatExpr)
 		}
 	}
 	s.WriteString("  }\n")

@@ -165,6 +165,19 @@ func (m *Manager) ApplyRule(ctx context.Context, spec protocol.RuleSpec) error {
 	return m.applyRuleLocked(ctx, spec)
 }
 
+func requiresNativeDriver(spec protocol.RuleSpec) bool {
+	if (spec.AccessMode == "allow" || spec.AccessMode == "deny") && strings.TrimSpace(spec.AccessCIDRs) != "" {
+		return true
+	}
+	if strings.TrimSpace(spec.MatchDomains) != "" {
+		return true
+	}
+	if spec.Tunnel != nil && (spec.Tunnel.EnableMux || spec.Tunnel.EnableBonding) {
+		return true
+	}
+	return false
+}
+
 func (m *Manager) applyRuleLocked(ctx context.Context, spec protocol.RuleSpec) error {
 	if spec.Engine == "" {
 		spec.Engine = protocol.EngineNative
@@ -172,16 +185,16 @@ func (m *Manager) applyRuleLocked(ctx context.Context, spec protocol.RuleSpec) e
 	if spec.Role == "" {
 		spec.Role = protocol.RoleRelay
 	}
-	isTunnelRole := spec.Role == protocol.RoleIngress || spec.Role == protocol.RoleEgress
+	isTunnelRole := protocol.IsTunnelRole(spec.Role)
 
 	// realm / nftables cannot speak the authenticated encrypted tunnel protocol; tunnel legs always run on the
-	// native engine instead so traffic between Ingress and Egress is never sent in clear text.
+	// native engine instead so traffic between Ingress, Hop, and Egress is never sent in clear text.
 	if isTunnelRole && !supportsEncryptedTunnel(spec.Engine) {
 		log.Printf("[EngineManager] Engine %q has no encrypted tunnel support, using %q for rule #%d (%s)",
 			spec.Engine, protocol.EngineNative, spec.RuleID, spec.Role)
 		spec.Engine = protocol.EngineNative
 	}
-	if (spec.AccessMode == "allow" || spec.AccessMode == "deny") && strings.TrimSpace(spec.AccessCIDRs) != "" && spec.Engine != protocol.EngineNative {
+	if requiresNativeDriver(spec) && spec.Engine != protocol.EngineNative {
 		spec.Engine = protocol.EngineNative
 	}
 
@@ -208,7 +221,7 @@ func (m *Manager) applyRuleLocked(ctx context.Context, spec protocol.RuleSpec) e
 
 	runSpec := spec
 	if needsPinnedTargets(spec.Engine) {
-		allowPrivate := m.policy.AllowPrivateTargets || spec.Role == protocol.RoleIngress
+		allowPrivate := m.policy.AllowPrivateTargets || protocol.IsTunnelClientRole(spec.Role)
 		pinned, err := security.ResolveTargets(ctx, spec.Targets, allowPrivate)
 		if err != nil {
 			log.Printf("[EngineManager] SECURITY REJECTED rule #%d (%s): %v", spec.RuleID, spec.Name, err)
@@ -314,10 +327,10 @@ func effectiveEngine(spec protocol.RuleSpec) protocol.EngineType {
 	if e == "" {
 		e = protocol.EngineNative
 	}
-	if (spec.Role == protocol.RoleIngress || spec.Role == protocol.RoleEgress) && !supportsEncryptedTunnel(e) {
+	if protocol.IsTunnelRole(spec.Role) && !supportsEncryptedTunnel(e) {
 		e = protocol.EngineNative
 	}
-	if (spec.AccessMode == "allow" || spec.AccessMode == "deny") && strings.TrimSpace(spec.AccessCIDRs) != "" {
+	if requiresNativeDriver(spec) {
 		e = protocol.EngineNative
 	}
 	return e
@@ -330,6 +343,7 @@ func sameRuleSpec(a, b protocol.RuleSpec) bool {
 		a.Protocol != b.Protocol || a.ListenHost != b.ListenHost || a.ListenPort != b.ListenPort ||
 		a.LoadBalance != b.LoadBalance || a.SpeedLimitMbps != b.SpeedLimitMbps || a.MaxConns != b.MaxConns ||
 		a.AccessMode != b.AccessMode || a.AccessCIDRs != b.AccessCIDRs ||
+		a.OutboundIP != b.OutboundIP || a.ProxyProto != b.ProxyProto || a.MatchDomains != b.MatchDomains ||
 		len(a.Targets) != len(b.Targets) {
 		return false
 	}
@@ -384,7 +398,7 @@ func (m *Manager) SyncAll(ctx context.Context, desired []protocol.RuleSpec, forc
 				if needsPinnedTargets(engine) {
 					// Hostname targets on external engines are pinned to IPs; re-resolve and re-apply only when the
 					// DNS answer changed (still validated against the sandbox policy).
-					allowPrivate := m.policy.AllowPrivateTargets || spec.Role == protocol.RoleIngress
+					allowPrivate := m.policy.AllowPrivateTargets || protocol.IsTunnelClientRole(spec.Role)
 					pinned, err := security.ResolveTargets(ctx, spec.Targets, allowPrivate)
 					if err == nil && !sameTargets(pinned, resolved.Targets) {
 						unchanged = false

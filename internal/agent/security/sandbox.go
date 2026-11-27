@@ -254,10 +254,117 @@ func embeddedIPv4(ip net.IP) net.IP {
 	return nil
 }
 
+var matchDomainPattern = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?)+$`)
+
+// ValidateOutboundIP checks an optional source IP binding for outbound sockets.
+func ValidateOutboundIP(raw string, allowPrivate bool) (net.IP, error) {
+	trimmed := strings.Trim(strings.TrimSpace(raw), "[]")
+	if trimmed == "" {
+		return nil, nil
+	}
+	ip := net.ParseIP(trimmed)
+	if ip == nil {
+		return nil, fmt.Errorf("security violation: invalid outbound_ip %q", raw)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	checkOne := func(cand net.IP) error {
+		if cand.IsUnspecified() || cand.IsMulticast() || cand.IsLinkLocalMulticast() {
+			return fmt.Errorf("security violation: outbound_ip %s cannot be unspecified or multicast", ip.String())
+		}
+		if !allowPrivate && (cand.IsLoopback() || cand.IsLinkLocalUnicast()) {
+			return fmt.Errorf("security violation: loopback/link-local outbound_ip %s is prohibited", ip.String())
+		}
+		return nil
+	}
+	if err := checkOne(ip); err != nil {
+		return nil, err
+	}
+	if emb := embeddedIPv4(ip); emb != nil {
+		if err := checkOne(emb); err != nil {
+			return nil, err
+		}
+	}
+	return ip, nil
+}
+
+// IsLocalInterfaceIP reports whether raw is currently assigned to one of this host's network interfaces.
+func IsLocalInterfaceIP(raw string) bool {
+	trimmed := strings.Trim(strings.TrimSpace(raw), "[]")
+	target := net.ParseIP(trimmed)
+	if target == nil {
+		return false
+	}
+	if v4 := target.To4(); v4 != nil {
+		target = v4
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var hostIP net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			hostIP = v.IP
+		case *net.IPAddr:
+			hostIP = v.IP
+		}
+		if hostIP == nil {
+			continue
+		}
+		if v4 := hostIP.To4(); v4 != nil {
+			hostIP = v4
+		}
+		if hostIP.Equal(target) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseAndValidateMatchDomains normalizes and validates comma/semicolon/whitespace-separated SNI / HTTP Host patterns.
+func ParseAndValidateMatchDomains(raw string) ([]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if len(trimmed) > 512 {
+		return nil, fmt.Errorf("match_domains exceeds 512 bytes")
+	}
+	tokens := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	})
+	if len(tokens) == 0 || len(tokens) > 32 {
+		return nil, fmt.Errorf("invalid match_domains count (%d)", len(tokens))
+	}
+	seen := make(map[string]struct{}, len(tokens))
+	out := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		d := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(tok), "."))
+		if d == "" {
+			continue
+		}
+		if len(d) > 253 || !matchDomainPattern.MatchString(d) {
+			return nil, fmt.Errorf("invalid SNI/Host domain pattern %q (expected e.g. app.example.com or *.example.com)", tok)
+		}
+		if _, dup := seen[d]; !dup {
+			seen[d] = struct{}{}
+			out = append(out, d)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid domains in match_domains")
+	}
+	return out, nil
+}
+
 // ValidateRuleSpec performs a comprehensive security audit on a RuleSpec before any EngineDriver executes it.
 func ValidateRuleSpec(spec protocol.RuleSpec, policy Policy) error {
-	switch spec.Role {
-	case "", protocol.RoleRelay, protocol.RoleIngress, protocol.RoleEgress:
+	switch {
+	case spec.Role == "", spec.Role == protocol.RoleRelay, spec.Role == protocol.RoleIngress, spec.Role == protocol.RoleEgress:
+	case protocol.IsHopRole(spec.Role):
 	default:
 		return fmt.Errorf("security violation: invalid rule role %q", spec.Role)
 	}
@@ -274,13 +381,30 @@ func ValidateRuleSpec(spec protocol.RuleSpec, policy Policy) error {
 		return fmt.Errorf("invalid target count (%d)", len(spec.Targets))
 	}
 
-	// Ingress role connects to Master-paired Egress internal IP, which may legitimately be an IEPL internal IP.
+	// Ingress and Hop roles connect to Master-paired next-hop / Egress internal IPs, which may legitimately be IEPL internal IPs.
 	// Relay and Egress roles connect to user-supplied destinations and MUST enforce strict Anti-SSRF unless overridden.
-	allowPrivate := policy.AllowPrivateTargets || (spec.Role == protocol.RoleIngress)
+	allowPrivate := policy.AllowPrivateTargets || protocol.IsTunnelClientRole(spec.Role)
 
 	for _, t := range spec.Targets {
 		if err := ValidateTargetAddress(t.Address, allowPrivate); err != nil {
 			return err
+		}
+		if len(t.CertPEM) > 16*1024 {
+			return fmt.Errorf("security violation: target tunnel certificate too large")
+		}
+	}
+	if _, err := ValidateOutboundIP(spec.OutboundIP, policy.AllowPrivateTargets); err != nil {
+		return err
+	}
+	if spec.ProxyProto < 0 || spec.ProxyProto > 2 {
+		return fmt.Errorf("invalid proxy_proto %d", spec.ProxyProto)
+	}
+	if strings.TrimSpace(spec.MatchDomains) != "" {
+		if _, err := ParseAndValidateMatchDomains(spec.MatchDomains); err != nil {
+			return err
+		}
+		if spec.Protocol != "" && spec.Protocol != "tcp" {
+			return fmt.Errorf("match_domains shared-port routing requires tcp protocol")
 		}
 	}
 
@@ -290,6 +414,12 @@ func ValidateRuleSpec(spec protocol.RuleSpec, policy Policy) error {
 		}
 		if len(spec.Tunnel.CertPEM) > 16*1024 {
 			return fmt.Errorf("security violation: tunnel certificate too large")
+		}
+		if spec.Tunnel.ProxyProto < 0 || spec.Tunnel.ProxyProto > 2 {
+			return fmt.Errorf("invalid tunnel proxy_proto %d", spec.Tunnel.ProxyProto)
+		}
+		if spec.Tunnel.BondLinks < 0 || spec.Tunnel.BondLinks > 16 {
+			return fmt.Errorf("invalid tunnel bond_links %d", spec.Tunnel.BondLinks)
 		}
 		if spec.Role != protocol.RoleRelay && spec.Tunnel.SecretKey == "" {
 			return fmt.Errorf("security violation: tunnel rule without secret key")
@@ -301,7 +431,7 @@ func ValidateRuleSpec(spec protocol.RuleSpec, policy Policy) error {
 		return fmt.Errorf("invalid protocol %q", spec.Protocol)
 	}
 	switch spec.LoadBalance {
-	case "", "round_robin", "failover", "random":
+	case "", "round_robin", "weighted", "least_rtt", "failover", "random":
 	default:
 		return fmt.Errorf("invalid load balance strategy %q", spec.LoadBalance)
 	}
@@ -311,7 +441,17 @@ func ValidateRuleSpec(spec protocol.RuleSpec, policy Policy) error {
 // SafeDialTCP resolves the target address and verifies every resolved IP against SSRF & DNS Rebinding
 // before opening the outbound TCP socket.
 func SafeDialTCP(ctx context.Context, addr string, timeout time.Duration, allowPrivate bool) (net.Conn, error) {
+	return SafeDialTCPWithSource(ctx, addr, "", timeout, allowPrivate)
+}
+
+// SafeDialTCPWithSource resolves the target address, verifies SSRF & DNS Rebinding constraints, and optionally binds
+// localSourceIP as the outbound local IP address.
+func SafeDialTCPWithSource(ctx context.Context, addr string, localSourceIP string, timeout time.Duration, allowPrivate bool) (net.Conn, error) {
 	if err := ValidateTargetAddress(addr, allowPrivate); err != nil {
+		return nil, err
+	}
+	localIP, err := ValidateOutboundIP(localSourceIP, allowPrivate)
+	if err != nil {
 		return nil, err
 	}
 	host, portStr, err := net.SplitHostPort(addr)
@@ -327,21 +467,27 @@ func SafeDialTCP(ctx context.Context, addr string, timeout time.Duration, allowP
 		return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
 	}
 
-	// Anti-DNS Rebinding check: verify resolved IP right before dialing
+	// Anti-DNS Rebinding check: verify resolved IP right before dialing, matching address family when localIP is set.
 	var safeIP net.IP
 	for _, ip := range ips {
+		if localIP != nil && (localIP.To4() != nil) != (ip.To4() != nil) {
+			continue
+		}
 		if err := ValidateResolvedIP(ip, allowPrivate); err == nil {
 			safeIP = ip
 			break
 		}
 	}
 	if safeIP == nil {
-		return nil, fmt.Errorf("security violation: DNS resolution of %q pointed to restricted internal IP %s (DNS rebinding blocked)", host, ips[0].String())
+		return nil, fmt.Errorf("security violation: DNS resolution of %q pointed to restricted or family-mismatched IP %s", host, ips[0].String())
 	}
 
 	dialer := &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
+	}
+	if localIP != nil {
+		dialer.LocalAddr = &net.TCPAddr{IP: localIP}
 	}
 	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(safeIP.String(), portStr))
 }

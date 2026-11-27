@@ -1,4 +1,5 @@
 export type EngineType = 'native' | 'gost' | 'realm' | 'nftables'
+export type LoadBalanceStrategy = 'round_robin' | 'weighted' | 'least_rtt' | 'failover' | 'random'
 
 export interface TargetEndpoint {
   address: string
@@ -36,6 +37,11 @@ export interface SystemConfig {
   affiliate_enabled?: boolean
   affiliate_commission_rate?: number
   affiliate_min_withdraw_cents?: number
+  offpeak_enabled?: boolean
+  offpeak_start?: string
+  offpeak_end?: string
+  offpeak_multiplier?: number
+  offpeak_timezone?: string
   admin_api_key_prefix?: string
 }
 
@@ -79,6 +85,8 @@ export interface NodeItem {
   connect_ip: string
   public_host: string
   internal_host?: string
+  outbound_ip?: string
+  allowed_outbound_ips?: string
   port_range: string
   traffic_rate: number
   quota_bytes: number
@@ -114,7 +122,16 @@ export interface TunnelLine {
   type: 'direct' | 'encrypt'
   description: string
   ingress_node_id: number
+  hop_node_ids?: string
   egress_node_id: number
+  egress_node_ids?: string
+  load_balance?: LoadBalanceStrategy
+  enable_mux?: boolean
+  enable_bonding?: boolean
+  bond_links?: number
+  proxy_protocol?: number
+  offpeak_multiplier?: number
+  allowed_outbound_ips?: string
   transport: 'raw' | 'tls' | 'ws' | 'wss' | 'quic' | 'custom'
   engine: EngineType
   billing_mode: 'one_way' | 'two_way'
@@ -132,21 +149,69 @@ export interface ForwardRule {
   ingress_node_id: number
   tunnel_line_id: number
   engine: EngineType
-  effective_engine?: EngineType // 实际运行的引擎（限速规则会从 gost/realm 回退到 native）
+  effective_engine?: EngineType
   protocol: 'tcp' | 'udp' | 'both'
   listen_port: number
   relay_port: number
-  load_balance: 'round_robin' | 'failover'
+  hop_ports_json?: string
+  egress_ports_json?: string
+  load_balance: LoadBalanceStrategy
   targets_json: string
   speed_mbps: number
   access_mode?: 'off' | 'allow' | 'deny'
   access_cidrs?: string
+  proxy_protocol?: number
+  match_domains?: string
+  outbound_ip?: string
+  rule_quota_bytes?: number
+  daily_quota_bytes?: number
+  daily_used_bytes?: number
+  daily_reset_date?: string
   upload_bytes: number
   down_bytes: number
   billed_bytes: number
   enabled: boolean
   status: string
   last_error?: string
+}
+
+export interface ProbeLeg {
+  leg: string
+  from_node_id?: number
+  from_name: string
+  to_node_id?: number
+  to_name: string
+  latency_ms: number
+  backup?: boolean
+}
+
+export interface IngressFailoverGroupItem {
+  id: number
+  name: string
+  domain: string
+  record_type: 'A' | 'AAAA'
+  ttl: number
+  proxied: boolean
+  primary_node_id: number
+  backup_node_ids: string
+  active_node_id: number
+  active_ip: string
+  provider: 'cloudflare' | 'dnspod' | 'webhook'
+  zone_id: string
+  record_id: string
+  sub_domain: string
+  webhook_url: string
+  offline_threshold_sec: number
+  cooldown_sec: number
+  auto_failback: boolean
+  enabled: boolean
+  last_switch_at?: string
+  last_check_at?: string
+  last_error?: string
+  switch_count: number
+  has_api_token: boolean
+  created_at: string
+  updated_at: string
 }
 
 export interface Plan {
@@ -355,6 +420,10 @@ export const api = {
         upload_bytes: number
         down_bytes: number
         billed_bytes: number
+        daily_used_bytes?: number
+        daily_reset_date?: string
+        rule_quota_bytes?: number
+        daily_quota_bytes?: number
         enabled: boolean
         status: string
       }>
@@ -368,11 +437,16 @@ export const api = {
     engine: EngineType
     protocol: 'tcp' | 'udp' | 'both'
     listen_port: number
-    load_balance: 'round_robin' | 'failover'
+    load_balance: LoadBalanceStrategy
     targets: TargetEndpoint[]
     speed_mbps: number
     access_mode?: 'off' | 'allow' | 'deny'
     access_cidrs?: string
+    proxy_protocol?: number
+    match_domains?: string
+    outbound_ip?: string
+    rule_quota_bytes?: number
+    daily_quota_bytes?: number
   }) =>
     request<ForwardRule>('/rules', {
       method: 'POST',
@@ -388,7 +462,7 @@ export const api = {
       port_range?: string
       targets: TargetEndpoint[]
       protocol?: 'tcp' | 'udp' | 'both'
-      load_balance?: 'round_robin' | 'failover'
+      load_balance?: LoadBalanceStrategy
     }>
   }) =>
     request<ForwardRule[]>('/rules/batch', {
@@ -406,7 +480,7 @@ export const api = {
     request<ForwardRule>(`/rules/${id}/toggle`, { method: 'POST' }),
 
   probeRule: (id: number) =>
-    request<{ tunnel_ms?: number; latencies: Record<string, number> }>(`/rules/${id}/probe`, {
+    request<{ tunnel_ms?: number; latencies: Record<string, number>; legs?: ProbeLeg[] }>(`/rules/${id}/probe`, {
       method: 'POST',
     }),
 
@@ -518,6 +592,28 @@ export const api = {
     }),
   adminDeleteLine: (id: number) =>
     request<{ deleted: boolean }>(`/admin/lines/${id}`, { method: 'DELETE' }),
+
+  adminListDNSFailover: () => request<IngressFailoverGroupItem[]>('/admin/dns-failover'),
+  adminCreateDNSFailover: (payload: Record<string, unknown>) =>
+    request<IngressFailoverGroupItem>('/admin/dns-failover', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  adminUpdateDNSFailover: (id: number, payload: Record<string, unknown>) =>
+    request<IngressFailoverGroupItem>(`/admin/dns-failover/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  adminDeleteDNSFailover: (id: number) =>
+    request<{ deleted: boolean }>(`/admin/dns-failover/${id}`, { method: 'DELETE' }),
+  adminReconcileDNSFailover: (id: number, target_node_id = 0) =>
+    request<{ message: string; switched: boolean; group: IngressFailoverGroupItem }>(
+      `/admin/dns-failover/${id}/reconcile`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ target_node_id }),
+      },
+    ),
   adminListUsers: (params?: {
     q?: string
     plan_id?: number
